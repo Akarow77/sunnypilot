@@ -16,11 +16,11 @@ PERSONALITY_MIN = min(AccelerationPersonality.schema.enumerants.values())
 PERSONALITY_MAX = max(AccelerationPersonality.schema.enumerants.values())
 
 # Accel ceiling. NORMAL is stock so a disabled controller (forced to NORMAL) is stock.
-A_CRUISE_MAX_BP = [0., 10., 25., 40.]
-STOCK_A_CRUISE_MAX_V = [1.6, 1.0, 0.65, 0.11]
+A_CRUISE_MAX_BP = [0., 14., 25., 40.]
+STOCK_A_CRUISE_MAX_V = [1.6, 0.7, 0.2, 0.08]
 STOCK_RISE_RATE = 0.05
 A_CRUISE_MAX_V = {
-  ECO:    [1.20, 0.60, 0.25, 0.07],
+  ECO:    [1.20, 0.40, 0.13, 0.05],
   NORMAL: STOCK_A_CRUISE_MAX_V,
   SPORT:  [1.90, 1.30, 0.60, 0.25],
 }
@@ -29,9 +29,9 @@ RISE_RATE = {ECO: 0.02, NORMAL: STOCK_RISE_RATE, SPORT: 0.06}
 # Early soft braking: predicted brake need (m/s^2) -> early decel target (m/s^2).
 SMOOTH_DECEL_BP = [0.0, 0.4, 0.8, 1.2, 1.6, 2.0, 2.4]
 SMOOTH_DECEL_V = {
-  ECO:    [0.00, -0.08, -0.20, -0.30, -0.40, -0.70, -0.80],
-  NORMAL: [0.00, -0.13, -0.30, -0.55, -0.84, -1.12, -1.40],
-  SPORT:  [0.00, -0.17, -0.40, -0.72, -1.05, -1.35, -1.65],
+  ECO:    [0.00, -0.08, -0.15, -0.20, -0.30, -0.40, -0.60],
+  NORMAL: [0.00, -0.13, -0.20, -0.40, -0.60, -0.80, -1.00],
+  SPORT:  [0.00, -0.17, -0.40, -0.72, -1.05, -1.12, -1.40],
 }
 BRAKE_DEEPENING_JERK = {ECO: 0.5, NORMAL: 0.8, SPORT: 1.0}
 BRAKE_RELEASE_JERK = 2.0
