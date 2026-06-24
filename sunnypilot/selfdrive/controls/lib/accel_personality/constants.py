@@ -72,17 +72,17 @@ STOP_PASSTHROUGH_V = 5.0          # m/s
 ONSET_SPREAD_MAX = 0.25           # m/s^2: max the output may lag (be weaker than) the live plan, non-emergency only
 ONSET_SPREAD_JERK = 2.5           # m/s^3: rate the spread output deepens back toward the plan
 
-# Low-speed comfort stop. Behind a (near-)stopped lead, bring the car to rest at COMFORT_STOP_GAP with a
-# MONOTONE decel that slews IN (no entry grab) and never self-releases early (so the car does not roll the
-# final metre). min(plan, floor) keeps it never weaker than the plan; the monotone + slew-in also low-passes
-# raw-radar dRel steps (a farther/noisier dRel can only be ignored, never injected as a deeper grab). Replaces
-# the old self-releasing v^2/(2*gap) enforcer, which grabbed at v~3 then released into a roll. Off => no-op.
+# Low-speed comfort stop = ANTI-CREEP HOLD (not a brake adder). In the final approach behind a (near-)stopped
+# lead it HOLDS the deepest decel the PLAN itself has commanded (gentle-capped), so the brake does not ease
+# off / creep in before the car is stopped (no roll, slightly roomier). It is NEVER firmer than the plan, so
+# it can never add a hard bite -- the stop stays as gentle as the plan's own decel. Outside the final approach
+# (cruising / gap opening as a creeping lead pulls away / lead moving / launch) the floor eases out at the
+# release rate. min(plan, floor) keeps it never weaker than the plan. Replaces the old kinematic v^2/(2*gap)
+# enforcer, which engaged late and demanded a firm ~-1.6 grab to hit a fixed gap. Off => no-op.
 COMFORT_STOP_V = 4.0              # m/s: only engage at/below this ego speed
 COMFORT_STOP_LEAD_V = 1.0         # m/s: only behind a (near-)stopped lead
-COMFORT_STOP_GAP = 5.0            # m: target standstill gap (radar dRel); roomier than the stock crawl-in (~3.7-4.4m)
-COMFORT_STOP_MIN_GAP = 1.0        # m: kinematic denominator floor (gentle; no 1/x blow-up near the target)
-COMFORT_STOP_MAX_DECEL = -1.6     # m/s^2: gentle cap -> never a grab
-COMFORT_STOP_JERK = 1.0           # m/s^3: slew-IN / deepen rate of the comfort floor (no step on engage)
-COMFORT_STOP_RELEASE_V = 0.3      # m/s: below this, ease the floor out (release jerk) -> smooth stock standstill handoff
-COMFORT_STOP_HOLD_GAP = 2.0       # m: within this of the target gap = final approach -> strict monotone hold (no roll);
-                                  # beyond it the floor may WEAKEN at the release rate if a creeping lead pulls away
+COMFORT_STOP_GAP = 5.0            # m: reference standstill gap (radar dRel) for the final-approach window
+COMFORT_STOP_MAX_DECEL = -1.6     # m/s^2: backstop cap on the held decel (a brief plan spike is not held firmer than this)
+COMFORT_STOP_RELEASE_V = 0.3      # m/s: below this, ease the floor out (release rate) -> smooth stock standstill handoff
+COMFORT_STOP_HOLD_GAP = 2.0       # m: within this of the reference gap = final-approach window where the hold applies;
+                                  # beyond it the floor eases out (a creeping lead opening the gap -> no phantom brake)

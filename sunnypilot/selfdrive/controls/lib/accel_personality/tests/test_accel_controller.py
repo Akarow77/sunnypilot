@@ -14,7 +14,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.accel_control
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import \
   ECO, NORMAL, SPORT, PERSONALITY_MIN, PERSONALITY_MAX, A_CRUISE_MAX_BP, RISE_RATE, \
   STOCK_A_CRUISE_MAX_V, STOCK_RISE_RATE, HARD_BRAKE_TARGET_ACCEL, OVERBITE_CAP, \
-  STOP_PASSTHROUGH_V, ONSET_SPREAD_MAX, COMFORT_STOP_MAX_DECEL, AccelerationPersonality
+  STOP_PASSTHROUGH_V, ONSET_SPREAD_MAX, AccelerationPersonality
 
 T_IDXS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0]
 _EPS = 1e-6
@@ -229,24 +229,25 @@ def test_stop_imminent_passthrough_but_moving_follow_shapes():
   assert ctrl.smooth_active()
 
 
-def test_comfort_stop_brakes_approaching_stopped_lead():
-  # Approaching a near-stopped lead at low speed: the comfort floor adds a gentle decel below the easing plan
-  # so the car stops cleanly instead of crawling in, and stays within the gentle cap (never a grab).
+def test_comfort_stop_holds_through_plan_ease():
+  # Plan brakes to a peak then eases off near the stop (the stock creep). The hold keeps the deeper decel so
+  # the brake does not ease in (no roll) -- but NEVER firmer than the plan's own peak (no added hard bite).
   ctrl = make_controller(personality=ECO)
-  ctrl.update(make_sm(v_ego=2.5, lead_status=True, lead_d=6.0, lead_vlead=0.0))
   out = 0.0
-  for _ in range(30):
-    out = ctrl.smooth_target_accel(-0.1, flat_traj(-0.1), T_IDXS, should_stop=False)
-  assert out < -0.1 - _EPS                              # deeper than the easing plan (no creep-in)
-  assert out >= COMFORT_STOP_MAX_DECEL - _EPS           # but gentle (capped), never a grab
+  for plan in [-0.4, -0.8, -1.1, -1.1, -0.6, -0.3, -0.1]:   # decel to a -1.1 peak, then ease (creep)
+    ctrl.update(make_sm(v_ego=2.0, lead_status=True, lead_d=6.0, lead_vlead=0.0))
+    out = ctrl.smooth_target_accel(plan, flat_traj(plan), T_IDXS, should_stop=False)
+  assert out < -0.3 - _EPS                              # held deeper than the easing plan (-0.1) -> no creep-in
+  assert out >= -1.1 - _EPS                             # but never firmer than the plan's own peak (no -1.6 bite)
 
 
-def test_comfort_stop_slews_in_no_grab():
-  # First engaged frame must NOT step to the cap -- the floor slews in from 0 (no entry grab / jerk).
+def test_comfort_stop_never_firmer_than_plan():
+  # The hold can only stop the brake from WEAKENING; it never commands a decel firmer than the plan itself.
   ctrl = make_controller(personality=ECO)
-  ctrl.update(make_sm(v_ego=2.5, lead_status=True, lead_d=6.0, lead_vlead=0.0))
-  first = ctrl.smooth_target_accel(-0.1, flat_traj(-0.1), T_IDXS, should_stop=False)
-  assert first > -0.2                                   # ~ -0.1 plan + a tiny slewed-in floor, not -1.6
+  for plan in [-0.2, -0.5, -0.9, -0.9, -0.9]:           # steady (no ease) -> hold matches plan, adds nothing
+    ctrl.update(make_sm(v_ego=2.0, lead_status=True, lead_d=6.0, lead_vlead=0.0))
+    out = ctrl.smooth_target_accel(plan, flat_traj(plan), T_IDXS, should_stop=False)
+    assert out == pytest.approx(plan, abs=_EPS)         # never firmer than the (non-easing) plan -> no bite/grab
 
 
 def test_comfort_stop_monotone_no_early_release():
@@ -304,10 +305,10 @@ def test_comfort_stop_releases_on_launch():
   # Stop-and-go GO: after holding a comfort floor at a stop, once the lead moves and the plan wants throttle the
   # floor must release (track the plan up) and not hold the output below the natural plan -> the car launches.
   ctrl = make_controller(personality=ECO)
-  for _ in range(20):                                          # build a deep comfort floor approaching a stopped lead
+  for _ in range(20):                                          # hold the plan's -1.0 decel approaching a stopped lead
     ctrl.update(make_sm(v_ego=1.5, lead_status=True, lead_d=6.0, lead_vlead=0.0))
-    ctrl.smooth_target_accel(-0.1, flat_traj(-0.1), T_IDXS, should_stop=False)
-  assert ctrl._stop_floor < -0.2                               # floor is engaged/deep
+    ctrl.smooth_target_accel(-1.0, flat_traj(-1.0), T_IDXS, should_stop=False)
+  assert ctrl._stop_floor < -0.5                               # floor holds the plan's decel (engaged/deep)
   out = 0.0
   for _ in range(30):                                          # lead launches, plan wants throttle
     ctrl.update(make_sm(v_ego=2.0, lead_status=True, lead_d=8.0, lead_vlead=4.0))

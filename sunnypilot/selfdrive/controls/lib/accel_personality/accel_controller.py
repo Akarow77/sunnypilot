@@ -28,8 +28,8 @@ from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants imp
   BRAKE_RELEASE_JERK, ACCEL_RISE_JERK, SMOOTH_DECEL_LOOKAHEAD_T, MIN_SMOOTH_BRAKE_NEED, \
   HARD_BRAKE_TARGET_ACCEL, HARD_BRAKE_NEED, OVERBITE_CAP, STOP_PASSTHROUGH_V, \
   STOP_IMMINENT_VEGO, STOP_IMMINENT_LOOKAHEAD_T, ONSET_SPREAD_MAX, ONSET_SPREAD_JERK, \
-  COMFORT_STOP_V, COMFORT_STOP_LEAD_V, COMFORT_STOP_GAP, COMFORT_STOP_MIN_GAP, \
-  COMFORT_STOP_MAX_DECEL, COMFORT_STOP_JERK, COMFORT_STOP_RELEASE_V, COMFORT_STOP_HOLD_GAP
+  COMFORT_STOP_V, COMFORT_STOP_LEAD_V, COMFORT_STOP_GAP, \
+  COMFORT_STOP_MAX_DECEL, COMFORT_STOP_RELEASE_V, COMFORT_STOP_HOLD_GAP
 
 _ZERO_ACCEL_EPS = 1e-6
 
@@ -133,30 +133,26 @@ class AccelController:
     return min(shaped, spread)
 
   def _comfort_stop(self, out: float, reset: bool) -> float:
-    # Low-speed comfort decel-to-stop behind a near-stopped lead. Unlike the old enforcer it slews IN (no entry
-    # grab) and low-passes raw-radar dRel (deepening rate-limited). It tracks the kinematic decel a_req both ways
-    # while approaching, BUT holds strictly monotone (never weakens) inside the final-approach window so it cannot
-    # self-release into a roll; outside that window it may weaken at the release rate when a creeping lead pulls
-    # away (no phantom brake into an opening gap). min(out, floor) keeps it never weaker than the plan. Off => no-op.
+    # Low-speed ANTI-CREEP HOLD behind a near-stopped lead. In the final-approach window it HOLDS the deepest
+    # decel the PLAN itself commanded this episode (gentle-capped at COMFORT_STOP_MAX_DECEL), so the brake does
+    # not ease off / creep in before the car is stopped (no roll, slightly roomier). It is NEVER firmer than the
+    # plan -- it only stops the brake from WEAKENING -- so it can never add a hard bite (the old kinematic
+    # enforcer demanded a firm ~-1.6 grab; this does not). Outside the window (gap opening as a creeping lead
+    # pulls away / lead moving / launch / standstill) the floor eases out at the release rate. min(out, floor)
+    # keeps it never weaker than the plan. Off => no-op (off==stock).
     if reset or not self._enabled:
       self._stop_floor = 0.0                                   # disengaged/disabled: drop the latch, pure passthrough
       return out
-    engaged = (self._lead_status and self._lead_vlead < COMFORT_STOP_LEAD_V
-               and self._lead_d > 0.1 and self._v_ego < COMFORT_STOP_V)
-    if engaged and self._v_ego >= COMFORT_STOP_RELEASE_V:
-      gap = self._lead_d - COMFORT_STOP_GAP
-      a_req = max(-(self._v_ego ** 2) / (2.0 * max(gap, COMFORT_STOP_MIN_GAP)), COMFORT_STOP_MAX_DECEL)
-      lo = self._stop_floor - COMFORT_STOP_JERK * DT_MDL       # deepest allowed this frame (slew-in, no grab)
-      hi = self._stop_floor + BRAKE_RELEASE_JERK * DT_MDL      # shallowest allowed this frame (release rate)
-      tracked = min(hi, max(lo, a_req))                        # track a_req, rate-limited both directions
-      if gap > COMFORT_STOP_HOLD_GAP:
-        self._stop_floor = min(0.0, tracked)                   # gap still open -> may weaken if the lead pulls away
-      else:
-        self._stop_floor = min(tracked, self._stop_floor)      # final approach -> strict monotone hold (no roll)
+    final_approach = (self._lead_status and self._lead_vlead < COMFORT_STOP_LEAD_V and self._lead_d > 0.1
+                      and COMFORT_STOP_RELEASE_V <= self._v_ego < COMFORT_STOP_V
+                      and self._lead_d - COMFORT_STOP_GAP <= COMFORT_STOP_HOLD_GAP)
+    if final_approach:
+      plan_hold = max(out, COMFORT_STOP_MAX_DECEL)             # the plan's own decel, gentle-capped (never firmer)
+      self._stop_floor = min(plan_hold, self._stop_floor)      # latch the deepest -> hold through the plan's ease
     else:
-      # Stop episode over (lead moving / launched / standstill handoff): ease the floor toward 0 at the release
-      # jerk. This matches _shape's own _slew_up release rate (BRAKE_RELEASE_JERK), so the floor decays in
-      # lockstep with the natural output -> no added launch drag, and no release-direction step (no snap).
+      # Not final approach (cruise / gap opening / lead moving / launch / standstill): ease the floor toward 0 at
+      # the release rate. Matches _shape's own _slew_up rate, so the floor decays in lockstep with the natural
+      # output -> no launch drag, no release-direction snap, no phantom brake into an opening gap.
       self._stop_floor = min(0.0, self._stop_floor + BRAKE_RELEASE_JERK * DT_MDL)
     return min(out, self._stop_floor) if self._stop_floor < 0.0 else out
 
