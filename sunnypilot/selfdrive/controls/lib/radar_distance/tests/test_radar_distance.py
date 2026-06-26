@@ -107,13 +107,23 @@ def test_low_speed_passthrough_but_hold_warmed_for_highway():
   assert out.leadOne.status is True
 
 
-def test_vlead_passed_through_unchanged():
-  # The lead's real speed is reported as-is above the gate (no rise-lag) -- a lead pulling away is NOT
-  # reported as still-slow, so no phantom-slow-lead braking / stop-and-go rubber-band.
-  c = ctrl()                                           # default _v_ego above the gate
-  c.smooth_radarstate(rs(lead(dRel=30.0, vLead=15.0)))
+def test_vlead_lags_rise_instant_fall():
+  c = ctrl()
+  c.smooth_radarstate(rs(lead(dRel=30.0, vLead=15.0)))           # seed at 15
   rising = c.smooth_radarstate(rs(lead(dRel=30.0, vLead=25.0))).leadOne
-  assert rising.vLead == pytest.approx(25.0, abs=1e-6)   # real speed, not lagged below it
+  assert 15.0 <= rising.vLead < 25.0                            # rise lagged (<= real -> never faster than real)
+  falling = c.smooth_radarstate(rs(lead(dRel=30.0, vLead=8.0))).leadOne
+  assert falling.vLead == pytest.approx(8.0, abs=1e-6)          # slow-down instant
+
+
+def test_vlead_resets_on_track_switch_no_phantom_slow():
+  # the old bug: a slow lead's filtered speed carried across a switch to a fast farther track, reporting it
+  # near-stopped. A dRel jump (track switch) now resets the filter -> the new track's real speed is reported.
+  c = ctrl()
+  for _ in range(3):
+    c.smooth_radarstate(rs(lead(dRel=12.0, vLead=0.5)))         # slow close lead
+  switched = c.smooth_radarstate(rs(lead(dRel=80.0, vLead=18.0))).leadOne  # different, far, fast track
+  assert switched.vLead == pytest.approx(18.0, abs=1e-6)        # real speed, not the stale ~0.5
 
 
 def test_obstacle_monotone_during_hold():

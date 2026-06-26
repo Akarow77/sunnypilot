@@ -4,29 +4,45 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
-RadarDistance: keep a just-dropped, recently-sustained lead alive through a brief radar dropout (flicker-hold),
-so the MPC does not lose+regain a flickering lead. The held lead is obstacle-monotone (held obstacle <= last
-real <= stock) -> braking is always >= stock, never weaker. Active only above LOW_SPEED_PASSTHROUGH_V; at/below
-it (stop/creep) it returns the raw radarstate unchanged -> byte-stock stops. Default off => stock passthrough.
-
-NOTE: an earlier vLead "rise smoothing" was removed -- it lagged the lead's speed-up by ~1 s, so when a lead
-pulled away in stop-and-go it reported the lead as still near-stopped (measured up to 11 m/s slower than real).
-That fed the MPC a phantom-slow/stopped lead -> phantom hard braking + a launch rubber-band. The lead's real
-speed is passed through unchanged now.
+RadarDistance smooths the lead the longitudinal MPC follows on a noisy radar, never reporting a
+farther-or-faster lead than reality, so braking is always >= stock:
+  - flicker-hold: keep a just-dropped, recently-sustained lead alive through a radar dropout.
+  - speed damp: lag the lead speeding up (instant on slow-down) to damp the catch-up surge / rubber-band,
+    reset on a track switch so it never carries a stale-slow value across a different track.
+Active only above LOW_SPEED_PASSTHROUGH_V; at/below it returns the raw radarstate (byte-stock stops).
+Default off => stock passthrough.
 """
 
 from opendbc.car import structs
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 
-HOLD_MAX_FRAMES = 10        # ~0.5s flicker-hold cap, since the last sustained lead
-SUSTAIN_FRAMES = 2          # consecutive valid frames to arm the hold
+HOLD_MAX_FRAMES = 20        # ~1.0s flicker-hold cap, since the last sustained lead
+SUSTAIN_FRAMES = 2
 DROPOUT_DREL = 1.0
-FCW_PROB_CAP = 0.9          # held lead can't reach the FCW gate (>0.9)
+FCW_PROB_CAP = 0.9
 MIN_HELD_DREL = 0.5
 
-# Stop/creep regime: return the raw radarstate so stop distance is byte-identical to stock (off==on).
 LOW_SPEED_PASSTHROUGH_V = 5.0   # m/s
+
+VLEAD_TAU = 0.4                 # s, lag on a speeding-up lead
+_VLEAD_ALPHA = DT_MDL / VLEAD_TAU
+SWITCH_DREL = 8.0              # m, dRel jump that means the radar switched to a different track -> reset the filter
+
+
+class _LeadView:
+  __slots__ = ('status', 'dRel', 'yRel', 'vRel', 'vLead', 'vLeadK', 'aLeadK', 'aLeadTau', 'modelProb')
+
+  def __init__(self, src, vlead):
+    self.status = src.status
+    self.dRel = src.dRel
+    self.yRel = src.yRel
+    self.vRel = src.vRel
+    self.vLead = vlead
+    self.vLeadK = vlead
+    self.aLeadK = src.aLeadK
+    self.aLeadTau = src.aLeadTau
+    self.modelProb = src.modelProb
 
 
 class _HeldLead:
@@ -59,13 +75,13 @@ class _LeadHold:
     self._since_real = 0
     self._armed = False
     self._held_dRel = 0.0
+    self._vlead_f = None
+    self._last_dRel = None
 
   def reset(self):
     self.__init__()
 
   def step(self, raw):
-    # Validity mirrors the MPC (keys off status alone). modelProb is NOT a gate: radard's low_speed_override
-    # emits a real close lead with modelProb=0.0, so gating on prob dropped real stop-and-go leads.
     if raw.status and raw.dRel > DROPOUT_DREL:
       self._last = (raw.dRel, raw.vRel, raw.vLead, raw.aLeadK, raw.aLeadTau, raw.modelProb)
       self._sustained += 1
@@ -85,6 +101,21 @@ class _LeadHold:
 
     self._armed = False
     return raw
+
+  def smooth(self, lead):
+    if not lead.status:
+      self._vlead_f = None
+      self._last_dRel = None
+      return lead
+    if self._last_dRel is None or abs(lead.dRel - self._last_dRel) > SWITCH_DREL:
+      self._vlead_f = lead.vLead
+    self._last_dRel = lead.dRel
+    v = float(lead.vLead)
+    if self._vlead_f is None or v <= self._vlead_f:
+      self._vlead_f = v
+      return lead
+    self._vlead_f += (v - self._vlead_f) * _VLEAD_ALPHA
+    return _LeadView(lead, self._vlead_f)
 
 
 class RadarDistanceController:
@@ -118,6 +149,6 @@ class RadarDistanceController:
       return radarstate
     one = self._one.step(radarstate.leadOne)
     two = self._two.step(radarstate.leadTwo)
-    if self._v_ego < LOW_SPEED_PASSTHROUGH_V:               # stop/creep -> raw (byte-stock stops)
+    if self._v_ego < LOW_SPEED_PASSTHROUGH_V:
       return radarstate
-    return _RadarStateProxy(one, two)                       # flicker-hold only; lead speed passed through as-is
+    return _RadarStateProxy(self._one.smooth(one), self._two.smooth(two))
