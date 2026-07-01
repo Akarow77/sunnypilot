@@ -4,15 +4,12 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
-Acceleration personality: per-profile launch/cruise accel ceiling (ECO/NORMAL/SPORT), an anticipatory brake
-front-load, and a TTC-scaled brake-jerk limiter (smooth decel). SAFETY: a firm/closing brake -- emergency
-(raw <= HARD_BRAKE_TARGET_ACCEL or brake_need >= HARD_BRAKE_NEED), FCW/crash, should_stop, or blended/e2e --
-passes the plan straight through, never softened. Only on the NON-emergency path may the onset arrive spread
-by at most ONSET_SPREAD_MAX (a bounded transient lag). The front-load only ever ADDS braking (min(., plan)),
-and the jerk limiter caps the deepening RATE only (never the magnitude). Disabled => byte-stock.
+Acceleration Personality (ECO / NORMAL / SPORT). Tunes only MPC INPUTS, never the output:
+  * positive-accel ceiling + per-cycle open-rate -> tier-scaled take-off from a stop;
+  * add-only, speed-dependent follow-gap widen on the MPC t_follow -> earlier/gentler braking, roomier gap;
+  * sticky should_stop hysteresis -> no stop-and-go gas-brake-gas-brake.
+Add-only gap => desired distance >= stock => braking >= stock. Disabled => stock everywhere (byte-stock).
 """
-
-from collections.abc import Sequence
 
 import numpy as np
 
@@ -22,34 +19,23 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot import get_sanitize_int_param
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import \
-  NORMAL, PERSONALITY_MIN, PERSONALITY_MAX, A_CRUISE_MAX_BP, A_CRUISE_MAX_V, RISE_RATE, \
-  STOCK_A_CRUISE_MAX_V, STOCK_RISE_RATE, SMOOTH_DECEL_BP, SMOOTH_DECEL_V, BRAKE_DEEPENING_JERK, \
-  BRAKE_RELEASE_JERK, ACCEL_RISE_JERK, SMOOTH_DECEL_LOOKAHEAD_T, MIN_SMOOTH_BRAKE_NEED, \
-  HARD_BRAKE_TARGET_ACCEL, HARD_BRAKE_NEED, OVERBITE_CAP, STOP_PASSTHROUGH_V, \
-  STOP_IMMINENT_VEGO, STOP_IMMINENT_LOOKAHEAD_T, ONSET_SPREAD_MAX, ONSET_SPREAD_JERK, \
-  JERK_LIMIT_ENABLED, BRAKE_JERK_SMOOTH, BRAKE_JERK_URGENT, BRAKE_JERK_TTC_HI, BRAKE_JERK_TTC_LO
-
-_ZERO_ACCEL_EPS = 1e-6
+  NORMAL, PERSONALITY_MIN, PERSONALITY_MAX, A_CRUISE_MAX_BP, A_CRUISE_MAX_V, STOCK_A_CRUISE_MAX_V, \
+  RISE_RATE, STOCK_RISE_RATE, TF_WIDEN_V_BP, TF_WIDEN_BASE_V, TF_WIDEN_TIER, TF_WIDEN_MAX, \
+  TF_SLEW_PER_S, TF_DECEL_HOLD_A, SNG_GO_ACCEL
 
 
 class AccelController:
-  def __init__(self, CP: structs.CarParams, mpc, params=None):
-    self._CP = CP
-    self._mpc = mpc
+  def __init__(self, CP: structs.CarParams, mpc=None, params=None):
+    # CP/mpc accepted for the planner's constructor signature; unused (shapes MPC inputs only).
     self._params = params or Params()
     self._frame = 0
-    self._enabled = self._params.get_bool("AccelPersonalityEnabled")
+    self._enabled = False
     self._personality = NORMAL
     self._v_ego = 0.0
-    self._last_target_accel = 0.0
-    self._brake_need = 0.0
-    self._decel_target = 0.0
-    self._smooth_active = False
-    self._bypassed = False
-    self._lead_status = False
-    self._lead_d = 0.0
-    self._lead_vlead = 0.0
-    self._jerk_limit_enabled = JERK_LIMIT_ENABLED
+    self._a_ego = 0.0
+    self._widen = 0.0                     # current slewed follow-gap widen (s), add-only
+    self._t_follow = 0.0                  # last t_follow handed to the MPC (telemetry)
+    self._sng_stopped = True              # SnG hysteresis: committed stop/go state (start stopped-committed)
     self._read_params()
 
   def _read_params(self) -> None:
@@ -62,12 +48,14 @@ class AccelController:
   def update(self, sm: messaging.SubMaster) -> None:
     if self._frame % int(1. / DT_MDL) == 0:
       self._read_params()
-    self._v_ego = sm['carState'].vEgo
-    lead = sm['radarState'].leadOne          # raw radard lead (== what the MPC sees at crawl, where the enforcer acts)
-    self._lead_status = bool(lead.status)
-    self._lead_d = float(lead.dRel)
-    self._lead_vlead = float(lead.vLead)
+    self._v_ego = float(sm['carState'].vEgo)
+    self._a_ego = float(sm['carState'].aEgo)
     self._frame += 1
+
+  def reset(self) -> None:
+    # Drop the accumulated widen (e.g. on disengage / standstill re-init) so it re-ramps cleanly.
+    self._widen = 0.0
+    self._sng_stopped = True              # re-init stopped-committed (safe: only ever holds a stop longer)
 
   def get_max_accel(self, v_ego: float) -> float:
     # Disabled -> stock ceiling (off == stock, independent of the NORMAL profile so NORMAL is free to differ).
@@ -75,126 +63,53 @@ class AccelController:
     return float(np.interp(v_ego, A_CRUISE_MAX_BP, table))
 
   def get_rise_rate(self) -> float:
-    # Disabled -> stock rise rate (off == stock, independent of the NORMAL profile).
+    # Disabled -> stock ceiling open-rate (off == stock, independent of the NORMAL profile).
     return RISE_RATE[self._personality] if self._enabled else STOCK_RISE_RATE
 
-  def get_decel_target(self, brake_need: float) -> float:
-    return float(np.interp(max(0.0, float(brake_need)), SMOOTH_DECEL_BP, SMOOTH_DECEL_V[self._personality]))
+  def get_t_follow(self, t_follow: float, v_ego: float) -> float:
+    # MPC t_follow hook. Adds a slewed, decel-held, speed-dependent comfort widen on top of the stock
+    # t_follow. Identity when disabled => byte-stock. Add-only => desired distance >= stock => brake >= stock.
+    t_follow = float(t_follow)
+    if not self._enabled:
+      self._widen = 0.0
+      self._t_follow = t_follow
+      return t_follow
 
-  def smooth_target_accel(self, raw_target_accel: float, accel_trajectory: Sequence[float], t_idxs: Sequence[float],
-                          should_stop: bool, reset: bool = False, stock_brake: bool = False,
-                          speed_trajectory: Sequence[float] | None = None) -> float:
-    raw = float(raw_target_accel)
-    self._brake_need = self._compute_brake_need(raw, accel_trajectory, t_idxs)
-    self._decel_target = 0.0
-    self._smooth_active = False
-    self._bypassed = False
+    target = float(np.interp(v_ego, TF_WIDEN_V_BP, TF_WIDEN_BASE_V)) * TF_WIDEN_TIER[self._personality]
+    target = min(target, TF_WIDEN_MAX)
+    step = TF_SLEW_PER_S * DT_MDL
 
-    out = self._shape(raw, should_stop, reset, speed_trajectory, t_idxs, stock_brake)
-    out = self._brake_jerk_limit(out, reset)    # TTC-scaled deepening-jerk cap: smooth onset where there is room
-    return self._finalize(out)
+    if self._a_ego <= TF_DECEL_HOLD_A and target < self._widen:
+      pass                                              # decel-hold: don't ease the gap in while braking
+    elif target > self._widen:
+      self._widen = min(target, self._widen + step)     # open the gap, slewed
+    else:
+      self._widen = max(target, self._widen - step)     # close the gap, slewed
 
-  def _shape(self, raw: float, should_stop: bool, reset: bool, speed_trajectory, t_idxs, stock_brake: bool) -> float:
-    # --- Full stock passthroughs (output is exactly the plan, no shaping) ---
-    if reset or not self._enabled:
-      return raw                                               # disabled / reset
-    if self._v_ego < STOP_PASSTHROUGH_V and raw <= 0.0:
-      return raw                                               # stop/creep regime: braking is stock (no coast-in)
-    self._bypassed = self._emergency_bypass(raw, should_stop)
-    if self._bypassed or self._stop_imminent(speed_trajectory, t_idxs):
-      return raw                                               # emergency / coming stop: full strength, no delay
+    self._widen = max(0.0, self._widen)                 # add-only guard
+    self._t_follow = t_follow + self._widen
+    return self._t_follow
 
-    # Anticipatory front-load, capped at OVERBITE_CAP below the live plan (avoids an abrupt over-bite on a
-    # cut-in brake_need spike).
-    target = raw
-    if self._brake_need >= MIN_SMOOTH_BRAKE_NEED:
-      self._smooth_active = True
-      self._decel_target = max(self.get_decel_target(self._brake_need), raw - OVERBITE_CAP)
-      target = min(raw, self._decel_target)
-      if raw > 0.0:
-        target = max(target, 0.0)                              # plan wants throttle -> ease the gas early, never fabricate a brake
-    slewed = self._slew(target)
-    if raw >= 0.0:
-      return slewed
-    if stock_brake:
-      return min(slewed, raw)                                  # blended/e2e: the model owns the brake -> strict never-weaker
-    return self._onset_spread(slewed, raw)                     # non-emergency brake: bounded onset spread (<= ONSET_SPREAD_MAX weaker)
+  def sng_should_stop(self, should_stop: bool, a_target: float) -> bool:
+    # SnG anti-chatter: sticky hysteresis on should_stop so it doesn't flip stopping<->pid at the stop
+    # threshold (the gas-brake). Only ever holds a stop longer (brake >= stock), never delays a real stop.
+    # Identity when disabled => byte-stock.
+    should_stop = bool(should_stop)
+    if not self._enabled:
+      self._sng_stopped = should_stop
+      return should_stop
 
-  def _lead_ttc(self) -> float:
-    if not self._lead_status:
-      return 1e3                                                # no lead -> no urgency
-    vrel = self._lead_vlead - self._v_ego
-    if vrel >= -0.1:
-      return 1e3                                                # not closing -> no urgency
-    return self._lead_d / -vrel
+    if self._sng_stopped:
+      # stopped-committed: launch only on a clear GO (plan wants to move AND accel clears the go-band)
+      if not should_stop and float(a_target) >= SNG_GO_ACCEL:
+        self._sng_stopped = False
+    else:
+      # going-committed: re-assert stop only when the plan genuinely requests it (no delay on a real stop)
+      if should_stop:
+        self._sng_stopped = True
+    return self._sng_stopped
 
-  def _brake_jerk_limit(self, out: float, reset: bool) -> float:
-    # Cap how fast the brake DEEPENS, scaled by TTC: roomy -> gentle (smooth onset), urgent -> fast (no delay).
-    # Rate only -- never changes the magnitude, so it can never under-brake; an emergency just ramps quickly.
-    if reset or not self._enabled or not self._jerk_limit_enabled or out >= self._last_target_accel:
-      return out                                                # releasing/steady or off: nothing to limit
-    jmax = float(np.interp(self._lead_ttc(), [BRAKE_JERK_TTC_LO, BRAKE_JERK_TTC_HI], [BRAKE_JERK_URGENT, BRAKE_JERK_SMOOTH]))
-    return max(out, self._last_target_accel - jmax * DT_MDL)
-
-  def _onset_spread(self, shaped: float, raw: float) -> float:
-    # Scoped softening: on a NON-emergency brake the onset may arrive spread instead of stepping to the plan.
-    # The output deepens toward the plan jerk-limited at ONSET_SPREAD_JERK and may lag it by at most
-    # ONSET_SPREAD_MAX -- a tightly bounded, transient weaker-than-plan window that smooths the felt onset.
-    # Emergency brakes never reach here (raw passthrough in _shape), so a genuine hard brake is never softened.
-    # The front-load still wins when it is deeper (anticipation preserved).
-    spread = max(raw, self._last_target_accel - ONSET_SPREAD_JERK * DT_MDL)   # deepen toward the plan, jerk-limited
-    spread = min(spread, raw + ONSET_SPREAD_MAX)                              # never more than the bounded lag weaker
-    return min(shaped, spread)
-
-  def _stop_imminent(self, speed_trajectory: Sequence[float] | None, t_idxs: Sequence[float]) -> bool:
-    # plan predicts a near-stop within the lookahead -> a stop is coming (lead or light/sign).
-    if speed_trajectory is None:
-      return False
-    return any(float(s) < STOP_IMMINENT_VEGO
-               for s, t in zip(speed_trajectory, t_idxs, strict=False) if float(t) <= STOP_IMMINENT_LOOKAHEAD_T)
-
-  def _compute_brake_need(self, raw_target_accel: float, accel_trajectory: Sequence[float], t_idxs: Sequence[float]) -> float:
-    min_accel = float(raw_target_accel)
-    for accel, t in zip(accel_trajectory, t_idxs, strict=False):
-      if float(t) <= SMOOTH_DECEL_LOOKAHEAD_T:
-        min_accel = min(min_accel, float(accel))
-    return max(0.0, -min_accel)
-
-  def _emergency_bypass(self, raw_target_accel: float, should_stop: bool) -> bool:
-    return (self._mpc.crash_cnt > 0 or should_stop or
-            raw_target_accel <= HARD_BRAKE_TARGET_ACCEL or self._brake_need >= HARD_BRAKE_NEED)
-
-  def _slew(self, target_accel: float) -> float:
-    # Jerk-limit the brake DEEPENING (smooths the front-load's extra depth). On the brake side the caller
-    # clamps with min(., raw), so this NEVER delays a real brake -- when the plan is deeper than the slewed
-    # value, min(.) picks the plan and the brake passes through at full rate.
-    target_accel = float(target_accel)
-    if target_accel <= self._last_target_accel:
-      jmax = BRAKE_DEEPENING_JERK[self._personality]
-      return self._clean_accel(max(target_accel, self._last_target_accel - jmax * DT_MDL))
-    return self._slew_up(target_accel)
-
-  def _slew_up(self, target_accel: float) -> float:
-    # Releasing the brake / accelerating: rate-limit the rise (release jerk on the brake side, the
-    # personality accel-rise jerk on the throttle side).
-    if self._last_target_accel < 0.0:
-      released = min(target_accel, self._last_target_accel + BRAKE_RELEASE_JERK * DT_MDL)
-      if released <= 0.0:
-        return self._clean_accel(released)
-      return self._clean_accel(min(target_accel, ACCEL_RISE_JERK[self._personality] * DT_MDL))
-    step = ACCEL_RISE_JERK[self._personality] * DT_MDL
-    return self._clean_accel(min(target_accel, self._last_target_accel + step))
-
-  def _finalize(self, target_accel: float) -> float:
-    target_accel = self._clean_accel(target_accel)
-    self._last_target_accel = target_accel
-    return target_accel
-
-  @staticmethod
-  def _clean_accel(accel: float) -> float:
-    accel = float(accel)
-    return 0.0 if abs(accel) < _ZERO_ACCEL_EPS else accel
-
+  # --- telemetry (published to cereal LongitudinalPlanSP.acceleration; no control effect) ---
   def enabled(self) -> bool:
     return self._enabled
 
@@ -204,14 +119,11 @@ class AccelController:
   def max_accel(self) -> float:
     return self.get_max_accel(self._v_ego)
 
-  def brake_need(self) -> float:
-    return self._brake_need
+  def t_follow(self) -> float:
+    return self._t_follow
 
-  def decel_target(self) -> float:
-    return self._decel_target
+  def follow_widen(self) -> float:
+    return self._widen
 
-  def smooth_active(self) -> bool:
-    return self._smooth_active
-
-  def bypassed(self) -> bool:
-    return self._bypassed
+  def widen_active(self) -> bool:
+    return self._enabled and self._widen > 0.005

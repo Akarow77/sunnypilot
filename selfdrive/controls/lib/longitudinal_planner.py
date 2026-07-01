@@ -52,6 +52,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.CP = CP
     self.mpc = LongitudinalMpc(dt=dt)
     LongitudinalPlannerSP.__init__(self, self.CP, CP_SP, self.mpc)
+    self.mpc.t_follow_fn = self.accel.get_t_follow  # Acceleration Personality: add-only follow-gap widen
     self.fcw = False
     self.dt = dt
     self.allow_throttle = True
@@ -118,6 +119,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       self.v_desired_filter.x = v_ego
       # Clip aEgo to cruise limits to prevent large accelerations when becoming active
       self.a_desired = np.clip(sm['carState'].aEgo, accel_clip[0], accel_clip[1])
+      self.accel.reset()  # drop any accumulated follow-gap widen so it re-ramps cleanly on re-engage
 
     # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
@@ -170,10 +172,12 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       output_a_target = output_a_target_mpc
       self.output_should_stop = output_should_stop_mpc
 
-    # Acceleration Personality: early soft braking (never weaker than the plan). No-op when disabled.
-    output_a_target = self.accel.smooth_target_accel(output_a_target, self.a_desired_trajectory, CONTROL_N_T_IDX,
-                                                     self.output_should_stop or force_slow_decel, reset=reset_state, stock_brake=is_e2e,
-                                                     speed_trajectory=self.v_desired_trajectory)
+    # Stop-and-go anti-chatter: sticky should_stop hysteresis kills the stopping<->pid flip that reads as
+    # gas-brake-gas-brake, and makes launch decisive. No-op (byte-stock) when disabled.
+    self.output_should_stop = self.accel.sng_should_stop(self.output_should_stop, output_a_target)
+
+    # Acceleration Personality shapes only MPC INPUTS (accel ceiling above + t_follow via mpc.t_follow_fn),
+    # never the output accel -- output_a_target passes through byte-stock so the MPC owns the trajectory.
 
     # Lower (braking) bound and the ceiling's downward slew stay at the stock rate; only the ceiling's
     # upward slew is tier-dependent (Acceleration Personality).

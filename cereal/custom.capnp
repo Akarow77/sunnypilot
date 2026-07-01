@@ -303,10 +303,10 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
     personality @0 :AccelerationPersonality;
     enabled @1 :Bool;
     maxAccel @2 :Float32;     # current speed-indexed accel ceiling
-    brakeNeed @3 :Float32;    # predicted decel demand from the lookahead (m/s^2, positive)
-    decelTarget @4 :Float32;  # early-soft comfort decel target (m/s^2, negative)
-    smoothActive @5 :Bool;    # early-soft braking currently shaping the target
-    bypassed @6 :Bool;        # passthrough to stock plan (hard brake / FCW / should_stop / closing lead / e2e)
+    brakeNeed @3 :Float32;    # repurposed: follow-gap widen added on top of the stock t_follow (s)
+    decelTarget @4 :Float32;  # repurposed: t_follow handed to the MPC (s)
+    smoothActive @5 :Bool;    # repurposed: follow-gap widen currently active
+    bypassed @6 :Bool;        # unused (input-shaping design has no output post-shaping / bypass)
     comfortStopActive @7 :Bool;   # low-speed comfort decel-to-stop floor currently governing (behind a near-stopped lead)
     comfortStopFloor @8 :Float32; # comfort-stop floor commanded (m/s^2, negative; 0 when not engaged)
     leadUnstable @9 :Bool;        # RadarDistance lead-instability telemetry (bimodal/bouncing radar lead; informational, no control effect yet)

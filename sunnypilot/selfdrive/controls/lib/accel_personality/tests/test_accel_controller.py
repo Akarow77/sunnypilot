@@ -3,6 +3,11 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
+
+AccelController is an INPUT shaper for the longitudinal MPC: a per-tier positive-accel ceiling + open-rate
+(launch), and an ADD-ONLY, slewed, decel-held follow-gap widen fed to the MPC t_follow. It never shapes the
+MPC output, so these tests pin: off == byte-stock; tier ordering; and the t_follow invariants (add-only,
+zero below the gate, slew-bounded, decel-hold, capped).
 """
 
 from types import SimpleNamespace
@@ -10,14 +15,16 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.accel_controller import AccelController
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import \
   ECO, NORMAL, SPORT, PERSONALITY_MIN, PERSONALITY_MAX, A_CRUISE_MAX_BP, RISE_RATE, \
-  STOCK_A_CRUISE_MAX_V, STOCK_RISE_RATE, HARD_BRAKE_TARGET_ACCEL, OVERBITE_CAP, \
-  STOP_PASSTHROUGH_V, ONSET_SPREAD_MAX, AccelerationPersonality
+  STOCK_A_CRUISE_MAX_V, STOCK_RISE_RATE, TF_WIDEN_V_BP, TF_WIDEN_BASE_V, TF_WIDEN_TIER, TF_WIDEN_MAX, \
+  TF_SLEW_PER_S, TF_DECEL_HOLD_A, SNG_GO_ACCEL, AccelerationPersonality
 
-T_IDXS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0]
 _EPS = 1e-6
+_TF_STOCK = 1.45          # a representative stock t_follow (standard personality); the widen is add-only on top
+_SLEW_STEP = TF_SLEW_PER_S * DT_MDL
 
 
 class FakeParams:
@@ -34,24 +41,26 @@ class FakeParams:
     self.store[key] = val
 
 
-def make_sm(v_ego=20.0, lead_status=False, lead_d=0.0, lead_vlead=0.0):
-  lead = SimpleNamespace(status=lead_status, dRel=lead_d, vLead=lead_vlead)
-  return {'carState': SimpleNamespace(vEgo=v_ego), 'radarState': SimpleNamespace(leadOne=lead)}
+def make_sm(v_ego=20.0, a_ego=0.0):
+  return {'carState': SimpleNamespace(vEgo=v_ego, aEgo=a_ego)}
 
 
-def make_controller(enabled=True, personality=NORMAL, crash_cnt=0, jerk_limit=False):
+def make_controller(enabled=True, personality=NORMAL):
   store = {"AccelPersonalityEnabled": enabled, "AccelPersonality": int(personality)}
-  ctrl = AccelController(CP=SimpleNamespace(), mpc=SimpleNamespace(crash_cnt=crash_cnt), params=FakeParams(store))
-  ctrl._jerk_limit_enabled = jerk_limit       # brake-jerk limiter is gated off in production; opt in per-test
+  ctrl = AccelController(CP=SimpleNamespace(), mpc=SimpleNamespace(), params=FakeParams(store))
   ctrl.update(make_sm())
   return ctrl
 
 
-def flat_traj(value):
-  return [float(value)] * len(T_IDXS)
+def settle(ctrl, v_ego, a_ego=0.0, t_follow=_TF_STOCK, n=400):
+  ctrl.update(make_sm(v_ego=v_ego, a_ego=a_ego))
+  out = t_follow
+  for _ in range(n):
+    out = ctrl.get_t_follow(t_follow, v_ego)
+  return out
 
 
-# --- Profiles / off==stock ---------------------------------------------------
+# --- Profiles / off == stock ------------------------------------------------------------------------------
 
 def test_enum_source_parity():
   assert (ECO, NORMAL, SPORT) == (AccelerationPersonality.eco, AccelerationPersonality.normal, AccelerationPersonality.sport)
@@ -67,233 +76,161 @@ def test_disabled_forces_normal_and_stock_ceiling():
   assert ctrl.get_rise_rate() == STOCK_RISE_RATE
 
 
-def test_disabled_passes_brake_through():
-  ctrl = make_controller(enabled=False)
-  for raw in (-3.0, -1.5, -0.5, 0.0, 1.0):
-    out = ctrl.smooth_target_accel(raw, flat_traj(raw), T_IDXS, should_stop=False)
-    assert out == pytest.approx(raw, abs=_EPS)
+def test_disabled_t_follow_is_identity():
+  ctrl = make_controller(enabled=False, personality=SPORT)
+  for v in (2.0, 10.0, 20.0, 30.0):
+    assert ctrl.get_t_follow(_TF_STOCK, v) == pytest.approx(_TF_STOCK)
+    assert ctrl.follow_widen() == 0.0
+    assert not ctrl.widen_active()
+
+
+def test_stock_ceiling_matches_upstream():
+  # off must equal upstream get_max_accel table so the feature is byte-stock when disabled.
+  assert STOCK_A_CRUISE_MAX_V == [1.6, 1.2, 0.8, 0.6]
+  assert A_CRUISE_MAX_BP == [0., 10., 25., 40.]
+  assert STOCK_RISE_RATE == 0.05
+
+
+def test_ceiling_ordering_eco_le_normal_le_sport():
+  eco = make_controller(personality=ECO)
+  nrm = make_controller(personality=NORMAL)
+  spt = make_controller(personality=SPORT)
+  for v in (0.0, 10.0, 25.0, 40.0):
+    assert eco.get_max_accel(v) <= nrm.get_max_accel(v) + _EPS
+    assert nrm.get_max_accel(v) <= spt.get_max_accel(v) + _EPS
+  # strictly distinct where the tables diverge (mid speed)
+  assert make_controller(personality=ECO).get_max_accel(25.0) < make_controller(personality=SPORT).get_max_accel(25.0)
+
+
+def test_rise_rate_ordering_and_above_stock():
+  assert RISE_RATE[ECO] < RISE_RATE[NORMAL] < RISE_RATE[SPORT]
+  assert RISE_RATE[ECO] > STOCK_RISE_RATE            # every tier opens the ceiling faster than stock (fast take-off)
 
 
 def test_normal_is_distinct_from_stock():
-  # off==stock is enforced via the disabled path, NOT by NORMAL==stock, so enabled NORMAL is free to differ.
+  nrm = make_controller(personality=NORMAL)
+  # enabled NORMAL differs from stock (so NORMAL is a real profile, not a stock alias)
+  assert nrm.get_max_accel(25.0) != pytest.approx(np.interp(25.0, A_CRUISE_MAX_BP, STOCK_A_CRUISE_MAX_V))
+  assert nrm.get_rise_rate() != STOCK_RISE_RATE
+
+
+# --- t_follow: add-only speed widen -----------------------------------------------------------------------
+
+def test_t_follow_zero_below_gate():
   ctrl = make_controller(personality=NORMAL)
-  assert ctrl.get_max_accel(0.0) != pytest.approx(np.interp(0.0, A_CRUISE_MAX_BP, STOCK_A_CRUISE_MAX_V))
-  assert ctrl.get_rise_rate() != STOCK_RISE_RATE
+  out = settle(ctrl, v_ego=TF_WIDEN_V_BP[0] - 1.0)     # below the widen onset
+  assert out == pytest.approx(_TF_STOCK)
+  assert ctrl.follow_widen() == pytest.approx(0.0, abs=1e-6)
 
 
-def test_ceiling_ordering_eco_lt_normal_lt_sport():
-  eco, normal, sport = (make_controller(personality=p) for p in (ECO, NORMAL, SPORT))
-  for v in (0.0, 14.0, 25.0, 40.0):
-    assert eco.get_max_accel(v) < normal.get_max_accel(v) < sport.get_max_accel(v)
-  assert eco.get_rise_rate() < normal.get_rise_rate() < sport.get_rise_rate()
+def test_t_follow_widens_at_speed():
+  ctrl = make_controller(personality=NORMAL)
+  out = settle(ctrl, v_ego=TF_WIDEN_V_BP[1] + 5.0)     # flat-widen region, above the band
+  expected = _TF_STOCK + TF_WIDEN_BASE_V[1] * TF_WIDEN_TIER[NORMAL]
+  assert out == pytest.approx(expected, abs=1e-3)
+  assert ctrl.widen_active()
 
 
-def test_rise_rate_ordering():
-  assert RISE_RATE[ECO] < RISE_RATE[NORMAL] < RISE_RATE[SPORT]
-
-
-# --- SAFETY: never weaker than the plan, hard brakes never delayed --------------
-
-@pytest.mark.parametrize("personality", [ECO, NORMAL, SPORT])
-def test_never_weaker_than_plan_sustained(personality):
-  # Safety: an EMERGENCY brake is never weaker than the plan (strict). A non-emergency brake may lag the plan
-  # by at most ONSET_SPREAD_MAX (the bounded onset-spread) and no more.
-  ctrl = make_controller(personality=personality)
-  for raw in [0.0, -0.2, -0.5, -0.9, -1.2, -1.5, -2.0] + [-2.0] * 20:
-    out = ctrl.smooth_target_accel(raw, flat_traj(raw), T_IDXS, should_stop=False)
-    if raw <= HARD_BRAKE_TARGET_ACCEL:
-      assert out <= raw + _EPS                                 # emergency: strict never-weaker
-    elif raw < 0.0:
-      assert out <= raw + ONSET_SPREAD_MAX + _EPS              # non-emergency: bounded onset-spread only
-
-
-@pytest.mark.parametrize("personality", [ECO, NORMAL, SPORT])
-def test_never_weaker_random_walk(personality):
+def test_t_follow_add_only_random_walk():
   rng = np.random.default_rng(0)
-  ctrl = make_controller(personality=personality)
-  for _ in range(500):
-    raw = float(rng.uniform(-2.5, 1.5))
-    traj = flat_traj(raw - float(rng.uniform(0.0, 0.6)))
-    out = ctrl.smooth_target_accel(raw, traj, T_IDXS, should_stop=False)
-    if raw < 0.0:
-      assert out <= raw + ONSET_SPREAD_MAX + _EPS              # never more than the bounded onset-spread weaker
+  for personality in (ECO, NORMAL, SPORT):
+    ctrl = make_controller(personality=personality)
+    for _ in range(500):
+      v = float(rng.uniform(0.0, 40.0))
+      a = float(rng.uniform(-3.0, 1.5))
+      ctrl.update(make_sm(v_ego=v, a_ego=a))
+      out = ctrl.get_t_follow(_TF_STOCK, v)
+      assert out >= _TF_STOCK - _EPS                    # never tighter than the stock gap => brake >= stock
+      assert ctrl.follow_widen() <= TF_WIDEN_MAX + _EPS  # widen capped
 
 
-@pytest.mark.parametrize("personality", [ECO, NORMAL, SPORT])
-def test_hard_brake_passes_through_immediately(personality):
-  # Regression for route 00000466 near-crash: a sudden hard brake (plan steps deep) must reach FULL depth
-  # on the FIRST frame -- never rate-limited / delayed, or the car under-brakes into a closing lead.
-  ctrl = make_controller(personality=personality)
-  out = ctrl.smooth_target_accel(-3.5, flat_traj(-3.5), T_IDXS, should_stop=False)
-  assert out == pytest.approx(-3.5, abs=_EPS)
-  assert ctrl.bypassed()
+def test_t_follow_tier_ordering_at_speed():
+  v = TF_WIDEN_V_BP[1] + 5.0
+  eco = settle(make_controller(personality=ECO), v_ego=v)
+  nrm = settle(make_controller(personality=NORMAL), v_ego=v)
+  spt = settle(make_controller(personality=SPORT), v_ego=v)
+  assert eco > nrm > spt                                # ECO roomiest, SPORT tightest
 
 
-def test_sudden_lead_no_brake_delay():
-  # The exact 466 shape: cruising (plan +1.7, no brake) then a fast lead appears and the plan steps to max
-  # brake. The commanded brake must hit full depth immediately, not ramp in over time.
+def test_t_follow_slew_bounded():
   ctrl = make_controller(personality=ECO)
-  for _ in range(5):
-    ctrl.smooth_target_accel(1.7, flat_traj(1.7), T_IDXS, should_stop=False)   # cruising, no lead
-  out = ctrl.smooth_target_accel(-3.5, flat_traj(-3.5), T_IDXS, should_stop=False)  # lead appears
-  assert out == pytest.approx(-3.5, abs=_EPS)                                  # full brake, zero delay
+  ctrl.update(make_sm(v_ego=35.0, a_ego=0.0))           # big target widen, start from 0
+  prev = 0.0
+  for _ in range(50):
+    ctrl.get_t_follow(_TF_STOCK, 35.0)
+    assert ctrl.follow_widen() - prev <= _SLEW_STEP + _EPS   # opens no faster than the slew cap
+    prev = ctrl.follow_widen()
 
 
-def test_should_stop_passes_through():
-  ctrl = make_controller(personality=ECO)
-  out = ctrl.smooth_target_accel(-1.0, flat_traj(-1.0), T_IDXS, should_stop=True)
-  assert out == pytest.approx(-1.0, abs=_EPS)
-  assert ctrl.bypassed()
+def test_t_follow_decel_hold_does_not_shrink_gap():
+  ctrl = make_controller(personality=NORMAL)
+  settle(ctrl, v_ego=35.0, a_ego=0.0)                   # open the gap fully
+  held = ctrl.follow_widen()
+  assert held > 0.1
+  # now braking (a_ego below the hold threshold) while speed drops into the zero-widen region
+  for _ in range(50):
+    ctrl.update(make_sm(v_ego=8.0, a_ego=TF_DECEL_HOLD_A - 1.0))
+    ctrl.get_t_follow(_TF_STOCK, 8.0)
+    assert ctrl.follow_widen() >= held - _EPS           # gap does not ease in while braking
+  # once no longer braking, the gap eases back toward the (zero) target
+  for _ in range(200):
+    ctrl.update(make_sm(v_ego=8.0, a_ego=0.0))
+    ctrl.get_t_follow(_TF_STOCK, 8.0)
+  assert ctrl.follow_widen() == pytest.approx(0.0, abs=1e-3)
 
 
-def test_fcw_crash_passes_through():
-  ctrl = make_controller(personality=ECO, crash_cnt=3)
-  out = ctrl.smooth_target_accel(-1.0, flat_traj(-1.0), T_IDXS, should_stop=False)
-  assert out == pytest.approx(-1.0, abs=_EPS)
-  assert ctrl.bypassed()
+def test_reset_clears_widen():
+  ctrl = make_controller(personality=SPORT)
+  settle(ctrl, v_ego=35.0)
+  assert ctrl.follow_widen() > 0.0
+  ctrl.reset()
+  assert ctrl.follow_widen() == 0.0
 
-
-def test_blended_never_weaker():
-  # Blended/e2e (stock_brake): never weaker than the plan (may anticipate via the never-weaker front-load).
-  ctrl = make_controller(personality=ECO)
-  for raw in [0.0, -0.3, -0.6, -0.9, -1.0, -1.0, -1.0]:
-    out = ctrl.smooth_target_accel(raw, flat_traj(raw), T_IDXS, should_stop=False, stock_brake=True)
-    assert out <= raw + _EPS
-
-
-# --- Anticipatory front-load (never weaker, capped) ------------------------------
-
-def test_front_load_brakes_before_plan():
-  # A deeper brake is predicted ahead (brake_need=1.0) while the live plan is still flat -> front-load
-  # brakes early (output goes negative), but the smooth branch keeps it never weaker than the plan.
-  ctrl = make_controller(personality=ECO)
-  out = ctrl.smooth_target_accel(0.0, flat_traj(-1.0), T_IDXS, should_stop=False)
-  assert out < 0.0
-  assert ctrl.smooth_active()
-  assert ctrl.brake_need() == pytest.approx(1.0)
-
-
-def test_front_load_anticipates_below_live_plan():
-  # When the live plan is gently braking and a deeper brake is predicted, the front-load deepens below the
-  # live plan (anticipatory early brake), settling within OVERBITE_CAP of it.
-  ctrl = make_controller(personality=ECO)
-  out = 0.0
-  for _ in range(20):
-    out = ctrl.smooth_target_accel(-0.2, flat_traj(-1.5), T_IDXS, should_stop=False)
-  assert out < -0.2 - _EPS                                   # deeper than the live -0.2 plan
-  assert out >= -0.2 - OVERBITE_CAP - _EPS                   # but never more than the cap below it
-
-
-def test_overbite_cap_limits_frontload_vs_live_plan():
-  # Cut-in/merge: plan still wants throttle (+0.5) while a deep brake is predicted -> front-load may not
-  # settle more than OVERBITE_CAP below the live plan (no abrupt early over-bite).
-  ctrl = make_controller(personality=ECO)
-  traj = [0.5, 0.3, 0.0, -0.5, -1.5, -2.0] + [-2.0] * (len(T_IDXS) - 6)
-  out = 0.0
-  for _ in range(10):
-    out = ctrl.smooth_target_accel(0.5, traj, T_IDXS, should_stop=False)
-  assert ctrl.smooth_active()
-  assert out == pytest.approx(0.5 - OVERBITE_CAP, abs=1e-3)
-
-
-# --- Stop / low-speed neutrality -------------------------------------------------
-
-def test_low_speed_brake_is_stock_passthrough():
-  # Stop/creep regime (vEgo < STOP_PASSTHROUGH_V): braking is stock so the stop distance matches OFF.
-  ctrl = make_controller(personality=ECO)
-  ctrl.update(make_sm(v_ego=STOP_PASSTHROUGH_V - 0.1))
-  for raw in (-0.3, -1.0):
-    out = ctrl.smooth_target_accel(raw, flat_traj(-1.5), T_IDXS, should_stop=False)
-    assert out == pytest.approx(raw, abs=_EPS)
-    assert not ctrl.smooth_active()
-
-
-def test_low_speed_launch_still_shapes():
-  # The low-speed brake passthrough must NOT neutralize positive-accel (launch) shaping.
-  ctrl = make_controller(personality=ECO)
-  ctrl.update(make_sm(v_ego=STOP_PASSTHROUGH_V - 0.1))
-  ctrl.smooth_target_accel(0.0, flat_traj(0.0), T_IDXS, should_stop=False)
-  out = ctrl.smooth_target_accel(1.5, flat_traj(1.5), T_IDXS, should_stop=False)
-  assert out < 1.5                                           # rise-rate limited (shaped)
-
-
-def test_stop_imminent_passthrough_but_moving_follow_shapes():
-  # Stop coming (plan speed -> ~0): stock passthrough (no coast-in). Slowing to a moving follow: front-load
-  # stays active so the early-brake goal is preserved.
-  ctrl = make_controller(personality=ECO)
-  stopping = [3.0, 2.0, 1.0, 0.4, 0.0] + [0.0] * (len(T_IDXS) - 5)
-  out = ctrl.smooth_target_accel(-0.1, flat_traj(-1.0), T_IDXS, should_stop=False, speed_trajectory=stopping)
-  assert not ctrl.smooth_active()
-  assert out == pytest.approx(-0.1, abs=_EPS)
-  moving = [8.0] * len(T_IDXS)
-  ctrl.smooth_target_accel(-0.1, flat_traj(-1.0), T_IDXS, should_stop=False, speed_trajectory=moving)
-  assert ctrl.smooth_active()
-
-
-# --- TTC-scaled brake-jerk limiter (smooth decel) ----------------------------
-
-def _jl(ctrl, v_ego, lead_d, lead_vlead, raw=-2.8):
-  ctrl.update(make_sm(v_ego=v_ego, lead_status=True, lead_d=lead_d, lead_vlead=lead_vlead))
-  return ctrl.smooth_target_accel(raw, flat_traj(raw), T_IDXS, should_stop=False)
-
-def test_jerk_limit_smooths_roomy_onset():
-  out = _jl(make_controller(jerk_limit=True), 34.7, 84.0, 23.7)   # TTC 7.6s -> gentle 1.5 m/s^3
-  assert -0.2 < out < 0.0                                         # first frame rate-limited, not slammed to -2.8
-
-def test_jerk_limit_lets_urgent_through_fast():
-  out = _jl(make_controller(jerk_limit=True), 16.0, 30.0, 0.0)    # vRel -16, TTC 1.9s -> fast 8 m/s^3
-  assert out < -0.3                                               # ramps fast, far firmer than the roomy case
-
-def test_jerk_limit_off_passthrough():
-  out = _jl(make_controller(), 34.7, 84.0, 23.7)
-  assert out == pytest.approx(-2.8, abs=_EPS)
-
-def test_jerk_limit_no_lead_gentle():
-  ctrl = make_controller(jerk_limit=True)
-  ctrl.update(make_sm(v_ego=20.0))                               # no lead -> no urgency
-  out = ctrl.smooth_target_accel(-2.8, flat_traj(-2.8), T_IDXS, should_stop=False)
-  assert -0.2 < out < 0.0
-
-def test_jerk_limit_does_not_limit_release():
-  ctrl = make_controller(jerk_limit=True)
-  ctrl._last_target_accel = -2.0
-  ctrl.update(make_sm(v_ego=20.0, lead_status=True, lead_d=40.0, lead_vlead=18.0))
-  assert ctrl._brake_jerk_limit(-0.5, reset=False) == pytest.approx(-0.5, abs=_EPS)   # releasing -> not limited
-
-
-def test_onset_spread_bounded_and_skipped_for_emergency():
-  # Non-emergency brake onset is spread (lagged) but never by more than ONSET_SPREAD_MAX; an emergency brake
-  # is instant full depth (no spread).
-  ctrl = make_controller(personality=ECO)
-  for _ in range(3):
-    ctrl.smooth_target_accel(0.0, flat_traj(0.0), T_IDXS, should_stop=False)
-  out = ctrl.smooth_target_accel(-1.0, flat_traj(-1.0), T_IDXS, should_stop=False)   # non-emergency step
-  assert out > -1.0 + _EPS                              # lagged (spread), not an instant step
-  assert out <= -1.0 + ONSET_SPREAD_MAX + _EPS          # but bounded
-  ctrl2 = make_controller(personality=ECO)
-  for _ in range(3):
-    ctrl2.smooth_target_accel(0.0, flat_traj(0.0), T_IDXS, should_stop=False)
-  out2 = ctrl2.smooth_target_accel(-2.0, flat_traj(-2.0), T_IDXS, should_stop=False)  # emergency (<= -1.5)
-  assert out2 == pytest.approx(-2.0, abs=_EPS)
-
-
-def test_disabled_hard_brake_is_instant_stock():
-  ctrl = make_controller(enabled=False, personality=ECO)
-  out = ctrl.smooth_target_accel(-3.0, flat_traj(-3.0), T_IDXS, should_stop=False)
-  assert out == pytest.approx(-3.0, abs=_EPS)
-
-
-# --- Misc ------------------------------------------------------------------------
 
 def test_out_of_range_personality_clamps():
-  ctrl = AccelController(CP=SimpleNamespace(), mpc=SimpleNamespace(crash_cnt=0),
-                         params=FakeParams({"AccelPersonalityEnabled": True, "AccelPersonality": 99}))
-  ctrl.update(make_sm())
+  ctrl = make_controller(personality=99)
   assert ctrl.personality() == PERSONALITY_MAX
 
 
-def test_reset_passes_through():
-  ctrl = make_controller(personality=ECO)
-  out = ctrl.smooth_target_accel(0.0, flat_traj(-1.0), T_IDXS, should_stop=False, reset=True)
-  assert out == pytest.approx(0.0, abs=_EPS)
-  assert not ctrl.bypassed()
+def test_max_accel_uses_stored_v_ego():
+  ctrl = make_controller(personality=SPORT)
+  ctrl.update(make_sm(v_ego=0.0))
+  assert ctrl.max_accel() == pytest.approx(ctrl.get_max_accel(0.0))
+
+
+# --- SnG anti-chatter hysteresis --------------------------------------------------------------------------
+
+def test_sng_disabled_passthrough():
+  ctrl = make_controller(enabled=False)
+  assert ctrl.sng_should_stop(True, -0.5) is True
+  assert ctrl.sng_should_stop(False, 0.05) is False        # identity: mirrors the raw flag exactly
+
+
+def test_sng_sticky_stop_filters_chatter():
+  ctrl = make_controller(personality=NORMAL)
+  assert ctrl.sng_should_stop(True, -0.5) is True          # stopped
+  # raw should_stop chatters False with accel below the go-band -> stay stopped (no gas blip)
+  assert ctrl.sng_should_stop(False, SNG_GO_ACCEL - 0.05) is True
+  assert ctrl.sng_should_stop(False, 0.0) is True
+
+
+def test_sng_launch_is_decisive():
+  ctrl = make_controller(personality=NORMAL)
+  ctrl.sng_should_stop(True, -0.5)                         # stopped
+  assert ctrl.sng_should_stop(False, SNG_GO_ACCEL + 0.1) is False   # clear GO -> launch
+  # once launched it stays go while the plan keeps moving (no re-stop chatter)
+  assert ctrl.sng_should_stop(False, 0.05) is False
+
+
+def test_sng_no_delay_on_real_stop():
+  ctrl = make_controller(personality=NORMAL)
+  ctrl.sng_should_stop(False, 1.0)                         # going
+  assert ctrl.sng_should_stop(True, -1.0) is True          # a genuine stop request is honored immediately
+
+
+def test_sng_reset_recommits_stop():
+  ctrl = make_controller(personality=NORMAL)
+  ctrl.sng_should_stop(False, 1.0)                         # going
+  ctrl.reset()
+  # after reset it is stopped-committed: a below-go-band plan does not launch
+  assert ctrl.sng_should_stop(False, SNG_GO_ACCEL - 0.05) is True

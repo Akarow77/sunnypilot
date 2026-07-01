@@ -3,6 +3,11 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
+
+Acceleration Personality tuning tables. The controller shapes only what the longitudinal MPC CONSUMES
+(the positive-accel ceiling + its open-rate, and an add-only follow-gap widen fed to the MPC's t_follow);
+it never post-shapes the MPC's output accel. Disabled => every getter returns the upstream stock value,
+so off == byte-stock.
 """
 
 from cereal import custom
@@ -15,68 +20,39 @@ SPORT = AccelerationPersonality.sport
 PERSONALITY_MIN = min(AccelerationPersonality.schema.enumerants.values())
 PERSONALITY_MAX = max(AccelerationPersonality.schema.enumerants.values())
 
-# Positive-accel ceiling + its upward slew rate (launch/cruise side; independent of braking). off==stock is
-# enforced in accel_controller (falls back to STOCK_* when disabled), so the tiers are free to differ.
-A_CRUISE_MAX_BP = [0., 14., 25., 40.]
-STOCK_A_CRUISE_MAX_V = [1.6, 0.7, 0.2, 0.08]
-STOCK_RISE_RATE = 0.05
+# --- Positive-accel ceiling (launch/cruise) + its upward open-rate ---------------------------------------
+# off == stock: get_max_accel/get_rise_rate fall back to the STOCK_* values (upstream get_max_accel table
+# and +0.05 ceiling slew), independent of the NORMAL profile so NORMAL is free to differ.
+# ACCEL_MAX (opendbc) hard-caps the ceiling at 2.0 m/s^2, so the launch knots are set at/below it.
+A_CRUISE_MAX_BP = [0., 10., 25., 40.]              # m/s (matches upstream A_CRUISE_MAX_BP)
+STOCK_A_CRUISE_MAX_V = [1.6, 1.2, 0.8, 0.6]        # upstream A_CRUISE_MAX_VALS -> off == byte-stock ceiling
+STOCK_RISE_RATE = 0.05                             # upstream ceiling open-rate (m/s^2 per cycle)
 A_CRUISE_MAX_V = {
-  ECO:    [1.70, 0.75, 0.25, 0.10],   # prompt launch, efficient cruise
-  NORMAL: [2.10, 1.10, 0.50, 0.18],   # quick launch, balanced cruise
-  SPORT:  [2.60, 1.55, 0.85, 0.35],   # fast launch, strong cruise
+  ECO:    [1.80, 1.10, 0.70, 0.50],   # gentle-but-prompt launch, efficient cruise
+  NORMAL: [2.00, 1.40, 0.95, 0.70],   # brisk launch, balanced cruise
+  SPORT:  [2.00, 1.70, 1.20, 0.90],   # strong launch (ACCEL_MAX caps the 0 m/s knot), assertive cruise
 }
-RISE_RATE = {ECO: 0.10, NORMAL: 0.15, SPORT: 0.22}   # ceiling open-rate: all >> stock 0.05 for fast take-off
+# Ceiling open-rate: how fast the accel ceiling may rise per cycle. All >> stock 0.05 so the permitted
+# ceiling opens quickly off the line -> fast take-off from a stop. The MPC's own jerk/a_change cost still
+# smooths the actual accel, so a higher open-rate cannot make the launch jerky.
+RISE_RATE = {ECO: 0.10, NORMAL: 0.16, SPORT: 0.24}
 
-# Anticipatory front-load: predicted brake need (m/s^2) -> early decel target (m/s^2). Starts a gentle
-# decel early when a brake is predicted, so it arrives spread out, not as one late firm onset. The first
-# knot sits AT the MIN_SMOOTH_BRAKE_NEED gate (0.00 there): below the gate there is no front-load, so there
-# is no dead [0, gate) anchor and no step at the gate (the old [0.0 -> 0.00] knot was never evaluated).
-SMOOTH_DECEL_BP = [0.4, 0.8, 1.2, 1.6, 2.0, 2.4]
-SMOOTH_DECEL_V = {
-  ECO:    [0.00, -0.20, -0.35, -0.55, -0.78, -1.00],
-  NORMAL: [0.00, -0.30, -0.55, -0.84, -1.12, -1.40],
-  SPORT:  [0.00, -0.40, -0.72, -1.05, -1.35, -1.65],
-}
-BRAKE_DEEPENING_JERK = {ECO: 0.5, NORMAL: 0.8, SPORT: 1.0}
-BRAKE_RELEASE_JERK = 2.0
-ACCEL_RISE_JERK = {ECO: 1.0, NORMAL: 1.5, SPORT: 2.2}   # accel-onset jerk: higher = snappier take-off, stepped per tier
+# --- Follow-gap widen (add-only, fed to the MPC t_follow) ------------------------------------------------
+# Add a small speed-dependent widen to the stock t_follow (the driver's gap-button value). Wider gap ->
+# MPC brakes earlier + gentler onto a slowing lead and settles a roomier cruise gap. Invariants:
+#   * add-only         -> desired distance >= stock -> braking >= stock;
+#   * zero below TF_WIDEN_V_BP[0] -> low-speed & standstill gap stay stock (stock stop distance preserved);
+#   * slewed per cycle -> no rubber-band;  decel-hold -> gap won't shrink while braking (stays committed).
+TF_WIDEN_V_BP = [14.0, 28.0]                       # m/s: widen ramps in across this band, flat above
+TF_WIDEN_BASE_V = [0.0, 0.30]                      # s: base follow-time added at the band ends (pre-tier)
+TF_WIDEN_TIER = {ECO: 1.30, NORMAL: 1.00, SPORT: 0.50}   # ECO roomiest/smoothest, SPORT tightest/snappiest
+TF_WIDEN_MAX = 0.45                                # s: absolute cap on the added gap (never explodes)
+TF_SLEW_PER_S = 0.50                               # s per second: max rate the widen may open/close
+TF_DECEL_HOLD_A = -0.20                            # m/s^2: at/below this a_ego (braking) the widen won't shrink
 
-SMOOTH_DECEL_LOOKAHEAD_T = 3.0
-MIN_SMOOTH_BRAKE_NEED = 0.4   # below this no front-load (kills the faint low-brake_need drag + the gate-crossing toggle)
-
-# Cap how much DEEPER than the live plan the front-load may bite -> no abrupt over-bite on a cut-in
-# brake_need spike (binds only when the plan still wants throttle; once it brakes, the table wins).
-OVERBITE_CAP = 0.30   # m/s^2 max front-load depth below the live plan
-
-# Hard brake: at/below this accel, or this predicted brake_need within the lookahead, the controller hands
-# the plan straight through at full strength and rate (no front-load, no rate limit) -- a firm/closing-lead
-# brake must never be delayed, softened or rate-limited.
-HARD_BRAKE_TARGET_ACCEL = -1.5
-HARD_BRAKE_NEED = 2.6
-
-# Stop-imminent stand-down. When the plan predicts a near-stop within the lookahead, hand the plan straight
-# through (stock decel) so the car stops at the proper gap with no front-load coast-in. Keyed on the
-# PREDICTED speed reaching ~0 (covers lead AND light/sign stops), not raw ego speed.
-STOP_IMMINENT_VEGO = 1.0          # m/s  plan-predicted speed below this within the lookahead == stop coming
-STOP_IMMINENT_LOOKAHEAD_T = 3.0   # s
-
-# Below this ego speed the brake side is stock passthrough (the comfort stop below adds the only low-speed
-# shaping); the bounded onset-spread does not run here, so a stock stop is not rate-limited.
-STOP_PASSTHROUGH_V = 5.0          # m/s
-
-# Scoped onset-spread -- the ONLY place the output may be transiently WEAKER than the plan. On a NON-emergency
-# brake the onset may arrive spread over a bounded ramp instead of stepping straight to the plan: the output
-# may lag the plan by at most ONSET_SPREAD_MAX, deepening toward it at ONSET_SPREAD_JERK. A firm/closing brake
-# (raw <= HARD_BRAKE_TARGET_ACCEL or brake_need >= HARD_BRAKE_NEED, FCW/crash, should_stop, blended/e2e) skips
-# this entirely (raw passthrough), so a real hard brake is never softened or delayed.
-ONSET_SPREAD_MAX = 0.25           # m/s^2: max the output may lag (be weaker than) the live plan, non-emergency only
-ONSET_SPREAD_JERK = 2.5           # m/s^3: rate the spread output deepens back toward the plan
-
-# TTC-scaled brake-jerk limiter: cap how fast the brake DEEPENS, scaled by urgency. Roomy (high TTC) -> gentle
-# onset (smooth decel, no jerk); urgent (low TTC) -> fast (no delay on a real emergency). Caps the RATE only,
-# never the magnitude, so it cannot under-brake -- only smooths the onset where there is room. Gated OFF.
-JERK_LIMIT_ENABLED = False
-BRAKE_JERK_SMOOTH = 1.5           # m/s^3: deepening-jerk cap when roomy (TTC >= BRAKE_JERK_TTC_HI)
-BRAKE_JERK_URGENT = 8.0           # m/s^3: deepening-jerk cap when urgent (TTC <= BRAKE_JERK_TTC_LO; ~unconstrained)
-BRAKE_JERK_TTC_HI = 6.0           # s: at/above this TTC -> full smooth limit
-BRAKE_JERK_TTC_LO = 2.5           # s: at/below this TTC -> full fast limit
+# --- Stop-and-go anti-chatter (should_stop hysteresis) --------------------------------------------------
+# should_stop toggling at the stop threshold flips longcontrol stopping<->pid = the gas-brake-gas-brake.
+# Sticky-stop: once stopped, launch only on a clear GO (a_target >= SNG_GO_ACCEL, above the 0.1 should_stop
+# gate -> filters chatter, decisive launch). Sticky-go: re-stop only on a genuine request (no delay).
+# Only ever holds a stop longer (brake >= stock); off => passthrough.
+SNG_GO_ACCEL = 0.20   # m/s^2: plan accel above which a stopped car commits to launch

@@ -147,15 +147,16 @@ class LongitudinalPlannerSP:
     e2eAlerts.greenLightAlert = self.e2e_alerts_helper.green_light_alert
     e2eAlerts.leadDepartAlert = self.e2e_alerts_helper.lead_depart_alert
 
-    # Acceleration Personality
+    # Acceleration Personality (telemetry only; brakeNeed/decelTarget/smoothActive repurposed for the
+    # input-shaping design -- see cereal custom.capnp Acceleration).
     acceleration = longitudinalPlanSP.acceleration
     acceleration.personality = self.accel.personality()
     acceleration.enabled = self.accel.enabled()
     acceleration.maxAccel = float(self.accel.max_accel())
-    acceleration.brakeNeed = float(self.accel.brake_need())
-    acceleration.decelTarget = float(self.accel.decel_target())
-    acceleration.smoothActive = self.accel.smooth_active()
-    acceleration.bypassed = bool(self.accel.bypassed())
+    acceleration.brakeNeed = float(self.accel.follow_widen())    # follow-gap widen added on top of stock (s)
+    acceleration.decelTarget = float(self.accel.t_follow())       # t_follow handed to the MPC (s)
+    acceleration.smoothActive = self.accel.widen_active()         # follow-gap widen currently active
+    acceleration.bypassed = False                                 # unused (no output shaping / bypass anymore)
     acceleration.leadUnstable = bool(self.radar_distance.lead_unstable())
 
 

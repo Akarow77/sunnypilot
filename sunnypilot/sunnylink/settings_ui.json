@@ -597,47 +597,7 @@
               "key": "RadarDistance",
               "widget": "toggle",
               "title": "Radar Distance",
-              "description": "Holds a lead through brief radar flicker/dropout so sunnypilot does not lose and re-grab it, and at higher speed keeps a slightly wider following gap so it starts slowing sooner when the lead does. Smooths the hard/late brakes that radar drop-outs cause. Braking is never reduced below stock.",
-              "visibility": [
-                {
-                  "type": "capability",
-                  "field": "has_longitudinal_control",
-                  "equals": true
-                }
-              ],
-              "enablement": [
-                {
-                  "type": "capability",
-                  "field": "has_longitudinal_control",
-                  "equals": true
-                }
-              ]
-            },
-            {
-              "key": "StopGapBias",
-              "widget": "toggle",
-              "title": "Smooth Stop",
-              "description": "Stops a touch farther back from a stopped lead at low speed, so sunnypilot settles smoothly instead of crawling in close. Braking is never reduced below stock.",
-              "visibility": [
-                {
-                  "type": "capability",
-                  "field": "has_longitudinal_control",
-                  "equals": true
-                }
-              ],
-              "enablement": [
-                {
-                  "type": "capability",
-                  "field": "has_longitudinal_control",
-                  "equals": true
-                }
-              ]
-            },
-            {
-              "key": "LeadDecelAnticipate",
-              "widget": "toggle",
-              "title": "Anticipate Braking Lead",
-              "description": "When the lead brakes hard, starts slowing earlier and spreads the brake instead of a late hard catch-up. Braking is never reduced below stock.",
+              "description": "De-noises the lead sunnypilot follows -- holds it through brief radar flicker/dropout and smooths a jittery (track-flipping) lead -- so it does not lose and re-grab the lead or hunt the gap. Braking is never reduced below stock.",
               "visibility": [
                 {
                   "type": "capability",
@@ -690,7 +650,7 @@
               "key": "AccelPersonalityEnabled",
               "widget": "toggle",
               "title": "Enable Acceleration Profiles",
-              "description": "Enables Eco/Normal/Sport acceleration profiles for longitudinal control, including early soft braking.",
+              "description": "Enables Eco/Normal/Sport profiles -- a tier-scaled take-off from a stop and a slightly wider, smoother following gap. Braking is never reduced below stock.",
               "visibility": [
                 {
                   "type": "capability",
@@ -710,7 +670,7 @@
               "key": "AccelPersonality",
               "widget": "multiple_button",
               "title": "Acceleration Profile",
-              "description": "Eco accelerates gently and brakes early and soft; Sport accelerates briskly. Hard-braking authority is always preserved.",
+              "description": "Eco takes off gently and keeps the roomiest, smoothest following gap; Sport takes off briskly and follows a touch tighter. Hard-braking authority is always preserved.",
               "options": [
                 {
                   "value": 0,

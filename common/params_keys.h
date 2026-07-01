@@ -240,14 +240,9 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"AccelPersonalityEnabled", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"AccelPersonality", {PERSISTENT | BACKUP, INT, std::to_string(static_cast<int>(cereal::LongitudinalPlanSP::AccelerationPersonality::NORMAL))}},
 
-    // Radar Distance: hold a lead through radar flicker/dropout so the MPC doesn't lose+regain it
+    // Radar Distance: de-noise the lead the MPC follows (flicker-hold + churn smoother); never reports a
+    // farther/faster lead than reality, so braking stays >= stock
     {"RadarDistance", {PERSISTENT | BACKUP, BOOL, "0"}},
-
-    // Stop Gap Bias: stop a bit farther back from a stopped lead so it doesn't crawl in too close
-    {"StopGapBias", {PERSISTENT | BACKUP, BOOL, "0"}},
-
-    // Lead Decel Anticipate: start braking earlier for a hard-braking lead so the brake isn't a late catch-up
-    {"LeadDecelAnticipate", {PERSISTENT | BACKUP, BOOL, "0"}},
 
     // sunnypilot model params
     {"CameraOffset", {PERSISTENT | BACKUP, FLOAT, "0.0"}},

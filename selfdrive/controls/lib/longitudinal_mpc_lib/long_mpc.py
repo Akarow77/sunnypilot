@@ -219,6 +219,7 @@ class LongitudinalMpc:
     self.solver = AcadosOcpSolverCython(MODEL_NAME, ACADOS_SOLVER_TYPE, N)
     self.reset()
     self.source = LongitudinalPlanSource.cruise
+    self.t_follow_fn = None  # sunnypilot: optional (t_follow, v_ego)->t_follow override; None == byte-stock
 
   def reset(self):
     self.solver.reset()
@@ -316,6 +317,8 @@ class LongitudinalMpc:
   def update(self, radarstate, v_cruise, personality=log.LongitudinalPersonality.standard):
     t_follow = get_T_FOLLOW(personality)
     v_ego = self.x0[1]
+    if self.t_follow_fn is not None:
+      t_follow = self.t_follow_fn(t_follow, v_ego)
     self.status = radarstate.leadOne.status or radarstate.leadTwo.status
 
     lead_xv_0 = self.process_lead(radarstate.leadOne)

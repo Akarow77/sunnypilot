@@ -4,19 +4,18 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
-RadarDistance conditions the lead the longitudinal MPC follows on a noisy radar, never reporting a
-farther-or-faster lead than reality, so braking is always >= stock:
-  - flicker-hold: keep a just-dropped, recently-sustained lead alive through a radar dropout.
-  - lead-jitter smoother: de-jitter a churning (trackId-flipping) lead so the MPC does not hunt the gap.
-  - stop-gap bias: report a near-stopped lead slightly closer so the MPC stops a touch farther back.
-  - speed-gap bias: at higher speed report the lead slightly nearer so the MPC settles a wider following
-    gap and reacts to a lead's deceleration sooner.
-Also publishes a read-only lead-instability flag (telemetry). Default off => stock passthrough.
+RadarDistance de-noises the lead the longitudinal MPC follows on a noisy (TSS2-class) radar. It NEVER
+reports a farther-or-faster lead than reality, so braking is always >= stock, and it changes nothing about
+the desired gap -- that is the AccelController's job (t_follow). Two mechanisms only:
+  * flicker-hold: keep a just-dropped, recently-sustained lead alive (dead-reckoned) through a brief radar
+    dropout so the MPC does not lose and re-grab it (which reads as a phantom release then a catch-up brake);
+  * churn smoother: a short SYMMETRIC EMA on a trackId-churning lead's dRel/vLead/vRel so the MPC stops
+    hunting the gap (removes the follow-jitter that reads as rubber-banding).
+Also publishes a read-only lead-instability flag (telemetry). Below LOW_SPEED_PASSTHROUGH_V it is a
+byte-stock passthrough (stop distance stays exactly stock). Disabled => byte-stock passthrough always.
 """
 
 from collections import deque
-
-import numpy as np
 
 from opendbc.car import structs
 from openpilot.common.params import Params
@@ -28,66 +27,23 @@ DROPOUT_DREL = 1.0
 FCW_PROB_CAP = 0.9
 MIN_HELD_DREL = 0.5
 
-LOW_SPEED_PASSTHROUGH_V = 5.0   # m/s
+LOW_SPEED_PASSTHROUGH_V = 5.0   # m/s: below this, no flicker-hold (holding a stale lead near a stop would
+                                # delay the launch); the churn smoother still runs down to CREEP_PASSTHROUGH_V
+CREEP_PASSTHROUGH_V = 1.0       # m/s: below this, full byte-stock passthrough (protect the stock stop distance)
 
 SWITCH_DREL = 8.0              # m, dRel jump = a track switch (used by the instability detector)
 
 # Lead-instability detector (telemetry only): flags a bimodal/bouncing radar lead.
-STABILITY_WINDOW = 5            # frames (~0.25s @ 20Hz)
-VLEAD_SPREAD = 4.0             # m/s, vLead range over the window above which the lead is "unstable"
-ID_CHURN_WINDOW = 10           # frames (~0.5s) for radarTrackId-churn detection (steady lead, flipping track ids)
-ID_CHURN = 3                   # trackId switches in the window above which the lead is "unstable" (follow-hunting)
+STABILITY_WINDOW = 5           # frames (~0.25s @ 20Hz)
+VLEAD_SPREAD = 4.0            # m/s, vLead range over the window above which the lead is "unstable"
+ID_CHURN_WINDOW = 10          # frames (~0.5s) for radarTrackId-churn detection (steady lead, flipping ids)
+ID_CHURN = 3                 # trackId switches in the window above which the lead is "unstable" (follow-hunting)
 
-# Lead jitter smoother (B2): during trackId churn the per-track dRel/vRel jitter makes the MPC hunt the follow
-# gap. A short SYMMETRIC EMA on the churning lead removes the jitter so the MPC sees a steady lead and stops
-# hunting. Active ONLY during churn (NOT bimodal vLead -> never averages two real tracks). Bounded symmetric
-# lag ~LEAD_SMOOTH_TAU. Gated OFF by default.
-LEAD_SMOOTH_ENABLED = False
+# Churn smoother: during trackId churn the per-track dRel/vRel jitter makes the MPC hunt the follow gap. A
+# short SYMMETRIC EMA on the churning lead removes the jitter so the MPC sees a steady lead. Active ONLY
+# during churn (NOT bimodal vLead -> never averages two real tracks). Bounded symmetric lag ~LEAD_SMOOTH_TAU.
 LEAD_SMOOTH_TAU = 0.5          # s, EMA time constant
 LEAD_SMOOTH_HOLD = 20          # frames (~1s): keep smoothing through brief churn gaps (churn toggles on/off)
-
-# Stop-gap bias: near a (near-)stopped lead at low speed, report dRel up to STOP_GAP_BIAS_M closer so the MPC
-# runs its own smooth stop but terminates that much farther back (stock crawl-creeps to ~2m). Monotone (closer
-# => brake >= stock). Ramps in over the regime edge and out as the lead moves (no step, releases on launch).
-# Gated by the StopGapBias param, independent of the rest of the controller.
-STOP_GAP_BIAS_M = 2.0          # m: max dRel reduction = added standstill gap
-STOP_BIAS_VEGO = 8.0           # m/s: only below this ego speed
-STOP_BIAS_VLEAD = 1.5         # m/s: only behind a (near-)stopped lead; ramps out as vLead rises to this
-STOP_BIAS_REGIME_DREL = 12.0   # m: bias ramps in below this dRel
-STOP_BIAS_RAMP_BAND = 2.0     # m: ramp-in band (full offset below REGIME_DREL - RAMP_BAND)
-STOP_BIAS_MIN_DREL = 2.0      # m: never report a lead closer than this
-
-# Speed-gap bias: widen the following gap at higher speed by reporting the lead a touch nearer
-# (offset_m = dt(v) * v_ego). The MPC regulates the reported gap onto its target, so the real gap settles
-# wider and braking onto a slowing lead starts sooner. Only reports nearer, so braking stays >= stock.
-SPEED_GAP_V_BP = [14.0, 28.0]          # m/s: gap widening ramps in across this band, flat above
-SPEED_GAP_TF_V = [0.0, 0.25]           # s: follow-time added to the gap at the band ends
-SPEED_GAP_MAX_M = 5.0                  # m: cap on the reported reduction
-SPEED_GAP_MIN_DREL = 3.0               # m: never report the lead nearer than this
-
-# Lead-decel anticipation: when the lead is braking (aLeadK negative) and we are closing, report it a bit
-# nearer so the MPC brings its brake forward and spreads it, rather than a late hard catch-up. The offset
-# grows with how hard the lead is braking. Only reports nearer (obstacle only shrinks => brake >= stock).
-# Gated by the LeadDecelAnticipate param.
-LEAD_DECEL_ALEAD_BP = [0.5, 3.0]       # |aLeadK| m/s^2 (lead braking) mapped to the anticipation offset
-LEAD_DECEL_OFFSET_V = [0.0, 5.0]       # m: dRel reduction across that band
-LEAD_DECEL_MAX_VREL = -0.3             # m/s: only anticipate when closing (vRel below this)
-LEAD_DECEL_MIN_DREL = 4.0              # m: never report the lead nearer than this
-
-
-class _BiasedLead:
-  __slots__ = ('status', 'dRel', 'yRel', 'vRel', 'vLead', 'vLeadK', 'aLeadK', 'aLeadTau', 'modelProb')
-
-  def __init__(self, src, dRel):
-    self.status = src.status
-    self.dRel = dRel
-    self.yRel = src.yRel
-    self.vRel = src.vRel
-    self.vLead = src.vLead
-    self.vLeadK = src.vLeadK
-    self.aLeadK = src.aLeadK
-    self.aLeadTau = src.aLeadTau
-    self.modelProb = src.modelProb
 
 
 class _SmoothedLead:
@@ -103,6 +59,29 @@ class _SmoothedLead:
     self.aLeadK = src.aLeadK
     self.aLeadTau = src.aLeadTau
     self.modelProb = src.modelProb
+
+
+class _HeldLead:
+  __slots__ = ('status', 'dRel', 'yRel', 'vRel', 'vLead', 'vLeadK', 'aLeadK', 'aLeadTau', 'modelProb')
+
+  def __init__(self, dRel, vRel, vLead, aLeadK, aLeadTau, modelProb):
+    self.status = True
+    self.dRel = dRel
+    self.vRel = vRel
+    self.vLead = vLead
+    self.vLeadK = vLead
+    self.aLeadK = aLeadK
+    self.aLeadTau = aLeadTau
+    self.modelProb = modelProb
+    self.yRel = 0.0
+
+
+class _RadarStateProxy:
+  __slots__ = ('leadOne', 'leadTwo')
+
+  def __init__(self, lead_one, lead_two):
+    self.leadOne = lead_one
+    self.leadTwo = lead_two
 
 
 class _LeadSmoother:
@@ -133,29 +112,6 @@ class _LeadSmoother:
     self._vl += (lead.vLead - self._vl) * a
     self._vr += (lead.vRel - self._vr) * a
     return _SmoothedLead(lead, self._d, self._vl, self._vr)
-
-
-class _HeldLead:
-  __slots__ = ('status', 'dRel', 'yRel', 'vRel', 'vLead', 'vLeadK', 'aLeadK', 'aLeadTau', 'modelProb')
-
-  def __init__(self, dRel, vRel, vLead, aLeadK, aLeadTau, modelProb):
-    self.status = True
-    self.dRel = dRel
-    self.vRel = vRel
-    self.vLead = vLead
-    self.vLeadK = vLead
-    self.aLeadK = aLeadK
-    self.aLeadTau = aLeadTau
-    self.modelProb = modelProb
-    self.yRel = 0.0
-
-
-class _RadarStateProxy:
-  __slots__ = ('leadOne', 'leadTwo')
-
-  def __init__(self, lead_one, lead_two):
-    self.leadOne = lead_one
-    self.leadTwo = lead_two
 
 
 class _LeadHold:
@@ -209,7 +165,7 @@ class _LeadStability:
     self.churn = False
 
   def update(self, lead, v_ego: float) -> None:
-    if not lead.status or v_ego < LOW_SPEED_PASSTHROUGH_V:
+    if not lead.status or v_ego < CREEP_PASSTHROUGH_V:
       self.reset()
       return
     self._v.append(float(lead.vLead))
@@ -228,14 +184,11 @@ class _LeadStability:
 
 class RadarDistanceController:
   def __init__(self, CP: structs.CarParams, params=None):
-    self._CP = CP
+    # CP accepted for the planner's constructor signature; unused.
     self._params = params or Params()
     self._frame = 0
     self._v_ego = 0.0
     self._enabled = self._params.get_bool("RadarDistance")
-    self._stop_gap_bias_enabled = self._params.get_bool("StopGapBias")
-    self._lead_decel_enabled = self._params.get_bool("LeadDecelAnticipate")
-    self._lead_smooth_enabled = LEAD_SMOOTH_ENABLED
     self._one = _LeadHold()
     self._two = _LeadHold()
     self._stability = _LeadStability()
@@ -243,12 +196,11 @@ class RadarDistanceController:
 
   def _read_params(self) -> None:
     enabled = self._params.get_bool("RadarDistance")
-    if enabled and not self._enabled:
+    if not enabled and self._enabled:
       self._one.reset()
       self._two.reset()
+      self._smoother.reset()
     self._enabled = enabled
-    self._stop_gap_bias_enabled = self._params.get_bool("StopGapBias")
-    self._lead_decel_enabled = self._params.get_bool("LeadDecelAnticipate")
 
   def update(self, sm) -> None:
     if self._frame % int(1. / DT_MDL) == 0:
@@ -262,56 +214,16 @@ class RadarDistanceController:
   def lead_unstable(self) -> bool:
     return self._stability.unstable
 
-  def _stop_gap_bias(self, lead):
-    # Report a (near-)stopped lead up to STOP_GAP_BIAS_M closer at low speed, so the MPC's own smooth stop ends
-    # that much farther back. Monotone (only ever reports closer). No-op outside the regime / when disabled.
-    if not self._stop_gap_bias_enabled or not lead.status:
-      return lead
-    if lead.vLead > STOP_BIAS_VLEAD or self._v_ego > STOP_BIAS_VEGO or lead.dRel <= STOP_BIAS_MIN_DREL:
-      return lead
-    d_ramp = min(max((STOP_BIAS_REGIME_DREL - lead.dRel) / STOP_BIAS_RAMP_BAND, 0.0), 1.0)
-    v_ramp = min(max((STOP_BIAS_VLEAD - lead.vLead) / STOP_BIAS_VLEAD, 0.0), 1.0)
-    offset = STOP_GAP_BIAS_M * d_ramp * v_ramp
-    if offset < 0.05:
-      return lead
-    return _BiasedLead(lead, max(lead.dRel - offset, STOP_BIAS_MIN_DREL))
-
-  def _speed_gap_bias(self, lead):
-    # Report the lead nearer at speed so the MPC holds a wider gap and brakes sooner onto a slowing lead.
-    if not lead.status:
-      return lead
-    tf = float(np.interp(self._v_ego, SPEED_GAP_V_BP, SPEED_GAP_TF_V))
-    offset = min(tf * self._v_ego, SPEED_GAP_MAX_M)
-    new_dRel = max(lead.dRel - offset, SPEED_GAP_MIN_DREL)
-    if new_dRel >= lead.dRel - 0.05:
-      return lead
-    return _BiasedLead(lead, new_dRel)
-
-  def _lead_decel_bias(self, lead):
-    # Report a braking, closing lead a bit nearer so the MPC brakes earlier and spreads it (anticipation).
-    if not self._lead_decel_enabled or not lead.status:
-      return lead
-    if lead.aLeadK >= 0.0 or lead.vRel > LEAD_DECEL_MAX_VREL:
-      return lead
-    offset = float(np.interp(-lead.aLeadK, LEAD_DECEL_ALEAD_BP, LEAD_DECEL_OFFSET_V))
-    new_dRel = max(lead.dRel - offset, LEAD_DECEL_MIN_DREL)
-    if new_dRel >= lead.dRel - 0.05:
-      return lead
-    return _BiasedLead(lead, new_dRel)
-
   def smooth_radarstate(self, radarstate):
     self._stability.update(radarstate.leadOne, self._v_ego)   # telemetry, runs every cycle
-    if not self._enabled:
-      one_b = self._lead_decel_bias(self._stop_gap_bias(radarstate.leadOne))  # standalone biases (self-gated)
-      return radarstate if one_b is radarstate.leadOne else _RadarStateProxy(one_b, radarstate.leadTwo)
-    one = self._one.step(radarstate.leadOne)
-    two = self._two.step(radarstate.leadTwo)
+    if not self._enabled or self._v_ego < CREEP_PASSTHROUGH_V:
+      return radarstate                                       # off / full standstill: byte-stock (stock stop)
     if self._v_ego < LOW_SPEED_PASSTHROUGH_V:
-      one_b = self._lead_decel_bias(self._stop_gap_bias(radarstate.leadOne))  # crawl: stop-gap + anticipation
-      return radarstate if one_b is radarstate.leadOne else _RadarStateProxy(one_b, radarstate.leadTwo)
-    one = self._stop_gap_bias(one)
-    one = self._speed_gap_bias(one)
-    one = self._lead_decel_bias(one)
-    if self._lead_smooth_enabled:
-      one = self._smoother.update(one, self._stability.churn)  # de-jitter a churning lead (anti follow-hunt)
+      # creep band: churn de-jitter ONLY (symmetric EMA, mean-preserving), no flicker-hold. Smooths the
+      # radar jitter that makes stop-and-go feel like gas-brake-gas-brake, without holding a stale lead.
+      one = self._smoother.update(radarstate.leadOne, self._stability.churn)
+      return radarstate if one is radarstate.leadOne else _RadarStateProxy(one, radarstate.leadTwo)
+    one = self._one.step(radarstate.leadOne)                  # >= LOW_SPEED: flicker-hold ...
+    two = self._two.step(radarstate.leadTwo)
+    one = self._smoother.update(one, self._stability.churn)   # ... + churn de-jitter (anti follow-hunt)
     return _RadarStateProxy(one, two)

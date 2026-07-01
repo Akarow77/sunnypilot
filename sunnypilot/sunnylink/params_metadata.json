@@ -1,11 +1,11 @@
 {
   "AccelPersonality": {
     "title": "Acceleration Profile",
-    "description": "Eco accelerates gently and brakes early and soft; Sport accelerates briskly. Hard-braking authority is always preserved."
+    "description": "Eco takes off gently and keeps the roomiest, smoothest following gap; Sport takes off briskly and follows a touch tighter. Hard-braking authority is always preserved."
   },
   "AccelPersonalityEnabled": {
     "title": "Enable Acceleration Profiles",
-    "description": "Enable Eco/Normal/Sport acceleration profiles, including early soft braking."
+    "description": "Enables Eco/Normal/Sport profiles -- a tier-scaled take-off from a stop and a slightly wider, smoother following gap. Braking is never reduced below stock."
   },
   "AccessToken": {
     "title": "AccessTokenIsNice",
@@ -600,10 +600,6 @@
     "title": "Lateral Maneuver Mode",
     "description": ""
   },
-  "LeadDecelAnticipate": {
-    "title": "Anticipate Braking Lead",
-    "description": "When the lead brakes hard, starts slowing earlier and spreads the brake instead of a late hard catch-up. Braking is never reduced below stock."
-  },
   "LeadDepartAlert": {
     "title": "Lead Departure Alert (Beta)",
     "description": "A chime and on-screen alert (TIZI/TICI only) will play when you are stopped, and the vehicle in front of you start moving. <br>Note: This chime is only designed as a notification. It is the driver's responsibility to observe their environment and make decisions accordingly."
@@ -1112,7 +1108,7 @@
   },
   "RadarDistance": {
     "title": "Radar Distance",
-    "description": "Holds a lead through brief radar flicker/dropout so sunnypilot does not lose and re-grab it, smoothing the hard/late brakes that radar drop-outs cause. Braking is never reduced below stock."
+    "description": "De-noises the lead sunnypilot follows -- holds it through brief radar flicker/dropout and smooths a jittery (track-flipping) lead -- so it does not lose and re-grab the lead or hunt the gap. Braking is never reduced below stock."
   },
   "RainbowMode": {
     "title": "Rainbow Mode",
@@ -1262,10 +1258,6 @@
   "StandstillTimer": {
     "title": "[TIZI/TICI only] Standstill Timer",
     "description": "Show a timer on the HUD when the car is at a standstill."
-  },
-  "StopGapBias": {
-    "title": "Smooth Stop",
-    "description": "Stops a touch farther back from a stopped lead at low speed, so sunnypilot settles smoothly instead of crawling in close. Braking is never reduced below stock."
   },
   "SubaruStopAndGo": {
     "title": "Subaru Stop and Go",

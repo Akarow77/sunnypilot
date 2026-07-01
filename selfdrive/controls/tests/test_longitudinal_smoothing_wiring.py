@@ -3,6 +3,7 @@ import re
 from pathlib import Path
 
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -13,19 +14,33 @@ def test_smoothing_params_default_off():
 
   assert re.search(r'"AccelPersonalityEnabled", \{PERSISTENT \| BACKUP, BOOL, "0"\}', params_keys)
   assert re.search(r'"RadarDistance", \{PERSISTENT \| BACKUP, BOOL, "0"\}', params_keys)
-  assert re.search(r'"StopGapBias", \{PERSISTENT \| BACKUP, BOOL, "0"\}', params_keys)
-  assert re.search(r'"LeadDecelAnticipate", \{PERSISTENT \| BACKUP, BOOL, "0"\}', params_keys)
+  # the retired dRel-bias sub-toggles must not return (their features were deleted in the input-shaping rewrite)
+  assert '"StopGapBias"' not in params_keys
+  assert '"LeadDecelAnticipate"' not in params_keys
 
 
-def test_longitudinal_smoothing_stays_planner_side():
+def test_output_is_byte_stock_and_inputs_are_shaped():
   update_src = inspect.getsource(LongitudinalPlanner.update)
 
-  accel_ceiling_idx = update_src.index("self.accel.get_max_accel(v_ego)")
-  radar_smoothing_idx = update_src.index("self.mpc.update(self.smooth_radarstate(sm['radarState'])")
-  accel_smoothing_idx = update_src.index("self.accel.smooth_target_accel(")
+  # INPUT shaping only: the accel ceiling and the radar-conditioning seam are present...
+  assert "self.accel.get_max_accel(v_ego)" in update_src
+  assert "self.mpc.update(self.smooth_radarstate(sm['radarState'])" in update_src
+  # ...and the OUTPUT is never post-shaped (the old output shaper is gone -> byte-stock output).
+  assert "smooth_target_accel" not in update_src
+  # the only output-side touch is the SnG should_stop hysteresis (anti gas-brake-gas-brake), which never
+  # changes the accel target, only whether the plan holds the stop.
+  assert "self.accel.sng_should_stop(" in update_src
 
-  assert accel_ceiling_idx < radar_smoothing_idx
-  assert radar_smoothing_idx < accel_smoothing_idx
+
+def test_t_follow_hook_wired_and_identity_default():
+  init_src = inspect.getsource(LongitudinalPlanner.__init__)
+  assert "self.mpc.t_follow_fn = self.accel.get_t_follow" in init_src   # planner wires the add-only widen
+
+  mpc_init = inspect.getsource(LongitudinalMpc.__init__)
+  assert "self.t_follow_fn = None" in mpc_init                          # default None == byte-stock identity
+
+  mpc_update = inspect.getsource(LongitudinalMpc.update)
+  assert "if self.t_follow_fn is not None:" in mpc_update               # guarded hook, only fires when set
 
 
 # Tokens for the reverted input-side DEC model-stop-target (capped v_target into the MPC pre-solve). It was
@@ -42,14 +57,3 @@ def test_dec_model_stop_target_not_reintroduced():
       src = path.read_text()
       for token in _DEC_MODEL_STOP_TOKENS:
         assert token not in src, f"reverted DEC model-stop-target ({token}) re-introduced in {path}"
-
-
-def test_long_feature_gates():
-  # The surviving opt-in long features default OFF (byte-stock until enabled + on-road verified):
-  # AccelController jerk-limiter and RadarDistance lead-smoother are module flags; the StopGapBias stop-gap
-  # rides on a param (its default is checked in test_smoothing_params_default_off).
-  from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import JERK_LIMIT_ENABLED
-  from openpilot.sunnypilot.selfdrive.controls.lib.radar_distance.radar_distance import LEAD_SMOOTH_ENABLED
-
-  assert JERK_LIMIT_ENABLED is False
-  assert LEAD_SMOOTH_ENABLED is False
