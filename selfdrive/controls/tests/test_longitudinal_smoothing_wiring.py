@@ -13,6 +13,7 @@ def test_smoothing_params_default_off():
 
   assert re.search(r'"AccelPersonalityEnabled", \{PERSISTENT \| BACKUP, BOOL, "0"\}', params_keys)
   assert re.search(r'"RadarDistance", \{PERSISTENT \| BACKUP, BOOL, "0"\}', params_keys)
+  assert re.search(r'"StopGapBias", \{PERSISTENT \| BACKUP, BOOL, "0"\}', params_keys)
 
 
 def test_longitudinal_smoothing_stays_planner_side():
@@ -43,12 +44,11 @@ def test_dec_model_stop_target_not_reintroduced():
 
 
 def test_long_feature_gates():
-  # The surviving opt-in long features all default OFF (byte-stock until enabled + on-road verified):
-  # AccelController jerk-limiter, RadarDistance lead-smoother + stop-gap bias.
+  # The surviving opt-in long features default OFF (byte-stock until enabled + on-road verified):
+  # AccelController jerk-limiter and RadarDistance lead-smoother are module flags; the StopGapBias stop-gap
+  # rides on a param (its default is checked in test_smoothing_params_default_off).
   from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import JERK_LIMIT_ENABLED
-  from openpilot.sunnypilot.selfdrive.controls.lib.radar_distance.radar_distance import \
-    LEAD_SMOOTH_ENABLED, STOP_GAP_BIAS_ENABLED
+  from openpilot.sunnypilot.selfdrive.controls.lib.radar_distance.radar_distance import LEAD_SMOOTH_ENABLED
 
   assert JERK_LIMIT_ENABLED is False
   assert LEAD_SMOOTH_ENABLED is False
-  assert STOP_GAP_BIAS_ENABLED is False

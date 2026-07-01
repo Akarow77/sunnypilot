@@ -243,8 +243,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // Radar Distance: hold a lead through radar flicker/dropout so the MPC doesn't lose+regain it
     {"RadarDistance", {PERSISTENT | BACKUP, BOOL, "0"}},
 
-    // Stop Settle Soften: ease the final brake-pressure build below walking speed for a smoother stop
-    {"StopSettleSoften", {PERSISTENT | BACKUP, BOOL, "0"}},
+    // Stop Gap Bias: stop a bit farther back from a stopped lead so it doesn't crawl in too close
+    {"StopGapBias", {PERSISTENT | BACKUP, BOOL, "0"}},
 
     // sunnypilot model params
     {"CameraOffset", {PERSISTENT | BACKUP, FLOAT, "0.0"}},

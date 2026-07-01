@@ -614,10 +614,10 @@
               ]
             },
             {
-              "key": "StopSettleSoften",
+              "key": "StopGapBias",
               "widget": "toggle",
               "title": "Smooth Stop",
-              "description": "Eases the brake pressure as the car settles the last few mph to a stop, so it stops with a soft taper instead of a firm catch. Only affects the final crawl, not normal braking.",
+              "description": "Stops a touch farther back from a stopped lead at low speed, so sunnypilot settles smoothly instead of crawling in close. Braking is never reduced below stock.",
               "visibility": [
                 {
                   "type": "capability",

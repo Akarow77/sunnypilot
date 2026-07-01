@@ -226,6 +226,13 @@ def test_stop_bias_via_smooth_radarstate_low_speed():
   out = _biased_ctrl().smooth_radarstate(rs(lead(dRel=8.0, vLead=0.0, vRel=-2.0)))
   assert out.leadOne.dRel < 8.0                                # biased proxy returned at low speed
 
+def test_stop_bias_independent_of_radar_distance():
+  c = ctrl(enabled=False)                                      # RadarDistance off ...
+  c._stop_gap_bias_enabled = True                              # ... but StopGapBias on
+  c._v_ego = 2.0
+  out = c.smooth_radarstate(rs(lead(dRel=8.0, vLead=0.0, vRel=-2.0)))
+  assert out.leadOne.dRel < 8.0                                # stop-gap still applies standalone
+
 
 # --- speed-gap bias (wider gap at speed) -------------------------------------
 

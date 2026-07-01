@@ -1259,9 +1259,9 @@
     "title": "[TIZI/TICI only] Standstill Timer",
     "description": "Show a timer on the HUD when the car is at a standstill."
   },
-  "StopSettleSoften": {
+  "StopGapBias": {
     "title": "Smooth Stop",
-    "description": "Eases the brake pressure as the car settles the last few mph to a stop, so it stops with a soft taper instead of a firm catch. Only affects the final crawl, not normal braking."
+    "description": "Stops a touch farther back from a stopped lead at low speed, so sunnypilot settles smoothly instead of crawling in close. Braking is never reduced below stock."
   },
   "SubaruStopAndGo": {
     "title": "Subaru Stop and Go",

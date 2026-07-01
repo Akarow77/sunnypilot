@@ -49,7 +49,7 @@ LEAD_SMOOTH_HOLD = 20          # frames (~1s): keep smoothing through brief chur
 # Stop-gap bias: near a (near-)stopped lead at low speed, report dRel up to STOP_GAP_BIAS_M closer so the MPC
 # runs its own smooth stop but terminates that much farther back (stock crawl-creeps to ~2m). Monotone (closer
 # => brake >= stock). Ramps in over the regime edge and out as the lead moves (no step, releases on launch).
-STOP_GAP_BIAS_ENABLED = False
+# Gated by the StopGapBias param, independent of the rest of the controller.
 STOP_GAP_BIAS_M = 2.0          # m: max dRel reduction = added standstill gap
 STOP_BIAS_VEGO = 8.0           # m/s: only below this ego speed
 STOP_BIAS_VLEAD = 1.5         # m/s: only behind a (near-)stopped lead; ramps out as vLead rises to this
@@ -224,7 +224,7 @@ class RadarDistanceController:
     self._frame = 0
     self._v_ego = 0.0
     self._enabled = self._params.get_bool("RadarDistance")
-    self._stop_gap_bias_enabled = STOP_GAP_BIAS_ENABLED
+    self._stop_gap_bias_enabled = self._params.get_bool("StopGapBias")
     self._lead_smooth_enabled = LEAD_SMOOTH_ENABLED
     self._one = _LeadHold()
     self._two = _LeadHold()
@@ -237,6 +237,7 @@ class RadarDistanceController:
       self._one.reset()
       self._two.reset()
     self._enabled = enabled
+    self._stop_gap_bias_enabled = self._params.get_bool("StopGapBias")
 
   def update(self, sm) -> None:
     if self._frame % int(1. / DT_MDL) == 0:
@@ -278,7 +279,8 @@ class RadarDistanceController:
   def smooth_radarstate(self, radarstate):
     self._stability.update(radarstate.leadOne, self._v_ego)   # telemetry, runs every cycle
     if not self._enabled:
-      return radarstate
+      one_b = self._stop_gap_bias(radarstate.leadOne)          # stop-gap bias works standalone; else passthrough
+      return radarstate if one_b is radarstate.leadOne else _RadarStateProxy(one_b, radarstate.leadTwo)
     one = self._one.step(radarstate.leadOne)
     two = self._two.step(radarstate.leadTwo)
     if self._v_ego < LOW_SPEED_PASSTHROUGH_V:
