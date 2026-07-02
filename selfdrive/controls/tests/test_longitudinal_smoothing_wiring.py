@@ -25,11 +25,9 @@ def test_output_is_byte_stock_and_inputs_are_shaped():
   # INPUT shaping only: the accel ceiling and the radar-conditioning seam are present...
   assert "self.accel.get_max_accel(v_ego)" in update_src
   assert "self.mpc.update(self.smooth_radarstate(sm['radarState'])" in update_src
-  # ...and the OUTPUT is never post-shaped (the old output shaper is gone -> byte-stock output).
+  # ...and the OUTPUT is never post-shaped (byte-stock output; no accel shaping, no should_stop override).
   assert "smooth_target_accel" not in update_src
-  # the only output-side touch is the SnG should_stop hysteresis (anti gas-brake-gas-brake), which never
-  # changes the accel target, only whether the plan holds the stop.
-  assert "self.accel.sng_should_stop(" in update_src
+  assert "sng_should_stop" not in update_src   # reverted: the should_stop hysteresis caused a high-speed under-brake
 
 
 def test_t_follow_hook_wired_and_identity_default():

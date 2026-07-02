@@ -20,7 +20,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.accel_control
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import \
   ECO, NORMAL, SPORT, PERSONALITY_MIN, PERSONALITY_MAX, A_CRUISE_MAX_BP, RISE_RATE, \
   STOCK_A_CRUISE_MAX_V, STOCK_RISE_RATE, TF_WIDEN_V_BP, TF_WIDEN_BASE_V, TF_WIDEN_TIER, TF_WIDEN_MAX, \
-  TF_SLEW_PER_S, TF_DECEL_HOLD_A, SNG_GO_ACCEL, AccelerationPersonality
+  TF_SLEW_PER_S, TF_DECEL_HOLD_A, AccelerationPersonality
 
 _EPS = 1e-6
 _TF_STOCK = 1.45          # a representative stock t_follow (standard personality); the widen is add-only on top
@@ -196,41 +196,3 @@ def test_max_accel_uses_stored_v_ego():
   ctrl = make_controller(personality=SPORT)
   ctrl.update(make_sm(v_ego=0.0))
   assert ctrl.max_accel() == pytest.approx(ctrl.get_max_accel(0.0))
-
-
-# --- SnG anti-chatter hysteresis --------------------------------------------------------------------------
-
-def test_sng_disabled_passthrough():
-  ctrl = make_controller(enabled=False)
-  assert ctrl.sng_should_stop(True, -0.5) is True
-  assert ctrl.sng_should_stop(False, 0.05) is False        # identity: mirrors the raw flag exactly
-
-
-def test_sng_sticky_stop_filters_chatter():
-  ctrl = make_controller(personality=NORMAL)
-  assert ctrl.sng_should_stop(True, -0.5) is True          # stopped
-  # raw should_stop chatters False with accel below the go-band -> stay stopped (no gas blip)
-  assert ctrl.sng_should_stop(False, SNG_GO_ACCEL - 0.05) is True
-  assert ctrl.sng_should_stop(False, 0.0) is True
-
-
-def test_sng_launch_is_decisive():
-  ctrl = make_controller(personality=NORMAL)
-  ctrl.sng_should_stop(True, -0.5)                         # stopped
-  assert ctrl.sng_should_stop(False, SNG_GO_ACCEL + 0.1) is False   # clear GO -> launch
-  # once launched it stays go while the plan keeps moving (no re-stop chatter)
-  assert ctrl.sng_should_stop(False, 0.05) is False
-
-
-def test_sng_no_delay_on_real_stop():
-  ctrl = make_controller(personality=NORMAL)
-  ctrl.sng_should_stop(False, 1.0)                         # going
-  assert ctrl.sng_should_stop(True, -1.0) is True          # a genuine stop request is honored immediately
-
-
-def test_sng_reset_recommits_stop():
-  ctrl = make_controller(personality=NORMAL)
-  ctrl.sng_should_stop(False, 1.0)                         # going
-  ctrl.reset()
-  # after reset it is stopped-committed: a below-go-band plan does not launch
-  assert ctrl.sng_should_stop(False, SNG_GO_ACCEL - 0.05) is True

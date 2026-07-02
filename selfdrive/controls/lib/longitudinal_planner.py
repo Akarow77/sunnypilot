@@ -172,10 +172,6 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       output_a_target = output_a_target_mpc
       self.output_should_stop = output_should_stop_mpc
 
-    # Stop-and-go anti-chatter: sticky should_stop hysteresis kills the stopping<->pid flip that reads as
-    # gas-brake-gas-brake, and makes launch decisive. No-op (byte-stock) when disabled.
-    self.output_should_stop = self.accel.sng_should_stop(self.output_should_stop, output_a_target)
-
     # Acceleration Personality shapes only MPC INPUTS (accel ceiling above + t_follow via mpc.t_follow_fn),
     # never the output accel -- output_a_target passes through byte-stock so the MPC owns the trajectory.
 

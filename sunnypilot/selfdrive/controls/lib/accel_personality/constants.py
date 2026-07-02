@@ -49,10 +49,3 @@ TF_WIDEN_TIER = {ECO: 1.30, NORMAL: 1.00, SPORT: 0.50}   # ECO roomiest/smoothes
 TF_WIDEN_MAX = 0.45                                # s: absolute cap on the added gap (never explodes)
 TF_SLEW_PER_S = 0.50                               # s per second: max rate the widen may open/close
 TF_DECEL_HOLD_A = -0.20                            # m/s^2: at/below this a_ego (braking) the widen won't shrink
-
-# --- Stop-and-go anti-chatter (should_stop hysteresis) --------------------------------------------------
-# should_stop toggling at the stop threshold flips longcontrol stopping<->pid = the gas-brake-gas-brake.
-# Sticky-stop: once stopped, launch only on a clear GO (a_target >= SNG_GO_ACCEL, above the 0.1 should_stop
-# gate -> filters chatter, decisive launch). Sticky-go: re-stop only on a genuine request (no delay).
-# Only ever holds a stop longer (brake >= stock); off => passthrough.
-SNG_GO_ACCEL = 0.20   # m/s^2: plan accel above which a stopped car commits to launch

@@ -21,7 +21,7 @@ from openpilot.sunnypilot import get_sanitize_int_param
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import \
   NORMAL, PERSONALITY_MIN, PERSONALITY_MAX, A_CRUISE_MAX_BP, A_CRUISE_MAX_V, STOCK_A_CRUISE_MAX_V, \
   RISE_RATE, STOCK_RISE_RATE, TF_WIDEN_V_BP, TF_WIDEN_BASE_V, TF_WIDEN_TIER, TF_WIDEN_MAX, \
-  TF_SLEW_PER_S, TF_DECEL_HOLD_A, SNG_GO_ACCEL
+  TF_SLEW_PER_S, TF_DECEL_HOLD_A
 
 
 class AccelController:
@@ -35,7 +35,6 @@ class AccelController:
     self._a_ego = 0.0
     self._widen = 0.0                     # current slewed follow-gap widen (s), add-only
     self._t_follow = 0.0                  # last t_follow handed to the MPC (telemetry)
-    self._sng_stopped = True              # SnG hysteresis: committed stop/go state (start stopped-committed)
     self._read_params()
 
   def _read_params(self) -> None:
@@ -55,7 +54,6 @@ class AccelController:
   def reset(self) -> None:
     # Drop the accumulated widen (e.g. on disengage / standstill re-init) so it re-ramps cleanly.
     self._widen = 0.0
-    self._sng_stopped = True              # re-init stopped-committed (safe: only ever holds a stop longer)
 
   def get_max_accel(self, v_ego: float) -> float:
     # Disabled -> stock ceiling (off == stock, independent of the NORMAL profile so NORMAL is free to differ).
@@ -89,25 +87,6 @@ class AccelController:
     self._widen = max(0.0, self._widen)                 # add-only guard
     self._t_follow = t_follow + self._widen
     return self._t_follow
-
-  def sng_should_stop(self, should_stop: bool, a_target: float) -> bool:
-    # SnG anti-chatter: sticky hysteresis on should_stop so it doesn't flip stopping<->pid at the stop
-    # threshold (the gas-brake). Only ever holds a stop longer (brake >= stock), never delays a real stop.
-    # Identity when disabled => byte-stock.
-    should_stop = bool(should_stop)
-    if not self._enabled:
-      self._sng_stopped = should_stop
-      return should_stop
-
-    if self._sng_stopped:
-      # stopped-committed: launch only on a clear GO (plan wants to move AND accel clears the go-band)
-      if not should_stop and float(a_target) >= SNG_GO_ACCEL:
-        self._sng_stopped = False
-    else:
-      # going-committed: re-assert stop only when the plan genuinely requests it (no delay on a real stop)
-      if should_stop:
-        self._sng_stopped = True
-    return self._sng_stopped
 
   # --- telemetry (published to cereal LongitudinalPlanSP.acceleration; no control effect) ---
   def enabled(self) -> bool:
