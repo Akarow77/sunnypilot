@@ -15,6 +15,7 @@ from cereal import custom
 AccelerationPersonality = custom.LongitudinalPlanSP.AccelerationPersonality
 ECO = AccelerationPersonality.eco
 NORMAL = AccelerationPersonality.normal
+SPORT = AccelerationPersonality.sport
 
 PERSONALITY_MIN = min(AccelerationPersonality.schema.enumerants.values())
 PERSONALITY_MAX = max(AccelerationPersonality.schema.enumerants.values())
