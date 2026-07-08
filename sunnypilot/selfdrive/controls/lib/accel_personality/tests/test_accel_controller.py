@@ -337,35 +337,6 @@ def test_closing_fires_before_a_ego_moves():
   assert ctrl.get_jerk_scale(20.0) == pytest.approx(CLOSING_FACTOR_V[NORMAL][0])
 
 
-# --- lead_unstable gate: suppress both lead-keyed relax factors during a radar glitch ----------------------
-
-def test_lead_unstable_suppresses_closing_factor():
-  ctrl = make_controller(personality=SPORT)
-  ctrl.update(make_sm(v_ego=20.0, lead=make_lead(status=True, vRel=-6.0)), lead_unstable=True)
-  assert ctrl.get_jerk_scale(20.0) == pytest.approx(1.0)
-
-
-def test_lead_unstable_suppresses_lead_brake_factor():
-  ctrl = make_controller(personality=SPORT)
-  ctrl.update(make_sm(v_ego=20.0, lead=make_lead(status=True, aLeadK=-3.0)), lead_unstable=True)
-  assert ctrl.get_jerk_scale(20.0) == pytest.approx(1.0)
-
-
-def test_lead_unstable_defaults_to_not_gating():
-  # update() without the kwarg (existing callers, e.g. tests) must behave exactly as before this fix.
-  ctrl = make_controller(personality=SPORT)
-  ctrl.update(make_sm(v_ego=20.0, lead=make_lead(status=True, vRel=-6.0)))
-  assert ctrl.get_jerk_scale(20.0) == pytest.approx(CLOSING_FACTOR_V[SPORT][0])
-
-
-def test_lead_unstable_clears_once_stable_again():
-  ctrl = make_controller(personality=SPORT)
-  ctrl.update(make_sm(v_ego=20.0, lead=make_lead(status=True, vRel=-6.0)), lead_unstable=True)
-  assert ctrl.get_jerk_scale(20.0) == pytest.approx(1.0)
-  ctrl.update(make_sm(v_ego=20.0, lead=make_lead(status=True, vRel=-6.0)), lead_unstable=False)
-  assert ctrl.get_jerk_scale(20.0) == pytest.approx(CLOSING_FACTOR_V[SPORT][0])
-
-
 # --- combined: get_jerk_scale takes the most-relaxed of all three factors ----------------------------------
 
 def test_combined_takes_most_relaxed_factor():

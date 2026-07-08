@@ -11,11 +11,7 @@ Acceleration Personality (ECO / NORMAL / SPORT). Tunes only MPC INPUTS, never th
     any fresh accel<->decel direction change, when the tracked lead is itself braking hard, or when the gap
     is closing fast for any other reason (cut-in, ego overtaking a slower lead) -- the last one is the only
     proactive trigger keyed on an MPC INPUT (vRel) rather than a_ego's own realized sign flip, so it can
-    soften the very first brake jab instead of only the recovery after it. Both lead-keyed factors read the
-    RAW radarState lead (RadarDistanceController's cleanup only reaches the MPC, not here by construction --
-    see get_jerk_scale) and are gated off (forced to 1.0, i.e. no relax) during a lead RadarDistance flagged
-    unstable last cycle, so a fusion/churn glitch on aLeadK/vRel can't fire a spurious relax the MPC's own
-    (cleaned-up) view never corroborates;
+    soften the very first brake jab instead of only the recovery after it;
   * add-only, speed-dependent follow-gap widen on the MPC t_follow -> earlier/gentler braking, roomier gap;
   * sticky should_stop hysteresis -> no stop-and-go gas-brake-gas-brake.
 Add-only gap => desired distance >= stock => braking >= stock. Disabled => stock everywhere (byte-stock).
@@ -77,7 +73,6 @@ class AccelController:
     self._onset_factor = 1.0
     self._lead_brake_factor = 1.0
     self._closing_factor = 1.0
-    self._lead_unstable = False
     self._read_params()
 
   def _read_params(self) -> None:
@@ -87,16 +82,11 @@ class AccelController:
       return
     self._personality = get_sanitize_int_param("AccelPersonality", PERSONALITY_MIN, PERSONALITY_MAX, self._params)
 
-  def update(self, sm: messaging.SubMaster, lead_unstable: bool = False) -> None:
-    # lead_unstable: RadarDistanceController.lead_unstable() from the END of the PREVIOUS cycle (this
-    # cycle's radar_distance stability update hasn't run yet -- it happens inside smooth_radarstate(),
-    # called later, only on the MPC's path). One cycle (~20ms) stale is fine: instability episodes run
-    # ~0.4s+ (telemetry-verified), so a 1-cycle-old flag still covers the same episode almost always.
+  def update(self, sm: messaging.SubMaster) -> None:
     if self._frame % int(1. / DT_MDL) == 0:
       self._read_params()
     self._v_ego = float(sm['carState'].vEgo)
     self._a_ego = float(sm['carState'].aEgo)
-    self._lead_unstable = lead_unstable
 
     if self._enabled:
       lead = sm['radarState'].leadOne
@@ -112,12 +102,12 @@ class AccelController:
     self._frame += 1
 
   def _get_lead_brake_factor(self, lead) -> float:
-    if not lead.status or self._lead_unstable:
+    if not lead.status:
       return 1.0
     return float(np.interp(lead.aLeadK, LEAD_BRAKE_ALEAD_BP, LEAD_BRAKE_FACTOR_V[self._personality]))
 
   def _get_closing_factor(self, lead) -> float:
-    if not lead.status or self._lead_unstable:
+    if not lead.status:
       return 1.0
     return float(np.interp(lead.vRel, CLOSING_VREL_BP, CLOSING_FACTOR_V[self._personality]))
 
@@ -128,7 +118,6 @@ class AccelController:
     self._onset_factor = 1.0
     self._lead_brake_factor = 1.0
     self._closing_factor = 1.0
-    self._lead_unstable = False
 
   def get_max_accel(self, v_ego: float) -> float:
     # Disabled -> stock ceiling (off == stock, independent of the NORMAL profile so NORMAL is free to differ).
