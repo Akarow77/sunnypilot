@@ -131,6 +131,26 @@ def test_rise_rate_fast_near_stop_tapers_to_steady_state():
     assert ctrl.get_rise_rate(20.0) == pytest.approx(steady_state)  # flat above the v=5 knot
 
 
+def test_rise_rate_falls_back_to_stock_while_closing_on_a_lead():
+  ctrl = make_controller(personality=NORMAL)
+  ctrl.update(make_sm(v_ego=2.0, lead=make_lead(status=True, vRel=-2.0)))
+  assert ctrl.get_rise_rate(2.0) == STOCK_RISE_RATE
+
+
+def test_rise_rate_unaffected_by_a_departing_or_absent_lead():
+  ctrl = make_controller(personality=NORMAL)
+  ctrl.update(make_sm(v_ego=2.0, lead=make_lead(status=True, vRel=0.5)))
+  assert ctrl.get_rise_rate(2.0) != STOCK_RISE_RATE
+  ctrl.update(make_sm(v_ego=2.0, lead=make_lead(status=False)))
+  assert ctrl.get_rise_rate(2.0) != STOCK_RISE_RATE
+
+
+def test_rise_rate_lead_gate_disabled_is_still_stock():
+  ctrl = make_controller(enabled=False, personality=SPORT)
+  ctrl.update(make_sm(v_ego=2.0, lead=make_lead(status=True, vRel=-2.0)))
+  assert ctrl.get_rise_rate(2.0) == STOCK_RISE_RATE
+
+
 def test_normal_is_distinct_from_stock():
   nrm = make_controller(personality=NORMAL)
   # enabled NORMAL differs from stock (so NORMAL is a real profile, not a stock alias)
