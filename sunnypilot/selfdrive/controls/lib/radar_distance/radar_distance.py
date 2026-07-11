@@ -187,10 +187,12 @@ class _JumpGuard:
   def __init__(self):
     self._last = None
     self._hold = 0
+    self._grace_used = False
 
   def reset(self):
     self._last = None
     self._hold = 0
+    self._grace_used = False
 
   def step(self, raw):
     if not raw.status:
@@ -204,7 +206,18 @@ class _JumpGuard:
       self._last = (held_dRel, vRel0, vLead0, aLeadK0, aLeadTau0, prob0)
       return _HeldLead(held_dRel, vRel0, vLead0, aLeadK0, aLeadTau0, min(prob0, FCW_PROB_CAP))
 
+    # Hold cap reached on a lead that was closing: self-healing straight onto raw here would adopt a farther
+    # reading than the trajectory already tracked, i.e. report a farther lead than reality for at least one
+    # more cycle. Take exactly one bounded extra cycle at the last-held value first -- never a second, so this
+    # can't turn into an indefinite hold on a lead that genuinely departed.
+    if (self._hold >= JUMP_GUARD_MAX_HOLD and not self._grace_used and self._last is not None and
+        self._last[1] < 0.0 and (raw.dRel - self._last[0]) > SWITCH_DREL):
+      dRel0, vRel0, vLead0, aLeadK0, aLeadTau0, prob0 = self._last
+      self._grace_used = True
+      return _HeldLead(dRel0, vRel0, vLead0, aLeadK0, aLeadTau0, min(prob0, FCW_PROB_CAP))
+
     self._hold = 0
+    self._grace_used = False
     self._last = (raw.dRel, raw.vRel, raw.vLead, raw.aLeadK, raw.aLeadTau, raw.modelProb)
     return raw
 

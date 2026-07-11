@@ -344,8 +344,59 @@ def test_jump_guard_self_heals_after_cap():
   for _ in range(JUMP_GUARD_MAX_HOLD):
     out = c.smooth_radarstate(rs(lead(dRel=40.0, vRel=-1.0, vLead=19.0)))
     assert out.leadOne.dRel < 40.0                   # held while under the cap
+  # cap just reached on a lead that was closing -- one bounded grace cycle before accepting a farther raw value
   out = c.smooth_radarstate(rs(lead(dRel=40.0, vRel=-1.0, vLead=19.0)))
-  assert out.leadOne.dRel == pytest.approx(40.0)     # cap exceeded -> accepts the real (departing) value
+  assert out.leadOne.dRel < 40.0                     # grace cycle: still held, not yet accepted
+  out = c.smooth_radarstate(rs(lead(dRel=40.0, vRel=-1.0, vLead=19.0)))
+  assert out.leadOne.dRel == pytest.approx(40.0)     # grace spent -> accepts the real (departing) value
+
+
+def test_jump_guard_self_heals_immediately_when_not_closing():
+  # The grace cycle only protects a lead that was closing when the cap was hit -- a lead that was already
+  # steady/opening (vRel >= 0) self-heals on the very first cap-exceeding frame, same as before this fix.
+  c = ctrl()
+  c.smooth_radarstate(rs(lead(dRel=20.0, vRel=0.5, vLead=19.0)))
+  for _ in range(JUMP_GUARD_MAX_HOLD):
+    out = c.smooth_radarstate(rs(lead(dRel=40.0, vRel=0.5, vLead=19.0)))
+    assert out.leadOne.dRel < 40.0
+  out = c.smooth_radarstate(rs(lead(dRel=40.0, vRel=0.5, vLead=19.0)))
+  assert out.leadOne.dRel == pytest.approx(40.0)     # no grace needed -> heals immediately, unchanged behavior
+
+
+def test_jump_guard_grace_is_used_at_most_once_per_hold_episode():
+  # The grace cycle must be bounded -- a lead that keeps reading farther after the grace is spent must not
+  # get a second grace before genuinely accepting the new value (else a departed lead could be held forever).
+  c = ctrl()
+  c.smooth_radarstate(rs(lead(dRel=20.0, vRel=-1.0, vLead=19.0)))
+  for _ in range(JUMP_GUARD_MAX_HOLD):
+    c.smooth_radarstate(rs(lead(dRel=40.0, vRel=-1.0, vLead=19.0)))
+  c.smooth_radarstate(rs(lead(dRel=40.0, vRel=-1.0, vLead=19.0)))    # grace cycle, spent
+  out = c.smooth_radarstate(rs(lead(dRel=70.0, vRel=-1.0, vLead=19.0)))
+  assert out.leadOne.dRel == pytest.approx(70.0)     # grace already spent this episode -> accepts immediately
+
+
+def test_jump_guard_replays_real_route_dropout_catchup():
+  # route 550a71ee4c7a7fbe/000004c6--ed1b6d7f95, t~1337.9-1338.5: a spurious closer misread (31.08 -> 24.94)
+  # passes through immediately (closer always does), poisoning the guard's anchor. The lead's real, continuing
+  # trajectory (~31m, closing) then reads as a farther jump against that bad anchor and gets held for the full
+  # cap. Without the grace cycle, the guard self-healed straight onto a farther transitional misread (56.52)
+  # right as a real dropout began, and _LeadHold then flicker-held THAT value through the whole dropout --
+  # reporting a lead ~2x farther and opening instead of closing, easing the MPC off right before a real
+  # catch-up brake. The grace cycle must keep the held value close to the real trajectory across this handoff.
+  c = ctrl(v_ego=14.4)
+  raw = [
+    (30.62, -0.45, 1), (38.36, -3.33, -1), (38.20, -3.42, -1), (38.08, -3.45, -1), (37.88, -3.53, -1),
+    (37.72, -3.58, -1), (47.53, 0.35, -1), (24.94, -1.90, -1), (31.44, -3.72, -1), (31.20, -3.97, -1),
+    (31.08, -3.95, 2), (74.32, 3.65, 3), (74.52, 3.70, 3), (74.92, 3.85, 3), (75.12, 3.88, 3),
+    (75.28, 3.90, 3), (75.64, 3.95, 3), (75.64, 3.95, 3), (56.52, -2.09, -1),
+  ]
+  out = None
+  for dRel, vRel, tid in raw:
+    out = c.smooth_radarstate(rs(lead(dRel=dRel, vRel=vRel, vLead=10.5, radarTrackId=tid)))
+  assert out.leadOne.dRel < 30.0                     # grace cycle: still held near the real trajectory
+  dropout_held = c.smooth_radarstate(rs(lead(status=False, dRel=0.0, modelProb=0.0))).leadOne
+  assert dropout_held.status is True
+  assert dropout_held.dRel < 30.0                    # flicker-hold seeds from the grace-held value, not 56.52
 
 
 def test_jump_guard_resets_on_dropout():
