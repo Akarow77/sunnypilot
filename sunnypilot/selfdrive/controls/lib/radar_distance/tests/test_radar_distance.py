@@ -475,6 +475,37 @@ def test_no_hold_without_sustained_lead():
   assert out.leadOne.status is False                 # no hold armed
 
 
+def test_hold_does_not_resurrect_a_stale_lead_after_an_extended_low_speed_gap():
+  # Below LOW_SPEED_PASSTHROUGH_V the hold is never stepped at all (see smooth_radarstate), so an elapsed-
+  # frames check must be based on real cycles, not "cycles since step() was last called" -- otherwise resuming
+  # above the gate looks like no time passed no matter how long the low-speed period actually was, and a hold
+  # armed on a real lead long before the gap can resurrect as if it were still fresh.
+  c = ctrl(v_ego=LOW_SPEED_PASSTHROUGH_V + 1.0)
+  for _ in range(3):
+    c.smooth_radarstate(rs(lead(dRel=30.0, vRel=-3.0, vLead=5.0)))
+  c._v_ego = LOW_SPEED_PASSTHROUGH_V - 1.0             # below the gate: step() stops being called on the hold
+  for _ in range(HOLD_MAX_FRAMES * 3):
+    c.smooth_radarstate(rs(lead(status=False, dRel=0.0, modelProb=0.0)))
+  c._v_ego = LOW_SPEED_PASSTHROUGH_V + 1.0             # back above the gate, lead still gone
+  out = c.smooth_radarstate(rs(lead(status=False, dRel=0.0, modelProb=0.0)))
+  assert out.leadOne.status is False                  # must not resurrect the old hold
+
+
+def test_hold_survives_a_brief_low_speed_dip_within_the_cap():
+  # A short dip below the gate (well under HOLD_MAX_FRAMES real cycles) is the case flicker-hold exists for --
+  # it must still bridge, same as a same-speed dropout of the same real duration would.
+  c = ctrl(v_ego=LOW_SPEED_PASSTHROUGH_V + 1.0)
+  for _ in range(3):
+    c.smooth_radarstate(rs(lead(dRel=30.0, vRel=-3.0, vLead=5.0)))
+  c._v_ego = LOW_SPEED_PASSTHROUGH_V - 1.0
+  for _ in range(3):
+    c.smooth_radarstate(rs(lead(status=False, dRel=0.0, modelProb=0.0)))
+  c._v_ego = LOW_SPEED_PASSTHROUGH_V + 1.0
+  out = c.smooth_radarstate(rs(lead(status=False, dRel=0.0, modelProb=0.0)))
+  assert out.leadOne.status is True
+  assert out.leadOne.dRel < 30.0
+
+
 def test_releases_after_hold_cap():
   c = ctrl()
   for _ in range(3):

@@ -223,30 +223,37 @@ class _JumpGuard:
 
 
 class _LeadHold:
+  # step() takes the caller's absolute frame counter rather than counting its own calls: below
+  # LOW_SPEED_PASSTHROUGH_V the caller stops calling step() at all (see smooth_radarstate), and a
+  # self-incrementing counter would then stay frozen at whatever it was for however long that lasts -- on
+  # resume it would read as "just a few frames since the last real sighting" no matter how much real time
+  # (a full stop, a slow zone) actually passed, and could hand HOLD_MAX_FRAMES worth of stale credit to a
+  # sighting from arbitrarily long ago. Comparing against the caller's frame counter makes the elapsed-frames
+  # check correct regardless of how many cycles were skipped in between.
   def __init__(self):
     self._last = None
     self._sustained = 0
-    self._since_real = 0
+    self._real_frame = 0
     self._armed = False
     self._held_dRel = 0.0
 
   def reset(self):
     self.__init__()
 
-  def step(self, raw):
+  def step(self, raw, frame):
     if raw.status and raw.dRel > DROPOUT_DREL:
       self._last = (raw.dRel, raw.vRel, raw.vLead, raw.aLeadK, raw.aLeadTau, raw.modelProb)
       self._sustained += 1
       if self._sustained >= SUSTAIN_FRAMES:
-        self._since_real = 0
+        self._real_frame = frame
         self._armed = True
       return raw
 
     self._sustained = 0
-    self._since_real += 1
-    if self._armed and self._last is not None and self._since_real <= HOLD_MAX_FRAMES:
+    since_real = frame - self._real_frame
+    if self._armed and self._last is not None and since_real <= HOLD_MAX_FRAMES:
       dRel0, vRel0, vLead0, aLeadK0, aLeadTau0, prob0 = self._last
-      if self._since_real == 1:
+      if since_real == 1:
         self._held_dRel = dRel0
       self._held_dRel = max(MIN_HELD_DREL, self._held_dRel - max(-vRel0, 0.0) * DT_MDL)
       return _HeldLead(self._held_dRel, vRel0, vLead0, min(aLeadK0, 0.0), aLeadTau0, min(prob0, FCW_PROB_CAP))
@@ -333,7 +340,6 @@ class RadarDistanceController:
     if self._frame % int(1. / DT_MDL) == 0:
       self._read_params()
     self._v_ego = float(sm['carState'].vEgo)
-    self._frame += 1
 
   def enabled(self) -> bool:
     return self._enabled
@@ -376,6 +382,7 @@ class RadarDistanceController:
     return _BiasedLead(lead, max(lead.dRel - offset, STOP_GAP_MIN_DREL))
 
   def smooth_radarstate(self, radarstate):
+    self._frame += 1                                           # step()'s elapsed-frames basis; see _LeadHold
     self._stability.update(radarstate.leadOne, self._v_ego)   # telemetry, runs every cycle
     if not self._enabled:
       return radarstate                                       # off: byte-stock passthrough
@@ -383,8 +390,8 @@ class RadarDistanceController:
     noisy = self._stability.churn or self._stability.same_track_noise
     if self._v_ego >= LOW_SPEED_PASSTHROUGH_V:
       one = self._jump_guard.step(radarstate.leadOne)         # reject a same-cycle farther-jump transient ...
-      one = self._one.step(one)                               # ... + flicker-hold ...
-      two = self._two.step(radarstate.leadTwo)
+      one = self._one.step(one, self._frame)                  # ... + flicker-hold ...
+      two = self._two.step(radarstate.leadTwo, self._frame)
       one = self._smoother.update(one, noisy)                 # ... + same-object de-jitter (anti follow-hunt)
     elif self._v_ego >= CREEP_PASSTHROUGH_V:
       # creep band: de-jitter ONLY (symmetric EMA), no flicker-hold (a stale held lead would delay launch)
