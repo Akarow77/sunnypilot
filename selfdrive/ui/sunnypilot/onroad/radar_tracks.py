@@ -8,8 +8,12 @@ import math
 import pyray as rl
 
 
+def _radar_track_ranges(live_tracks) -> list[tuple[int, int]]:
+  return sorted({(source.startAddress, source.endAddress) for source in live_tracks.trackSources})
+
+
 def format_radar_tracks_status(live_tracks) -> str:
-  ranges = sorted({(source.startAddress, source.endAddress) for source in live_tracks.trackSources})
+  ranges = _radar_track_ranges(live_tracks)
   if not ranges:
     return "none"
 
@@ -17,6 +21,15 @@ def format_radar_tracks_status(live_tracks) -> str:
   track_count = len(live_tracks.points)
   track_label = "track" if track_count == 1 else "tracks"
   return f"{range_text} · {track_count} {track_label}"
+
+
+def format_radar_tracks_onroad_status(live_tracks) -> str:
+  ranges = _radar_track_ranges(live_tracks)
+  if not ranges:
+    return "range: none\ntracks: none"
+
+  range_text = ", ".join(f"0x{start:X}-0x{end:X}" for start, end in ranges)
+  return f"range: {range_text}\ntracks: {len(live_tracks.points)}"
 
 
 class RadarTracks:
