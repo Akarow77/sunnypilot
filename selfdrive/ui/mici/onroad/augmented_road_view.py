@@ -134,9 +134,13 @@ class BookmarkIcon(Widget):
 
 
 class AugmentedRoadView(CameraView):
-  def __init__(self, bookmark_callback=None, stream_type: VisionStreamType = VisionStreamType.VISION_STREAM_ROAD):
+  def __init__(self, bookmark_callback=None, stream_type: VisionStreamType = VisionStreamType.VISION_STREAM_ROAD,
+               radar_tracks_settings_callback=None):
     super().__init__("camerad", stream_type)
     self._bookmark_callback = bookmark_callback
+    self._radar_tracks_settings_callback = radar_tracks_settings_callback
+    self._radar_tracks_settings_prompt = False
+    self._radar_status_rect = rl.Rectangle()
     self._set_placeholder_color(rl.BLACK)
 
     self.device_camera: DeviceCameraConfig | None = None
@@ -181,10 +185,16 @@ class AugmentedRoadView(CameraView):
     super()._update_state()
 
     if ui_state.sm.updated["liveTracks"]:
-      status = format_radar_tracks_onroad_columns(ui_state.sm["liveTracks"]) if ui_state.sm.valid["liveTracks"] else ("", "none")
+      live_tracks = ui_state.sm["liveTracks"]
+      self._radar_tracks_settings_prompt = bool(live_tracks.radarTracksAvailable and ui_state.hyundai_radar_mode != 2)
+      if self._radar_tracks_settings_prompt:
+        status = ("", "radar tracks detected")
+      else:
+        status = format_radar_tracks_onroad_columns(live_tracks) if ui_state.sm.valid["liveTracks"] else ("", "none")
       self._radar_ranges_label.set_text(status[0])
       self._radar_counts_label.set_text(status[1])
     elif not ui_state.sm.alive["liveTracks"]:
+      self._radar_tracks_settings_prompt = False
       self._radar_ranges_label.set_text("")
       self._radar_counts_label.set_text("none")
 
@@ -197,6 +207,11 @@ class AugmentedRoadView(CameraView):
       self._offroad_label.set_text("start the car to\nuse sunnypilot")
 
   def _handle_mouse_release(self, mouse_pos: MousePos):
+    if (self._radar_tracks_settings_prompt and self._radar_tracks_settings_callback is not None and
+        rl.check_collision_point_rec(mouse_pos, self._radar_status_rect)):
+      self._radar_tracks_settings_callback()
+      return
+
     # Don't trigger click callback if bookmark was triggered
     if not self._bookmark_icon.interacting():
       super()._handle_mouse_release(mouse_pos)
@@ -254,12 +269,13 @@ class AugmentedRoadView(CameraView):
       self._radar_ranges_label.get_content_height(max(radar_range_width, 1)) + 10,
       self._radar_counts_label.get_content_height(radar_count_width) + 10,
     )
-    radar_status_rect = rl.Rectangle(
+    self._radar_status_rect = rl.Rectangle(
       self._content_rect.x + self._content_rect.width - radar_status_width - 12,
       self._content_rect.y + 8,
       radar_status_width,
       radar_status_height,
     )
+    radar_status_rect = self._radar_status_rect
     rl.draw_rectangle_rounded(radar_status_rect, 0.5, 8, rl.Color(0, 0, 0, 170))
     self._radar_ranges_label.render(rl.Rectangle(
       radar_status_rect.x + radar_horizontal_padding,
