@@ -186,7 +186,7 @@ class AugmentedRoadView(CameraView):
 
     if ui_state.sm.updated["liveTracks"]:
       live_tracks = ui_state.sm["liveTracks"]
-      self._radar_tracks_settings_prompt = bool(live_tracks.radarTracksAvailable and ui_state.hyundai_radar_mode != 2)
+      self._radar_tracks_settings_prompt = bool(live_tracks.radarTracksAvailable and ui_state.radar_tracks != 2)
       if self._radar_tracks_settings_prompt:
         status = ("", "radar detected\ntap to enable")
       else:
