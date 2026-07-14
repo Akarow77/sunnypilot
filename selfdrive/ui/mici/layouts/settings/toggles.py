@@ -25,6 +25,7 @@ class TogglesLayoutMici(NavScroller):
     radar_tracks = BigParamControl("radar tracks", "RadarTracks")
 
     self._scroller.add_widgets([
+      hyundai_radar,
       radar_tracks,
       self._personality_toggle,
       self._experimental_btn,
