@@ -8,6 +8,17 @@ import math
 import pyray as rl
 
 
+def format_radar_tracks_status(live_tracks) -> str:
+  ranges = sorted({(source.startAddress, source.endAddress) for source in live_tracks.trackSources})
+  if not ranges:
+    return "none"
+
+  range_text = ", ".join(f"0x{start:X}-0x{end:X}" for start, end in ranges)
+  track_count = len(live_tracks.points)
+  track_label = "track" if track_count == 1 else "tracks"
+  return f"{range_text} · {track_count} {track_label}"
+
+
 class RadarTracks:
   def draw_radar_tracks(self, live_tracks, map_to_screen, path_offset_z, track_size=6):
     for track in live_tracks.points:
