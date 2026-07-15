@@ -1,0 +1,203 @@
+"""
+Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
+
+This file is part of sunnypilot and is licensed under the MIT License.
+See the LICENSE.md file in the root directory for more details.
+"""
+
+from cereal import messaging, custom
+from opendbc.car import structs
+from openpilot.common.constants import CV
+from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
+from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.accel_controller import AccelController
+from openpilot.sunnypilot.selfdrive.controls.lib.radar_distance.radar_distance import RadarDistanceController
+from openpilot.sunnypilot.selfdrive.controls.lib.dec.dec import DynamicExperimentalController
+from openpilot.sunnypilot.selfdrive.controls.lib.e2e_alerts_helper import E2EAlertsHelper
+from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.smart_cruise_control import SmartCruiseControl
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import SpeedLimitAssist
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver
+from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
+from openpilot.sunnypilot.models.helpers import get_active_bundle
+
+DecState = custom.LongitudinalPlanSP.DynamicExperimentalControl.DynamicExperimentalControlState
+LongitudinalPlanSource = custom.LongitudinalPlanSP.LongitudinalPlanSource
+
+# Bounds how fast output_a_target may drop while blended and NOT currently urgent (continuous -- not just a
+# short window right after the switch; see DynamicExperimentalController.smoothing_transition()/is_urgent()).
+# Never active during a genuine emergency (FCW, or a model slow-down past the urgent-severity threshold) at
+# any point, whether that was true at the moment of the switch or only became true later while still blended.
+TRANSITION_MAX_DROP_PER_CYCLE = 0.15   # m/s^2 per cycle
+
+
+class _E2ETransitionGuard:
+  # Without this, the e2e model's own action.desiredAcceleration -- which the core MPC-side jerk_scale never
+  # shapes (it only touches the MPC's own solution, not this raw model path) -- can drop sharply frame-to-
+  # frame at any point while blended, not only at the instant DEC switches into it, producing a discontinuous
+  # brake with zero jerk shaping. Only ever limits a DOWNWARD move; never delays a rise.
+  def __init__(self):
+    self._last = None
+
+  def reset(self) -> None:
+    self._last = None
+
+  def apply(self, output_a_target: float, smoothing_active: bool) -> float:
+    if not smoothing_active or self._last is None:
+      self._last = output_a_target
+      return output_a_target
+    limited = max(output_a_target, self._last - TRANSITION_MAX_DROP_PER_CYCLE)
+    self._last = limited
+    return limited
+
+
+class LongitudinalPlannerSP:
+  def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP, mpc):
+    self.events_sp = EventsSP()
+    self.resolver = SpeedLimitResolver()
+    self.dec = DynamicExperimentalController(CP, mpc)
+    self.accel = AccelController(CP, mpc)
+    self.radar_distance = RadarDistanceController(CP)
+    self.scc = SmartCruiseControl()
+    self.resolver = SpeedLimitResolver()
+    self.sla = SpeedLimitAssist(CP, CP_SP)
+    self.generation = int(model_bundle.generation) if (model_bundle := get_active_bundle()) else None
+    self.source = LongitudinalPlanSource.cruise
+    self.e2e_alerts_helper = E2EAlertsHelper()
+
+    self.output_v_target = 0.
+    self.output_a_target = 0.
+    self._e2e_transition_guard = _E2ETransitionGuard()
+
+  def is_e2e(self, sm: messaging.SubMaster) -> bool:
+    experimental_mode = sm['selfdriveState'].experimentalMode
+    if not experimental_mode:
+      return False
+
+    # A near/fast-closing radar lead always routes to pure MPC, regardless of whether DEC itself is on --
+    # this baseline is not something the DEC toggle should be able to bypass (dec.has_radar_acc_lead() is
+    # computed every cycle independent of dec.active()). DEC's own toggle only gates the OTHER blended
+    # triggers (standstill, slow-down, FCW) below.
+    if self.dec.has_radar_acc_lead():
+      return False
+
+    if not self.dec.active():
+      return True
+
+    return self.dec.mode() == "blended"
+
+  def update_targets(self, sm: messaging.SubMaster, v_ego: float, a_ego: float, v_cruise: float) -> tuple[float, float]:
+    CS = sm['carState']
+    v_cruise_cluster_kph = min(CS.vCruiseCluster, V_CRUISE_MAX)
+    v_cruise_cluster = v_cruise_cluster_kph * CV.KPH_TO_MS
+
+    long_enabled = sm['carControl'].enabled
+    long_override = sm['carControl'].cruiseControl.override
+
+    # Smart Cruise Control
+    self.scc.update(sm, long_enabled, long_override, v_ego, a_ego, v_cruise)
+
+    # Speed Limit Resolver
+    self.resolver.update(v_ego, sm)
+
+    # Speed Limit Assist
+    has_speed_limit = self.resolver.speed_limit_valid or self.resolver.speed_limit_last_valid
+    self.sla.update(long_enabled, long_override, v_ego, a_ego, v_cruise_cluster, self.resolver.speed_limit,
+                    self.resolver.speed_limit_final_last, has_speed_limit, self.resolver.distance, self.events_sp)
+
+    targets = {
+      LongitudinalPlanSource.cruise: (v_cruise, a_ego),
+      LongitudinalPlanSource.sccVision: (self.scc.vision.output_v_target, self.scc.vision.output_a_target),
+      LongitudinalPlanSource.sccMap: (self.scc.map.output_v_target, self.scc.map.output_a_target),
+      LongitudinalPlanSource.speedLimitAssist: (self.sla.output_v_target, self.sla.output_a_target),
+    }
+
+    self.source = min(targets, key=lambda k: targets[k][0])
+    self.output_v_target, self.output_a_target = targets[self.source]
+    return self.output_v_target, self.output_a_target
+
+  def update(self, sm: messaging.SubMaster) -> None:
+    self.events_sp.clear()
+    self.dec.update(sm)
+    self.accel.update(sm)
+    self.radar_distance.update(sm)
+    self.e2e_alerts_helper.update(sm, self.events_sp)
+
+  def smooth_radarstate(self, radarstate):
+    return self.radar_distance.smooth_radarstate(radarstate)
+
+  def smooth_e2e_transition(self, output_a_target: float) -> float:
+    return self._e2e_transition_guard.apply(output_a_target, self.dec.smoothing_transition())
+
+  def publish_longitudinal_plan_sp(self, sm: messaging.SubMaster, pm: messaging.PubMaster) -> None:
+    plan_sp_send = messaging.new_message('longitudinalPlanSP')
+
+    plan_sp_send.valid = sm.all_checks(service_list=['carState', 'controlsState'])
+
+    longitudinalPlanSP = plan_sp_send.longitudinalPlanSP
+    longitudinalPlanSP.longitudinalPlanSource = self.source
+    longitudinalPlanSP.vTarget = float(self.output_v_target)
+    longitudinalPlanSP.aTarget = float(self.output_a_target)
+    longitudinalPlanSP.events = self.events_sp.to_msg()
+
+    # Dynamic Experimental Control
+    dec = longitudinalPlanSP.dec
+    dec.state = DecState.blended if self.dec.mode() == 'blended' else DecState.acc
+    dec.enabled = self.dec.enabled()
+    dec.active = self.dec.active()
+
+    # Smart Cruise Control
+    smartCruiseControl = longitudinalPlanSP.smartCruiseControl
+    # Vision Control
+    sccVision = smartCruiseControl.vision
+    sccVision.state = self.scc.vision.state
+    sccVision.vTarget = float(self.scc.vision.output_v_target)
+    sccVision.aTarget = float(self.scc.vision.output_a_target)
+    sccVision.currentLateralAccel = float(self.scc.vision.current_lat_acc)
+    sccVision.maxPredictedLateralAccel = float(self.scc.vision.max_pred_lat_acc)
+    sccVision.enabled = self.scc.vision.is_enabled
+    sccVision.active = self.scc.vision.is_active
+    # Map Control
+    sccMap = smartCruiseControl.map
+    sccMap.state = self.scc.map.state
+    sccMap.vTarget = float(self.scc.map.output_v_target)
+    sccMap.aTarget = float(self.scc.map.output_a_target)
+    sccMap.enabled = self.scc.map.is_enabled
+    sccMap.active = self.scc.map.is_active
+
+    # Speed Limit
+    speedLimit = longitudinalPlanSP.speedLimit
+    resolver = speedLimit.resolver
+    resolver.speedLimit = float(self.resolver.speed_limit)
+    resolver.speedLimitLast = float(self.resolver.speed_limit_last)
+    resolver.speedLimitFinal = float(self.resolver.speed_limit_final)
+    resolver.speedLimitFinalLast = float(self.resolver.speed_limit_final_last)
+    resolver.speedLimitValid = self.resolver.speed_limit_valid
+    resolver.speedLimitLastValid = self.resolver.speed_limit_last_valid
+    resolver.speedLimitOffset = float(self.resolver.speed_limit_offset)
+    resolver.distToSpeedLimit = float(self.resolver.distance)
+    resolver.source = self.resolver.source
+    assist = speedLimit.assist
+    assist.state = self.sla.state
+    assist.enabled = self.sla.is_enabled
+    assist.active = self.sla.is_active
+    assist.vTarget = float(self.sla.output_v_target)
+    assist.aTarget = float(self.sla.output_a_target)
+
+    # E2E Alerts
+    e2eAlerts = longitudinalPlanSP.e2eAlerts
+    e2eAlerts.greenLightAlert = self.e2e_alerts_helper.green_light_alert
+    e2eAlerts.leadDepartAlert = self.e2e_alerts_helper.lead_depart_alert
+
+    # Acceleration Personality (telemetry only; brakeNeed/decelTarget/smoothActive repurposed for the
+    # input-shaping design -- see cereal custom.capnp Acceleration).
+    acceleration = longitudinalPlanSP.acceleration
+    acceleration.personality = self.accel.personality()
+    acceleration.enabled = self.accel.enabled()
+    acceleration.maxAccel = float(self.accel.max_accel())
+    acceleration.brakeNeed = float(self.accel.follow_widen())    # follow-gap widen added on top of stock (s)
+    acceleration.decelTarget = float(self.accel.t_follow())       # t_follow handed to the MPC (s)
+    acceleration.smoothActive = self.accel.widen_active()         # follow-gap widen currently active
+    acceleration.bypassed = False                                 # unused (no output shaping / bypass anymore)
+    acceleration.leadUnstable = bool(self.radar_distance.lead_unstable())
+
+
+    pm.send('longitudinalPlanSP', plan_sp_send)
