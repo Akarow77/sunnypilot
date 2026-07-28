@@ -232,3 +232,22 @@ class TestPowerMonitoring:
     result = pm.max_time_offroad_exceeded(offroad_time_s)
 
     assert result == expected_result
+
+  @pytest.mark.parametrize(
+    "custom_voltage, car_voltage, expected_result",
+    [
+      (12.0, 11.9, True),
+      (12.0, 12.1, False),
+      (11.8, 11.7, True),
+      (11.8, 11.9, False),
+      (11.7, 11.6, False),
+      (11.7, 11.9, False),
+    ]
+  )
+  def test_battery_voltage_below_threshold(self, custom_voltage, car_voltage, expected_result):
+    self.params.put("CustomShutdownVoltage", custom_voltage, block=True)
+
+    pm = PowerMonitoring()
+    result = pm.battery_voltage_below_threshold(car_voltage * 1e3)
+
+    assert result == expected_result
