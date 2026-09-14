@@ -14,10 +14,13 @@ for _ in {1..20}; do
   MAC_USB_IFACE="$(networksetup -listallhardwareports | awk '/Hardware Port: Linux USB Gadget/{getline; print $2; exit}')"
   if [[ -n "$MAC_USB_IFACE" ]] && ifconfig "$MAC_USB_IFACE" | grep -q 'status: active'; then
     MAC_LINK_LOCAL="$(ifconfig "$MAC_USB_IFACE" | awk '/inet6 fe80:/{split($2, address, "%"); print address[1]; exit}')"
-    DEVICE_LINK_LOCAL="$("$ADB" shell "ip -6 -o addr show dev '$USB_DEVICE_IFACE' scope link" | awk '{print $4}' | cut -d/ -f1 | tr -d '\r')"
-    echo "Mac:   ${MAC_LINK_LOCAL}%${MAC_USB_IFACE}"
-    echo "comma: ${DEVICE_LINK_LOCAL}%${USB_DEVICE_IFACE}"
-    exit 0
+    DEVICE_LINK_LINE="$("$ADB" shell "ip -6 -o addr show dev '$USB_DEVICE_IFACE' scope link" | tr -d '\r')"
+    if [[ -n "$DEVICE_LINK_LINE" ]] && [[ "$DEVICE_LINK_LINE" != *tentative* ]]; then
+      DEVICE_LINK_LOCAL="$(printf '%s\n' "$DEVICE_LINK_LINE" | awk '{print $4}' | cut -d/ -f1)"
+      echo "Mac:   ${MAC_LINK_LOCAL}%${MAC_USB_IFACE}"
+      echo "comma: ${DEVICE_LINK_LOCAL}%${USB_DEVICE_IFACE}"
+      exit 0
+    fi
   fi
   sleep 0.25
 done

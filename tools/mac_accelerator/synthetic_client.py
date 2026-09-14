@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Dependency-free 20 Hz synthetic client suitable for running on a comma 3X."""
+"""Fail-closed 20 Hz synthetic client suitable for running on a comma 3X."""
 
 from __future__ import annotations
 
 import argparse
 import math
-import secrets
-import socket
+from pathlib import Path
+import random
 import statistics
 import time
 
-from fallback import FallbackLatch
-from transport import (FLAG_RESET, POLICY_INPUTS, REQUEST, RESPONSE, TIMINGS,
-                       WARPED_BYTES, recv_message, send_message)
+from accelerator_client import AcceleratorClient
+from accelerator_protocol import read_auth_key
+from transport import POLICY_INPUTS, WARPED_BYTES
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -26,72 +26,85 @@ def percentile(values: list[float], q: float) -> float:
 
 
 def main() -> None:
-  parser = argparse.ArgumentParser(description="Synthetic comma-to-Mac accelerator link test")
-  parser.add_argument('host', help="Mac IPv6 link-local address, including %usb0 scope")
+  parser = argparse.ArgumentParser(description='Synthetic comma-to-Mac accelerator link test')
+  parser.add_argument('host', help='Mac IPv6 link-local address, including %usb0 scope')
   parser.add_argument('--port', type=int, default=8066)
   parser.add_argument('--frames', type=int, default=200)
-  parser.add_argument('--warmup-frames', type=int, default=5)
+  parser.add_argument('--warmup-frames', type=int, default=20)
+  parser.add_argument('--qualification-frames', type=int, default=20)
   parser.add_argument('--frequency', type=float, default=20.0)
   parser.add_argument('--deadline-ms', type=float, default=50.0)
+  parser.add_argument('--qualification-timeout-ms', type=float, default=500.0)
   parser.add_argument('--expected-output-floats', type=int, default=2576)
+  parser.add_argument('--expected-backend', default='METAL')
+  parser.add_argument('--expected-checkpoint')
+  parser.add_argument('--expected-model-sha256')
+  parser.add_argument('--auth-key-file', type=Path)
+  parser.add_argument('--compression', choices=('zstd-1',))
+  parser.add_argument('--synthetic-random-prefix-bytes', type=int, default=0,
+                      help='non-sensitive incompressible prefix for realistic transport tests')
   args = parser.parse_args()
-  if (args.frames < 1 or args.warmup_frames < 0 or args.frequency <= 0 or
-      args.deadline_ms <= 0 or args.expected_output_floats < 1):
+  if (args.frames < 1 or args.warmup_frames < args.qualification_frames or args.qualification_frames < 1 or args.frequency <= 0 or
+      args.deadline_ms <= 0 or args.qualification_timeout_ms < args.deadline_ms or args.expected_output_floats < 1):
     parser.error('frames, frequency, and deadline must be positive; warmup frames cannot be negative')
+  if not 0 <= args.synthetic_random_prefix_bytes <= WARPED_BYTES:
+    parser.error('synthetic random prefix must fit inside the warped payload')
 
   policy = POLICY_INPUTS.pack(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.1, 0.1)
-  payload = bytes(WARPED_BYTES) + policy
-  session_id = secrets.randbits(64)
+  random_prefix = random.Random(1).randbytes(args.synthetic_random_prefix_bytes)
+  warped = random_prefix + bytes(WARPED_BYTES - len(random_prefix))
   period = 1.0 / args.frequency
   latencies: list[float] = []
   inference_times: list[float] = []
-  deadline_misses = 0
-  fallback = FallbackLatch(args.deadline_ms)
+  attempted = 0
 
-  with socket.create_connection((args.host, args.port), timeout=5.0) as conn:
-    conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
-    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    conn.settimeout(max(5.0, args.deadline_ms / 1000.0 * 4))
+  client = AcceleratorClient(
+    args.host, args.port, deadline_ms=args.deadline_ms,
+    auth_key=read_auth_key(args.auth_key_file),
+    expected_checkpoint=args.expected_checkpoint,
+    expected_model_sha256=args.expected_model_sha256,
+    expected_output_floats=args.expected_output_floats,
+    expected_backend=args.expected_backend,
+    qualification_frames=args.qualification_frames,
+    qualification_timeout_ms=args.qualification_timeout_ms,
+    compression=args.compression,
+  )
+  identity = client.connect()
+  print(f'accelerator={identity.device_type} backend={identity.backend} checkpoint={identity.model_checkpoint}')
+  try:
     next_frame = time.monotonic()
     for frame_id in range(args.warmup_frames + args.frames):
       now = time.monotonic()
       if now < next_frame:
         time.sleep(next_frame - now)
       capture_ns = time.monotonic_ns()
-      flags = FLAG_RESET if frame_id == 0 else 0
-      send_message(conn, REQUEST, flags, session_id, frame_id, capture_ns, payload)
-      response_flags, response_session, response_frame, response_capture, response = recv_message(conn, RESPONSE)
-      completed_ns = time.monotonic_ns()
-      if (response_session, response_frame, response_capture) != (session_id, frame_id, capture_ns):
-        raise RuntimeError('response identity mismatch')
-      if response_flags != flags & FLAG_RESET:
-        raise RuntimeError('reset acknowledgement mismatch')
-      expected_response_bytes = TIMINGS.size + args.expected_output_floats * 4
-      if len(response) != expected_response_bytes:
-        raise RuntimeError(f'invalid response length: {len(response)}')
-      _, inference_start_ns, inference_end_ns = TIMINGS.unpack_from(response)
-      latency_ms = (completed_ns - capture_ns) / 1e6
-      output_valid = all(math.isfinite(value) for value in memoryview(response)[TIMINGS.size:].cast('f'))
-      if not output_valid:
-        raise RuntimeError(f'non-finite model output at frame {frame_id}')
+      attempted += int(frame_id >= args.warmup_frames)
+      result = client.infer(warped, policy, frame_id=frame_id, capture_ns=capture_ns, reset=frame_id == 0)
       if frame_id >= args.warmup_frames:
-        if frame_id == args.warmup_frames:
-          fallback.activate()
-        latencies.append(latency_ms)
-        inference_times.append((inference_end_ns - inference_start_ns) / 1e6)
-        deadline_misses += latency_ms > args.deadline_ms
-        fallback.observe(frame_id, latency_ms, output_valid)
+        if client.fallback.state.value != 'active':
+          raise RuntimeError('accelerator did not pass warm-up qualification')
+        latencies.append(result.round_trip_ms)
+        inference_times.append(result.inference_ms)
       next_frame += period
+  except Exception as error:
+    print(f'stopped_on_failure={type(error).__name__}: {error}')
+  finally:
+    client.close()
 
-  print(f'frames={args.frames} warmup_frames={args.warmup_frames} frequency={args.frequency:.1f}Hz')
-  round_trip_summary = f'round_trip_ms mean={statistics.fmean(latencies):.2f} p95={percentile(latencies, 95):.2f} '
-  round_trip_summary += f'p99={percentile(latencies, 99):.2f} max={max(latencies):.2f}'
-  inference_summary = f'inference_ms mean={statistics.fmean(inference_times):.2f} p95={percentile(inference_times, 95):.2f} '
-  inference_summary += f'p99={percentile(inference_times, 99):.2f} max={max(inference_times):.2f}'
-  print(round_trip_summary)
-  print(inference_summary)
-  print(f'deadline_misses={deadline_misses}/{args.frames} deadline_ms={args.deadline_ms:.1f}')
-  print(f'chestnut_style_fallback={fallback.state.value} frame={fallback.failure_frame} reason={fallback.failure_reason}')
+  print(f'frames_completed={len(latencies)}/{args.frames} warmup_frames={args.warmup_frames} frequency={args.frequency:.1f}Hz')
+  if latencies:
+    round_trip_summary = f'round_trip_ms mean={statistics.fmean(latencies):.2f} p95={percentile(latencies, 95):.2f} '
+    round_trip_summary += f'p99={percentile(latencies, 99):.2f} max={max(latencies):.2f}'
+    inference_summary = f'inference_ms mean={statistics.fmean(inference_times):.2f} p95={percentile(inference_times, 95):.2f} '
+    inference_summary += f'p99={percentile(inference_times, 99):.2f} max={max(inference_times):.2f}'
+    print(round_trip_summary)
+    print(inference_summary)
+  print(f'deadline_misses={attempted - len(latencies)}/{attempted} deadline_ms={args.deadline_ms:.1f}')
+  fallback_message = f'chestnut_style_fallback={client.fallback.state.value} frame={client.fallback.failure_frame}'
+  fallback_message += f' reason={client.fallback.failure_reason}'
+  print(fallback_message)
+  if len(latencies) != args.frames:
+    raise SystemExit(1)
 
 
 if __name__ == '__main__':

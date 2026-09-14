@@ -1,74 +1,76 @@
-# Remote inference protocol outline
+# Remote inference protocol v2
 
-This is the proposed bench protocol for a comma 3X and an Apple Silicon Mac. It is
-not approved for on-road control.
+This is the implemented bench protocol between a comma 3X and an Apple Silicon
+Mac. It is not approved for on-road control.
 
 ## Split point
 
-The comma 3X keeps camera acquisition, calibration, frame selection, and the tinygrad
-camera warp. It sends two contiguous `uint8[6,128,256]` tensors to the Mac. The Mac
-keeps the recurrent image, desire, and feature queues and runs the driving policy.
+The comma 3X retains camera acquisition, calibration, frame selection, and the
+tinygrad camera warp. It sends two contiguous `uint8[6,128,256]` tensors to the
+Mac. The Mac owns the recurrent image, desire, and feature queues and runs the
+driving policy.
 
-Keeping the warp on the 3X reduces the 20 Hz payload from about 149.4 MB/s of padded
-NV12 data to about 7.9 MB/s. The Mac returns the model-dependent float32 output:
-2,576 values (about 10.3 KB) for the small model or 18,452 values (about 73.8 KB) for
-the tested official big model.
+Keeping the warp on the 3X reduces the 20 Hz payload from about 149.4 MB/s of
+padded NV12 data to 393,216 bytes per inference before compression, or about
+7.9 MB/s at 20 Hz. The official Big Model response is 18,452 float32 values
+(about 73.8 KB).
 
-## Request
+## Framing and discovery
 
-Every request should contain:
+Every message starts with the 40-byte, network-order `SPMA` header defined in
+`transport.py`: protocol version, message type, flags, session ID, frame ID,
+capture monotonic timestamp, payload length, and CRC32. Payloads are capped at
+4 MiB.
 
-- protocol magic and version;
-- session ID, monotonically increasing frame ID, and capture monotonic timestamp;
-- payload length and checksum;
-- the two warped image tensors;
-- desire pulse, traffic convention, and action-delay inputs;
-- a reset flag for reconnects and model changes.
+The client begins each connection with a nonce-bearing JSON `HELLO`. The server
+returns an identity containing its device type, backend, model checkpoint,
+source-model SHA-256, input/output shapes, output length, request length, and
+supported compression modes. The client rejects any identity that differs from
+its configured expectations.
 
-Prototype v1 uses a 40-byte network-order header (`SPMA`, version, type, flags,
-session ID, frame ID, capture timestamp, payload length, CRC32). The request payload
-is exactly 393,216 bytes of `uint8[2,6,128,256]`, followed by twelve little-endian
-float32 values: eight desire pulses, two traffic-convention values, and two action
-delay values.
+When a shared key is configured, both sides prove possession with HMAC-SHA256
+over canonical handshake JSON. Every inference request and response also carries
+an HMAC-SHA256 tag covering the protocol metadata and payload. The key must be at
+least 32 bytes and is never stored in the repository.
 
-Only one request may be in flight. A newer frame supersedes an unsent older frame;
-queues must never be advanced for a dropped or out-of-order request.
+## Inference request and response
 
-## Response
+The uncompressed request is exactly 393,264 bytes: two warped image tensors,
+eight desire-pulse floats, two traffic-convention floats, and two action-delay
+floats. `FLAG_ZSTD_REQUEST` losslessly compresses this request with Zstd level 1;
+the declared uncompressed size remains fixed. `FLAG_RESET` resets recurrent
+state and must be acknowledged by the response.
 
-Every response should contain:
+The response contains server receive, inference-start, and inference-end
+monotonic timestamps followed by the model's little-endian float32 output. The
+header echoes the request session, frame, capture timestamp, and accepted flags.
+Monotonic clocks on different machines are not compared; the client measures the
+complete request round trip with its own clock.
 
-- matching session and frame IDs;
-- server receive, inference-start, and inference-end monotonic timestamps;
-- model identity and protocol version;
-- output length, checksum, and the model output tensor;
-- a reset acknowledgement when requested.
+Only one request may be in flight. Frame IDs must be sequential at the client and
+strictly increasing at the server. A newer camera frame may replace an unsent old
+frame, but queues must never advance for a dropped, duplicated, or rejected
+request.
 
-The prototype response starts with three network-order monotonic timestamps (receive,
-inference start, inference end), followed by the little-endian float32 model output.
-The header echoes the request session, frame, and capture timestamp. Monotonic clocks
-on the two machines are not compared directly; the client measures the round trip on
-its own clock.
+## Readiness and failure behavior
 
-Before live integration, add a handshake that binds a session to the model hash,
-input/output shapes, backend, and deadline. The current synthetic client supplies the
-expected output length out of band and is not sufficient for automatic model changes.
+Loading has a separate cold-start timeout. The accelerator becomes ready only
+after a configured number of consecutive frames finish within the active
+deadline. Once active, a bad identity, malformed length, checksum or HMAC error,
+stale response, non-finite output, disconnect, or deadline miss latches the
+client into the failed state until an explicit reset or ignition cycle.
 
-## Failure behavior
-
-The 3X must reject responses from an old session, duplicate or out-of-order frame IDs,
-non-finite outputs, malformed lengths, checksum failures, and results that miss their
-deadline. A remote disconnect must never block `modeld`.
-
-For early testing, the normal 3X model must continue running as the control source.
-The Mac output is shadow-only and logged for comparison. Promotion beyond shadow mode
-requires route replay, fault injection, sustained thermal testing, and an explicit
-fallback design review.
+A remote request must never block the local `modeld` path. The frame that causes
+failure is discarded, and the normal local model remains the only published
+control source. Current USB tests do not meet a sustained hard 50 ms
+camera-warp-to-output deadline, so the implementation remains synthetic and
+shadow-only.
 
 ## Development stages
 
-1. Loopback server/client on the Mac with synthetic warped inputs.
-2. Route replay with recorded 3X frames and side-by-side local/remote outputs.
-3. Wired bench connection to a powered 3X, remote output still shadow-only.
-4. Inject packet loss, delays, disconnects, restarts, and corrupted payloads.
-5. Decide whether the measured benefit justifies any further integration.
+1. Loopback server/client on the Mac with synthetic warped inputs. Completed.
+2. Recorded-route Core ML versus PyTorch validation. Completed for a short sample.
+3. Wired comma 3X discovery and synthetic USB-NCM inference. Completed off-road.
+4. Live camera-warp shadow integration and fault injection. Not implemented.
+5. Sustained thermal and full-route qualification. Not passed.
+6. Any control-path proposal requires a separate safety design and review.

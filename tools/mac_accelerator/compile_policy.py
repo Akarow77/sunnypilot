@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 from pathlib import Path
 
@@ -80,6 +81,9 @@ def main() -> None:
     'metadata': metadata,
     'input_devices': {'model': Device.DEFAULT},
     'run_policy': jit,
+    'accelerator': {
+      'model_sha256': hashlib.sha256(Path(args.onnx).read_bytes()).hexdigest(),
+    },
   }
   args.output.parent.mkdir(parents=True, exist_ok=True)
   with args.output.open('wb') as output_file:

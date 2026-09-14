@@ -2,12 +2,15 @@
 
 This directory contains a bench-only prototype for using an Apple Silicon Mac as a
 sunnypilot inference worker. It targets the comma 3X and the standard 20 Hz driving
-model. It includes a policy-only Metal artifact, a checksummed TCP worker, USB-NCM
-link setup, and a dependency-free synthetic client that runs on the 3X.
+model. It includes Metal and Core ML/ANE workers, authenticated and checksummed
+USB-NCM transport, lossless Zstd requests, and a dependency-free 3X client.
 
 Do not use this experiment to control a vehicle. The live camera/modeld integration
-and on-device fallback are not implemented. The current client sends synthetic
-warped tensors and measures the shadow inference path only.
+is not implemented and the sustained 50 ms end-to-end requirement has not passed.
+The current client recognizes the Mac as a user-space accelerator, sends synthetic
+warped tensors, and exercises a fail-closed shadow path only. A Mac cannot enumerate
+as a native PCIe/USB GPU on the 3X; the authenticated service identity is the honest
+equivalent.
 
 ## Prepare
 
@@ -34,8 +37,8 @@ Compile the policy-only worker artifact used by the USB prototype:
 tools/mac_accelerator/compile_policy.sh
 ```
 
-The official big model can also be compiled, but the tested M2 Air cannot run it at
-20 Hz:
+The official big model can also be compiled for Metal, but the tested M2 Air cannot
+run that backend at 20 Hz:
 
 ```bash
 git lfs pull --include=openpilot/selfdrive/modeld/models/big_driving_supercombo.onnx
@@ -43,6 +46,20 @@ MODEL="$PWD/openpilot/selfdrive/modeld/models/big_driving_supercombo.onnx" \
 OUTPUT="$PWD/tools/mac_accelerator/artifacts/big_driving_policy_metal.pkl" \
   tools/mac_accelerator/compile_policy.sh
 ```
+
+## Compile the Big Model for Core ML/ANE
+
+Core ML is the only tested backend that runs the official Big Model below 50 ms on
+the M2 Air itself. Create the isolated, pinned conversion environment and compile:
+
+```bash
+tools/mac_accelerator/setup_coreml_env.sh
+tools/mac_accelerator/compile_coreml.sh
+```
+
+The converter promotes the ONNX graph to consistent FP32 storage to work around a
+Core ML convolution import mismatch, then requests Core ML FLOAT16 lowering. Keep
+the original ONNX and its SHA-256 as the protocol identity.
 
 ## Run with a comma 3X
 
@@ -53,11 +70,31 @@ USB 3 cable. Enable ADB on the 3X. In the first Mac terminal, run:
 tools/mac_accelerator/run_server.sh
 ```
 
-The server binds only to the Mac's USB link-local address, not Wi-Fi. In a second
-terminal, run the synthetic 20 Hz client on the 3X:
+The Metal server binds only to the Mac's USB link-local address, not Wi-Fi. In a
+second terminal, run the synthetic 20 Hz client on the 3X:
 
 ```bash
 tools/mac_accelerator/run_3x_smoke_test.sh
+```
+
+For the Big Model Core ML/ANE worker, first generate a private 32-byte shared key,
+then start the server:
+
+```bash
+openssl rand -out /path/outside-the-repository/mac-accelerator.key 32
+AUTH_KEY_FILE=/path/outside-the-repository/mac-accelerator.key \
+  tools/mac_accelerator/run_coreml_server.sh
+```
+
+From another terminal, run the 3X test with the expected SHA printed by
+`shasum -a 256 openpilot/selfdrive/modeld/models/big_driving_supercombo.onnx`:
+
+```bash
+AUTH_KEY_FILE=/path/outside-the-repository/mac-accelerator.key \
+EXPECTED_BACKEND=COREML_ANE EXPECTED_OUTPUT_FLOATS=18452 \
+EXPECTED_MODEL_SHA256=<64-character SHA-256> COMPRESSION=zstd-1 \
+SYNTHETIC_RANDOM_PREFIX_BYTES=250000 WARMUP_FRAMES=40 \
+QUALIFICATION_FRAMES=20 tools/mac_accelerator/run_3x_smoke_test.sh
 ```
 
 The setup is intentionally transient. The 3X `usb0` interface is raised through
@@ -114,11 +151,16 @@ therefore not the limiting factor for the 63 Mbps model-input requirement.
 
 ## Safety boundary and next stage
 
-The prototype uses monotonically increasing frame IDs, session resets, capture
-timestamps, fixed payload sizes, CRC32, finite-output checks, and one request in
-flight. The next stage must connect live 3X warps in shadow mode and reject results
-over the deadline on the 3X. The local model must remain the control source whenever
-the worker is late, warming up, disconnected, or invalid.
+Protocol v2 uses mutually authenticated HMAC-SHA256 discovery, per-request and
+per-response HMAC tags, monotonically increasing frame IDs, session resets, capture
+timestamps, fixed uncompressed sizes, CRC32, finite-output checks, optional lossless
+Zstd, an absolute client deadline, and one request in flight. Loading allows a
+separate cold-start timeout but requires consecutive in-deadline frames before the
+accelerator becomes ready. Any active failure is latched until reset.
+
+The next stage must connect live 3X warps in shadow mode and measure the entire
+camera-warp-to-output deadline. The local model must remain the control source
+whenever the worker is late, warming up, disconnected, or invalid.
 
 See [PROTOCOL.md](PROTOCOL.md) for the proposed split, message contents, and staged
 failure-testing plan. [CHESTNUT_DESIGN.md](CHESTNUT_DESIGN.md) maps sunnypilot's
@@ -158,6 +200,22 @@ Actual calibrated route replay, using the same 200 camera-frame pairs:
 | Small | 2,576 | 12.79 ms | 28.25 ms | 35.43 ms | 0 / 200 |
 | Big | 18,452 | 114.87 ms | 118.26 ms | 147.28 ms | 200 / 200 |
 
-Both produced finite outputs, but the official big model is not real-time on the
-MacBook Air M2. Compiling successfully is not sufficient to use it as a 20 Hz driving
-model.
+Those rows use the tinygrad Metal backend. The Big Model is not real-time with that
+backend on the MacBook Air M2.
+
+The Core ML/ANE conversion materially improves inference speed on the same Mac:
+
+| Big Model test | Mean | p99 | Max | Missed 50 ms |
+| --- | ---: | ---: | ---: | ---: |
+| Mac only, CPU + Neural Engine / 20 frames | 18.96 ms | 19.84 ms | 19.90 ms | 0 / 20 |
+| 3X USB, Zstd synthetic / 400 frames | 37.40 ms | 42.48 ms | 45.04 ms | 0 / 400 |
+| Warm Mac + 3X USB diagnostic | 46.88 ms | 53.51 ms | 53.77 ms | observed |
+
+An exact five-frame recorded-route temporal comparison against the original PyTorch
+model measured 0.584% maximum overall normalized RMSE. Individual output heads ranged
+up to about 2.17%, so more route coverage is required before judging equivalence.
+
+Core ML/ANE can execute the Big Model itself at 20 Hz, but the fanless M2 Air plus
+compression, USB transport, scheduling, and 3X warp does not sustain a hard 50 ms
+capture-to-output deadline. The current result is suitable only for continued
+off-road shadow testing; it is not a vehicle-control accelerator.

@@ -9,10 +9,14 @@ import zlib
 
 
 MAGIC = b"SPMA"
-VERSION = 1
+VERSION = 2
 REQUEST = 1
 RESPONSE = 2
+HELLO = 3
+HELLO_RESPONSE = 4
+ERROR = 5
 FLAG_RESET = 1 << 0
+FLAG_ZSTD_REQUEST = 1 << 1
 
 HEADER = struct.Struct("!4sBBHQQQII")
 TIMINGS = struct.Struct("!QQQ")
@@ -22,6 +26,7 @@ WARPED_SHAPE = (2, 6, 128, 256)
 WARPED_BYTES = 2 * 6 * 128 * 256
 REQUEST_BYTES = WARPED_BYTES + POLICY_INPUTS.size
 MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
+DEVICE_TYPE = "sunnypilot-mac-accelerator-v2"
 
 
 class ProtocolError(RuntimeError):

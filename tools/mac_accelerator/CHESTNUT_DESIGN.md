@@ -27,7 +27,7 @@ must instead require all of the following:
 1. the comma USB gadget is negotiated at SuperSpeed;
 2. USB-NCM is active on both ends;
 3. the worker handshake matches protocol version, model hash, input/output shapes,
-   and Metal backend;
+   and the explicitly configured backend (for example `COREML_ANE`);
 4. warm-up completes within 60 seconds;
 5. a configured number of shadow frames pass CRC, identity, finite-output, and
    deadline checks.
