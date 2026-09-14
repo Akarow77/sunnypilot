@@ -7,11 +7,15 @@ MODEL="${MODEL:-$SCRIPT_DIR/artifacts/big_driving.mlpackage}"
 ONNX="${ONNX:-$REPO_ROOT/openpilot/selfdrive/modeld/models/big_driving_supercombo.onnx}"
 METADATA="${METADATA:-$REPO_ROOT/openpilot/selfdrive/modeld/models/big_driving_supercombo_metadata.pkl}"
 PORT="${PORT:-8066}"
+COREML_TMPDIR="${COREML_TMPDIR:-$SCRIPT_DIR/artifacts/tmp}"
 
 if [[ -z "${AUTH_KEY_FILE:-}" ]] || [[ ! -f "$AUTH_KEY_FILE" ]]; then
   echo "AUTH_KEY_FILE must point to a shared key containing at least 32 bytes." >&2
   exit 1
 fi
+
+mkdir -p "$COREML_TMPDIR"
+export TMPDIR="$COREML_TMPDIR"
 
 LINK_INFO="$($SCRIPT_DIR/setup_usb_ncm.sh)"
 printf '%s\n' "$LINK_INFO"

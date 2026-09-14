@@ -13,6 +13,7 @@ import time
 from accelerator_client import AcceleratorClient
 from accelerator_protocol import read_auth_key
 from transport import POLICY_INPUTS, WARPED_BYTES
+from ui_state import make_ui_state
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -43,6 +44,8 @@ def main() -> None:
   parser.add_argument('--compression', choices=('zstd-1',))
   parser.add_argument('--synthetic-random-prefix-bytes', type=int, default=0,
                       help='non-sensitive incompressible prefix for realistic transport tests')
+  parser.add_argument('--publish-ui-state', action='store_true',
+                      help='publish Chestnut-style Mac worker state on a comma checkout')
   args = parser.parse_args()
   if (args.frames < 1 or args.warmup_frames < args.qualification_frames or args.qualification_frames < 1 or args.frequency <= 0 or
       args.deadline_ms <= 0 or args.qualification_timeout_ms < args.deadline_ms or args.expected_output_floats < 1):
@@ -69,8 +72,16 @@ def main() -> None:
     qualification_timeout_ms=args.qualification_timeout_ms,
     compression=args.compression,
   )
-  identity = client.connect()
+  ui_state = make_ui_state(args.publish_ui_state)
+  ui_state.loading()
+  try:
+    identity = client.connect()
+  except Exception:
+    ui_state.failed()
+    raise
+  ui_state.ready()
   print(f'accelerator={identity.device_type} backend={identity.backend} checkpoint={identity.model_checkpoint}')
+  failed = False
   try:
     next_frame = time.monotonic()
     for frame_id in range(args.warmup_frames + args.frames):
@@ -87,9 +98,13 @@ def main() -> None:
         inference_times.append(result.inference_ms)
       next_frame += period
   except Exception as error:
+    failed = True
+    ui_state.failed()
     print(f'stopped_on_failure={type(error).__name__}: {error}')
   finally:
     client.close()
+    if not failed:
+      ui_state.disconnected()
 
   print(f'frames_completed={len(latencies)}/{args.frames} warmup_frames={args.warmup_frames} frequency={args.frequency:.1f}Hz')
   if latencies:

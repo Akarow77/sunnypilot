@@ -43,11 +43,20 @@ def main() -> None:
   parser.add_argument('--compute-unit', choices=COMPUTE_UNITS, default='all')
   parser.add_argument('--warmup', type=int, default=5)
   parser.add_argument('--runs', type=int, default=100)
+  parser.add_argument('--frequency', type=float, default=0.0,
+                      help='pace predictions at this frequency; zero runs as fast as possible')
+  parser.add_argument('--duration', type=float,
+                      help='derive run count from frequency and this duration in seconds')
   parser.add_argument('--deadline-ms', type=float, default=50.0)
   parser.add_argument('--json-output', type=Path)
+  parser.add_argument('--require-zero-misses', action='store_true')
   args = parser.parse_args()
-  if args.warmup < 1 or args.runs < 1 or args.deadline_ms <= 0:
-    parser.error('warmup, runs, and deadline must be positive')
+  if args.duration is not None:
+    if args.duration <= 0 or args.frequency <= 0:
+      parser.error('--duration requires a positive --frequency')
+    args.runs = round(args.duration * args.frequency)
+  if args.warmup < 1 or args.runs < 1 or args.frequency < 0 or args.deadline_ms <= 0:
+    parser.error('warmup, runs, frequency, and deadline must be non-negative or positive as appropriate')
 
   with args.metadata.open('rb') as metadata_file:
     metadata = pickle.load(metadata_file)
@@ -72,10 +81,21 @@ def main() -> None:
   for _ in range(args.warmup):
     predict()
   durations = []
+  schedule_lateness = []
+  period = 1.0 / args.frequency if args.frequency else 0.0
+  next_start = time.perf_counter()
   for _ in range(args.runs):
+    if period:
+      now = time.perf_counter()
+      if now < next_start:
+        time.sleep(next_start - now)
+      schedule_lateness.append(max(0.0, time.perf_counter() - next_start) * 1000.0)
     started = time.perf_counter()
     predict()
     durations.append((time.perf_counter() - started) * 1000.0)
+    next_start += period
+
+  midpoint = max(1, len(durations) // 2)
 
   report = {
     'compute_unit': args.compute_unit,
@@ -84,15 +104,23 @@ def main() -> None:
     'max_ms': max(durations),
     'mean_ms': float(np.mean(durations)),
     'misses': sum(duration > args.deadline_ms for duration in durations),
+    'first_half_mean_ms': float(np.mean(durations[:midpoint])),
+    'second_half_mean_ms': float(np.mean(durations[midpoint:] or durations)),
+    'frequency_hz': args.frequency,
     'p50_ms': percentile(durations, 50),
     'p95_ms': percentile(durations, 95),
     'p99_ms': percentile(durations, 99),
     'runs': args.runs,
   }
+  if schedule_lateness:
+    report['schedule_lateness_max_ms'] = max(schedule_lateness)
+    report['schedule_lateness_p99_ms'] = percentile(schedule_lateness, 99)
   print(json.dumps(report, indent=2, sort_keys=True))
   if args.json_output is not None:
     args.json_output.parent.mkdir(parents=True, exist_ok=True)
     args.json_output.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+  if args.require_zero_misses and report['misses']:
+    raise SystemExit(1)
 
 
 if __name__ == '__main__':

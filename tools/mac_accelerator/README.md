@@ -98,8 +98,34 @@ QUALIFICATION_FRAMES=20 tools/mac_accelerator/run_3x_smoke_test.sh
 ```
 
 The setup is intentionally transient. The 3X `usb0` interface is raised through
-ADB and returns to its normal state after a reboot. The two small client files are
-copied only to `/tmp/mac_accelerator` on the 3X.
+ADB and returns to its normal state after a reboot. The client files are copied
+only to `/tmp/mac_accelerator` on the 3X.
+
+## macOS app and dedicated qualification
+
+Build the native arm64 launcher app with the installed Command Line Tools:
+
+```bash
+tools/mac_accelerator/build_macos_app.sh
+open "tools/mac_accelerator/dist/Sunnypilot Mac Accelerator.app"
+```
+
+The app creates a mode-0600 shared key under the user's Application Support
+directory, keeps the Mac awake, limits auxiliary math-library threads, and starts
+the Core ML/ANE worker. It shows server and authenticated 3X connection status but
+does not publish vehicle-control outputs.
+
+To test the hypothesis that other Mac workloads caused latency spikes, quit heavy
+applications and run the paced five-minute qualification:
+
+```bash
+tools/mac_accelerator/run_coreml_qualification.sh
+```
+
+The command fails on any inference over 50 ms and reports first-half versus
+second-half latency plus scheduler lateness. A passing Mac-only run is necessary
+but not sufficient: the 3X warp, compression, USB round trip, full-route accuracy,
+disconnect injection, and local fallback must also pass.
 
 ## Sustained benchmark
 
@@ -162,6 +188,12 @@ The next stage must connect live 3X warps in shadow mode and measure the entire
 camera-warp-to-output deadline. The local model must remain the control source
 whenever the worker is late, warming up, disconnected, or invalid.
 
+When the comma-side test is running, `MacAccelerator*` parameters map its state to
+the existing Chestnut icons: loading pulses, ready/active is green, and a latched
+failure is orange. The model manager still knows it is not physical Chestnut, so a
+green shadow-ready icon cannot silently select a Chestnut model or vehicle-control
+path.
+
 See [PROTOCOL.md](PROTOCOL.md) for the proposed split, message contents, and staged
 failure-testing plan. [CHESTNUT_DESIGN.md](CHESTNUT_DESIGN.md) maps sunnypilot's
 Chestnut loading, state reporting, and latched small-model fallback onto a Mac worker.
@@ -207,7 +239,7 @@ The Core ML/ANE conversion materially improves inference speed on the same Mac:
 
 | Big Model test | Mean | p99 | Max | Missed 50 ms |
 | --- | ---: | ---: | ---: | ---: |
-| Mac only, CPU + Neural Engine / 20 frames | 18.96 ms | 19.84 ms | 19.90 ms | 0 / 20 |
+| Mac only, CPU + Neural Engine / 5 min at 20 Hz | 25.69 ms | 27.18 ms | 39.53 ms | 0 / 6,000 |
 | 3X USB, Zstd synthetic / 400 frames | 37.40 ms | 42.48 ms | 45.04 ms | 0 / 400 |
 | Warm Mac + 3X USB diagnostic | 46.88 ms | 53.51 ms | 53.77 ms | observed |
 

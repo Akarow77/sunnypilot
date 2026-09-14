@@ -14,6 +14,7 @@ from openpilot.system.ui.lib.application import gui_app
 from openpilot.common.hardware import HARDWARE, PC
 from openpilot.common.hardware.usb import TYPEC_CC_ORIENTATION_PATH, get_usb_state, is_chestnut_usb_id, read_int
 from openpilot.selfdrive.modeld.helpers import chestnut_compiled
+from openpilot.selfdrive.ui.mac_accelerator_state import mac_accelerator_state
 
 from openpilot.selfdrive.ui.sunnypilot.ui_state import UIStateSP, DeviceSP
 
@@ -96,6 +97,11 @@ class UIState(UIStateSP):
     self.chestnut_compiled: bool = chestnut_compiled()
     self.chestnut_active: bool | None = None
     self.chestnut_loading: bool = False
+    self.mac_accelerator_active: bool = False
+    self.mac_accelerator_loading: bool = False
+    self.mac_accelerator_model_error: bool = False
+    self.mac_accelerator_present: bool = False
+    self.mac_accelerator_ready: bool = False
     self.usb_connected: bool = False
     self.usb_connected_ts: float | None = None
     self.usb_disconnected_ts: float | None = None
@@ -219,6 +225,17 @@ class UIState(UIStateSP):
 
   def _update_chestnut_state(self) -> None:
     detected = self.sm["deviceState"].chestnutPresent
+    if not detected:
+      mac_state = mac_accelerator_state(
+        present=self.mac_accelerator_present,
+        loading=self.mac_accelerator_loading,
+        ready=self.mac_accelerator_ready,
+        active=self.mac_accelerator_active,
+        failed=self.mac_accelerator_model_error,
+      )
+      if mac_state is not None:
+        self.chestnut_state = ChestnutState(mac_state)
+        return
     if not self.started:
       self.chestnut_present = detected
       self.chestnut_state = (ChestnutState.READY if detected and self.chestnut_compiled else
@@ -259,6 +276,11 @@ class UIState(UIStateSP):
       self.chestnut_compiled = chestnut_compiled()
     self.chestnut_active = self.params.get("ChestnutActive")
     self.chestnut_loading = self.params.get_bool("ChestnutLoading")
+    self.mac_accelerator_active = self.params.get_bool("MacAcceleratorActive")
+    self.mac_accelerator_loading = self.params.get_bool("MacAcceleratorLoading")
+    self.mac_accelerator_model_error = self.params.get_bool("MacAcceleratorModelError")
+    self.mac_accelerator_present = self.params.get_bool("MacAcceleratorPresent")
+    self.mac_accelerator_ready = self.params.get_bool("MacAcceleratorReady")
     now = time.monotonic()
     if read_int(TYPEC_CC_ORIENTATION_PATH) != 0:
       self.usb_disconnected_ts = None
@@ -276,6 +298,11 @@ class UIState(UIStateSP):
         self.usb_connected = False
         self.usb_connected_ts = None
         self.usb_unknown = False
+
+    # USB-NCM does not carry Chestnut's VID/PID, but an authenticated Mac worker
+    # is a known accelerator rather than an unknown USB accessory.
+    if self.mac_accelerator_present:
+      self.usb_unknown = False
 
     UIStateSP.update_params(self)
 

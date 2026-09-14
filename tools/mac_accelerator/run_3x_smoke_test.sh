@@ -28,7 +28,7 @@ DEVICE_ENDPOINT="${MAC_ADDRESS}%usb0"
 adb shell "mkdir -p '$DEVICE_DIR'"
 adb push "$SCRIPT_DIR/accelerator_client.py" "$SCRIPT_DIR/accelerator_protocol.py" \
   "$SCRIPT_DIR/compression.py" "$SCRIPT_DIR/fallback.py" "$SCRIPT_DIR/transport.py" \
-  "$SCRIPT_DIR/synthetic_client.py" "$DEVICE_DIR/"
+  "$SCRIPT_DIR/synthetic_client.py" "$SCRIPT_DIR/ui_state.py" "$DEVICE_DIR/"
 if [[ -n "${AUTH_KEY_FILE:-}" ]]; then
   adb push "$AUTH_KEY_FILE" "$DEVICE_DIR/auth.key"
   AUTH_ARGS=(--auth-key-file "$DEVICE_DIR/auth.key")
@@ -42,10 +42,11 @@ fi
 if [[ -n "$COMPRESSION" ]]; then
   IDENTITY_ARGS+=(--compression "$COMPRESSION")
 fi
-adb shell "cd '$DEVICE_DIR' && python3 -u synthetic_client.py '$DEVICE_ENDPOINT' \
+adb shell "cd '$DEVICE_DIR' && PYTHONPATH=/data/openpilot python3 -u synthetic_client.py '$DEVICE_ENDPOINT' \
   --port '$PORT' --frames '$FRAMES' --warmup-frames '$WARMUP_FRAMES' \
   --qualification-frames '$QUALIFICATION_FRAMES' \
   --frequency '$FREQUENCY' --deadline-ms '$DEADLINE_MS' \
   --qualification-timeout-ms '$QUALIFICATION_TIMEOUT_MS' \
   --synthetic-random-prefix-bytes '$SYNTHETIC_RANDOM_PREFIX_BYTES' \
+  --publish-ui-state \
   --expected-output-floats '$EXPECTED_OUTPUT_FLOATS' ${IDENTITY_ARGS[*]} ${AUTH_ARGS[*]}"
