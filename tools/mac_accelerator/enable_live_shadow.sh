@@ -30,7 +30,7 @@ MAC_ADDRESS="${MAC_ENDPOINT%\%*}"
 DEVICE_ENDPOINT="${MAC_ADDRESS}%usb0"
 MODEL_SHA256="$(shasum -a 256 "$MODEL" | awk '{print $1}')"
 
-adb shell "mkdir -p '$DEVICE_AUTH_DIR' /data/media/0/mac_accelerator_shadow"
+adb shell "mkdir -p '$DEVICE_AUTH_DIR' /data/media/0/mac_accelerator_shadow && chmod 755 '$DEVICE_AUTH_DIR'"
 adb push "$AUTH_KEY_FILE" /data/local/tmp/mac-accelerator-auth.key >/dev/null
 adb shell "install -o comma -g comma -m 600 /data/local/tmp/mac-accelerator-auth.key '$DEVICE_AUTH_PATH' && \
   rm /data/local/tmp/mac-accelerator-auth.key && \
