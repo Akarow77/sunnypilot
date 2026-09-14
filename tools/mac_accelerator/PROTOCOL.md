@@ -12,8 +12,8 @@ driving policy.
 
 Keeping the warp on the 3X reduces the 20 Hz payload from about 149.4 MB/s of
 padded NV12 data to 393,216 bytes per inference before compression, or about
-7.9 MB/s at 20 Hz. The official Big Model response is 18,452 float32 values
-(about 73.8 KB).
+7.9 MB/s at 20 Hz. The Core ML Big Model response preserves its native 18,452
+float16 values (about 36.9 KB); the 3X converts these to float32 before parsing.
 
 ## Framing and discovery
 
@@ -24,7 +24,7 @@ capture monotonic timestamp, payload length, and CRC32. Payloads are capped at
 
 The client begins each connection with a nonce-bearing JSON `HELLO`. The server
 returns an identity containing its device type, backend, model checkpoint,
-source-model SHA-256, input/output shapes, output length, request length, and
+source-model SHA-256, input/output shapes, output length and dtype, request length, and
 supported compression modes. The client rejects any identity that differs from
 its configured expectations.
 
@@ -42,7 +42,7 @@ the declared uncompressed size remains fixed. `FLAG_RESET` resets recurrent
 state and must be acknowledged by the response.
 
 The response contains server receive, inference-start, and inference-end
-monotonic timestamps followed by the model's little-endian float32 output. The
+monotonic timestamps followed by the model's declared little-endian output. The
 header echoes the request session, frame, capture timestamp, and accepted flags.
 Monotonic clocks on different machines are not compared; the client measures the
 complete request round trip with its own clock.

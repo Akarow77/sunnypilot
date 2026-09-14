@@ -11,6 +11,7 @@
 @property(nonatomic, strong) NSButton *stopButton;
 @property(nonatomic, strong) NSTask *serverTask;
 @property(nonatomic, strong) NSPipe *outputPipe;
+@property(nonatomic) BOOL userRequestedStop;
 @end
 
 @implementation AppDelegate
@@ -202,10 +203,12 @@
   };
   task.terminationHandler = ^(NSTask *finished) {
     dispatch_async(dispatch_get_main_queue(), ^{
+      BOOL cleanStop = weakSelf.userRequestedStop;
+      weakSelf.userRequestedStop = NO;
       weakSelf.outputPipe.fileHandleForReading.readabilityHandler = nil;
       weakSelf.serverTask = nil;
       weakSelf.outputPipe = nil;
-      [weakSelf setStatus:(finished.terminationStatus == 0 ? @"Stopped" : @"Stopped with error") running:NO];
+      [weakSelf setStatus:(finished.terminationStatus == 0 || cleanStop ? @"Stopped" : @"Stopped with error") running:NO];
       [weakSelf appendLog:[NSString stringWithFormat:@"Server exited with status %d", finished.terminationStatus]];
     });
   };
@@ -216,12 +219,14 @@
   }
   self.serverTask = task;
   self.outputPipe = pipe;
+  self.userRequestedStop = NO;
   [self setStatus:@"Starting" running:YES];
   [self appendLog:@"Starting Core ML/ANE worker in dedicated awake mode"];
 }
 
 - (void)stopServer:(id)sender {
   if (self.serverTask.running) {
+    self.userRequestedStop = YES;
     [self setStatus:@"Stopping" running:YES];
     [self.serverTask terminate];
   }

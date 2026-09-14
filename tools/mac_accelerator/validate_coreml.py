@@ -66,7 +66,8 @@ def main() -> None:
   torch_model = torch.jit.load(args.torch_reference).eval().half()
   rng = np.random.default_rng(20260914)
   coreml_session = CoreMLPolicySession(coreml_model, metadata, coreml_output_name, frame_skip=2)
-  torch_session = CoreMLPolicySession(TorchAdapter(torch_model), metadata, 'output', frame_skip=2)
+  torch_session = CoreMLPolicySession(TorchAdapter(torch_model), metadata, 'output', frame_skip=2,
+                                      output_dtype='<f4')
   warps = np.load(args.warps) if args.warps is not None else None
   if warps is not None and (warps.shape[1:] != WARPED_SHAPE or len(warps) < args.samples):
     raise RuntimeError(f'invalid warp array: {warps.shape}')
@@ -76,7 +77,7 @@ def main() -> None:
   for frame in range(args.samples):
     warped = warps[frame] if warps is not None else rng.integers(0, 256, WARPED_SHAPE, dtype=np.uint8)
     payload = warped.tobytes() + policy
-    coreml_output = np.frombuffer(coreml_session.infer(payload), dtype='<f4').reshape(expected_shape)
+    coreml_output = np.frombuffer(coreml_session.infer(payload), dtype='<f2').astype(np.float32).reshape(expected_shape)
     torch_output = np.frombuffer(torch_session.infer(payload), dtype='<f4').reshape(expected_shape)
     if coreml_output.shape != expected_shape or torch_output.shape != expected_shape:
       raise RuntimeError(f'output shape mismatch: Core ML {coreml_output.shape}, Torch {torch_output.shape}')

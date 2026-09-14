@@ -11,6 +11,11 @@ import secrets
 import socket
 import time
 
+try:
+  import numpy as np
+except ImportError:
+  np = None
+
 from accelerator_protocol import authenticate_payload, canonical_json, make_auth, verify_payload
 from compression import ZstdCodec
 from fallback import AcceleratorState, FallbackLatch
@@ -29,14 +34,19 @@ class AcceleratorIdentity:
   output_floats: int
   request_bytes: int
   compressions: tuple[str, ...] = ()
+  output_dtype: str = 'float32'
 
 
 @dataclass(frozen=True)
 class InferenceResult:
   frame_id: int
-  output: bytes
+  output: bytes | memoryview
   round_trip_ms: float
   inference_ms: float
+  prepare_ms: float
+  send_ms: float
+  receive_ms: float
+  validate_ms: float
 
 
 class AcceleratorClient:
@@ -69,6 +79,8 @@ class AcceleratorClient:
     self.identity: AcceleratorIdentity | None = None
     self.fallback = FallbackLatch(deadline_ms)
     self.next_frame = 0
+    self._output_buffer = None
+    self._finite_buffer = None
 
   def connect(self, timeout: float = 5.0) -> AcceleratorIdentity:
     self.close()
@@ -112,6 +124,7 @@ class AcceleratorClient:
         output_floats=int(response['output_floats']),
         request_bytes=int(response['request_bytes']),
         compressions=tuple(response.get('compressions', ())),
+        output_dtype=str(response.get('output_dtype', 'float32')),
       )
       self._validate_identity(identity)
       conn.settimeout(self.deadline_ms / 1000.0)
@@ -119,10 +132,20 @@ class AcceleratorClient:
       self.identity = identity
       self.next_frame = 0
       self.qualification_count = 0
+      self._prepare_output_buffers(identity)
       return identity
     except Exception:
       conn.close()
       raise
+
+  def _prepare_output_buffers(self, identity: AcceleratorIdentity) -> None:
+    if identity.output_dtype == 'float16':
+      assert np is not None
+      self._output_buffer = np.empty(identity.output_floats, dtype='<f4')
+      self._finite_buffer = np.empty(identity.output_floats, dtype=np.bool_)
+    else:
+      self._output_buffer = None
+      self._finite_buffer = None
 
   def _validate_identity(self, identity: AcceleratorIdentity) -> None:
     if identity.device_type != DEVICE_TYPE:
@@ -141,6 +164,10 @@ class AcceleratorClient:
       raise ProtocolError('model output length mismatch')
     if self.compression is not None and self.compression not in identity.compressions:
       raise ProtocolError(f'accelerator does not support {self.compression}')
+    if identity.output_dtype not in ('float16', 'float32'):
+      raise ProtocolError(f'unsupported output dtype: {identity.output_dtype}')
+    if identity.output_dtype == 'float16' and np is None:
+      raise ProtocolError('float16 output requires NumPy on the client')
 
   def infer(self, warped: bytes, policy: bytes, *, frame_id: int, capture_ns: int,
             reset: bool = False) -> InferenceResult:
@@ -148,12 +175,16 @@ class AcceleratorClient:
       raise RuntimeError('accelerator is not connected')
     if self.fallback.state is AcceleratorState.FAILED:
       raise RuntimeError(f'accelerator failure is latched: {self.fallback.failure_reason}')
+    if self.identity.output_dtype == 'float16' and self._output_buffer is None:
+      self._prepare_output_buffers(self.identity)
     if frame_id != self.next_frame:
       self._fail(frame_id, f'non-sequential client frame: {frame_id} != {self.next_frame}')
     if len(warped) != WARPED_BYTES or len(policy) != POLICY_INPUTS.size:
       self._fail(frame_id, 'invalid local request shape')
 
     started_ns = time.monotonic_ns()
+    stage = 'prepare'
+    prepared_ns = sent_ns = received_ns = completed_ns = None
     flags = FLAG_RESET if reset else 0
     request_payload = warped + policy
     if self.codec is not None:
@@ -171,27 +202,54 @@ class AcceleratorClient:
       self.socket.settimeout(remaining)
 
     try:
-      set_remaining_timeout()
       request = authenticate_payload(self.auth_key, REQUEST, flags, self.session_id, frame_id,
                                      capture_ns, request_payload)
+      prepared_ns = time.monotonic_ns()
+      stage = 'send'
+      set_remaining_timeout()
       send_message(self.socket, REQUEST, flags, self.session_id, frame_id, capture_ns, request)
+      sent_ns = time.monotonic_ns()
+      stage = 'receive'
       set_remaining_timeout()
       response_flags, session_id, response_frame, response_capture, response = recv_message(self.socket, RESPONSE)
-      completed_ns = time.monotonic_ns()
+      received_ns = time.monotonic_ns()
+      stage = 'validate'
       if (session_id, response_frame, response_capture) != (self.session_id, frame_id, capture_ns):
         raise ProtocolError('response identity mismatch')
       if response_flags != flags:
         raise ProtocolError('reset acknowledgement mismatch')
       response = verify_payload(self.auth_key, RESPONSE, response_flags, session_id,
                                 response_frame, response_capture, response)
-      expected_bytes = TIMINGS.size + self.identity.output_floats * 4
+      output_itemsize = 2 if self.identity.output_dtype == 'float16' else 4
+      expected_bytes = TIMINGS.size + self.identity.output_floats * output_itemsize
       if len(response) != expected_bytes:
         raise ProtocolError(f'invalid response length: {len(response)} != {expected_bytes}')
       _, inference_start_ns, inference_end_ns = TIMINGS.unpack_from(response)
-      output = response[TIMINGS.size:]
-      if not all(math.isfinite(value) for value in memoryview(output).cast('f')):
-        raise ProtocolError('non-finite model output')
+      wire_output = response[TIMINGS.size:]
+      if np is not None:
+        wire_dtype = '<f2' if self.identity.output_dtype == 'float16' else '<f4'
+        values = np.frombuffer(wire_output, dtype=wire_dtype)
+        finite = self._finite_buffer
+        if finite is None:
+          finite = np.isfinite(values)
+        else:
+          np.isfinite(values, out=finite)
+        if not np.all(finite):
+          raise ProtocolError('non-finite model output')
+        if self.identity.output_dtype == 'float16':
+          assert self._output_buffer is not None
+          np.copyto(self._output_buffer, values, casting='unsafe')
+          output = memoryview(self._output_buffer).cast('B')
+        else:
+          output = wire_output
+      else:
+        output = wire_output
+        if not all(math.isfinite(value) for value in memoryview(output).cast('f')):
+          raise ProtocolError('non-finite model output')
+      completed_ns = time.monotonic_ns()
       round_trip_ms = (completed_ns - started_ns) / 1e6
+      if completed_ns > deadline_ns:
+        raise TimeoutError(f'accelerator deadline expired after validation ({round_trip_ms:.2f} ms)')
       inference_ms = (inference_end_ns - inference_start_ns) / 1e6
       if self.fallback.state is AcceleratorState.LOADING:
         self.qualification_count = self.qualification_count + 1 if round_trip_ms <= self.deadline_ms else 0
@@ -202,9 +260,27 @@ class AcceleratorClient:
       if self.fallback.state is AcceleratorState.FAILED:
         raise TimeoutError(self.fallback.failure_reason)
       self.next_frame += 1
-      return InferenceResult(frame_id, output, round_trip_ms, inference_ms)
+      return InferenceResult(
+        frame_id, output, round_trip_ms, inference_ms,
+        (prepared_ns - started_ns) / 1e6,
+        (sent_ns - prepared_ns) / 1e6,
+        (received_ns - sent_ns) / 1e6,
+        (completed_ns - received_ns) / 1e6,
+      )
     except Exception as error:
-      self._fail(frame_id, f'{type(error).__name__}: {error}')
+      now_ns = time.monotonic_ns()
+      elapsed_ms = (now_ns - started_ns) / 1e6
+      stage_times = []
+      if prepared_ns is not None:
+        stage_times.append(f'prepare={((prepared_ns - started_ns) / 1e6):.2f}')
+      if sent_ns is not None and prepared_ns is not None:
+        stage_times.append(f'send={((sent_ns - prepared_ns) / 1e6):.2f}')
+      if received_ns is not None and sent_ns is not None:
+        stage_times.append(f'receive={((received_ns - sent_ns) / 1e6):.2f}')
+      if completed_ns is not None and received_ns is not None:
+        stage_times.append(f'validate={((completed_ns - received_ns) / 1e6):.2f}')
+      detail = f' stages[{",".join(stage_times)}]' if stage_times else ''
+      self._fail(frame_id, f'{stage} after {elapsed_ms:.2f} ms:{detail} {type(error).__name__}: {error}')
 
   def _fail(self, frame_id: int, reason: str):
     self.fallback.fail(frame_id, reason)
@@ -223,6 +299,8 @@ class AcceleratorClient:
     self.identity = None
     self.next_frame = 0
     self.qualification_count = 0
+    self._output_buffer = None
+    self._finite_buffer = None
 
   def __enter__(self):
     self.connect()

@@ -17,6 +17,7 @@ import numpy as np
 
 from accelerator_protocol import authenticate_payload, read_auth_key, server_handshake, verify_payload
 from compression import ZstdCodec, ZstdError
+from macos_performance import configure_user_interactive_qos
 from transport import (DEVICE_TYPE, FLAG_RESET, FLAG_ZSTD_REQUEST, POLICY_INPUTS, REQUEST, REQUEST_BYTES,
                        RESPONSE, TIMINGS, VERSION, WARPED_BYTES, WARPED_SHAPE,
                        ProtocolError, recv_message, send_message)
@@ -34,11 +35,15 @@ def sha256_file(path: Path) -> str:
 
 
 class CoreMLPolicySession:
-  def __init__(self, model: ct.models.MLModel, metadata: dict, output_name: str, frame_skip: int):
+  def __init__(self, model: ct.models.MLModel, metadata: dict, output_name: str, frame_skip: int,
+               output_dtype: str = '<f2'):
+    if output_dtype not in ('<f2', '<f4'):
+      raise ValueError(f'unsupported session output dtype: {output_dtype}')
     self.model = model
     self.metadata = metadata
     self.output_name = output_name
     self.frame_skip = frame_skip
+    self.output_dtype = output_dtype
     shapes = metadata['input_shapes']
     image_frames = shapes['img'][1] // WARPED_SHAPE[1]
     feature_shape = shapes['features_buffer']
@@ -70,7 +75,7 @@ class CoreMLPolicySession:
     self.inputs['traffic_convention'][0] = (traffic0, traffic1)
     self.inputs['action_t'][0] = (action0, action1)
     np.copyto(self.inputs['features_buffer'][0], self.feature_q[::self.frame_skip])
-    output = np.asarray(self.model.predict(self.inputs)[self.output_name], dtype=np.float32)
+    output = np.asarray(self.model.predict(self.inputs)[self.output_name])
     if output.shape != self.output_shape:
       raise ProtocolError(f'model output shape {output.shape} != {self.output_shape}')
     if not np.all(np.isfinite(output)):
@@ -78,7 +83,7 @@ class CoreMLPolicySession:
     hidden = output[0, self.hidden_slice].reshape(self.feature_q[-1].shape)
     self.feature_q[:-1] = self.feature_q[1:]
     self.feature_q[-1] = hidden
-    return output.astype('<f4', copy=False).tobytes()
+    return output.astype(self.output_dtype, copy=False).tobytes()
 
 
 def make_identity(metadata: dict, model_sha256: str) -> dict:
@@ -91,6 +96,7 @@ def make_identity(metadata: dict, model_sha256: str) -> dict:
     'model_checkpoint': str(metadata.get('model_checkpoint', '')),
     'model_sha256': model_sha256,
     'output_floats': math.prod(metadata['output_shapes']['outputs']),
+    'output_dtype': 'float16',
     'output_shapes': {name: list(shape) for name, shape in metadata['output_shapes'].items()},
     'protocol': VERSION,
     'request_bytes': REQUEST_BYTES,
@@ -99,7 +105,7 @@ def make_identity(metadata: dict, model_sha256: str) -> dict:
 
 def serve_client(conn: socket.socket, peer, model: ct.models.MLModel, metadata: dict,
                  output_name: str, frame_skip: int, identity: dict,
-                 auth_key: bytes | None, timeout: float) -> None:
+                 auth_key: bytes | None, timeout: float, slow_log_ms: float) -> None:
   conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2 * 1024 * 1024)
   conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
   conn.settimeout(timeout)
@@ -129,11 +135,17 @@ def serve_client(conn: socket.socket, peer, model: ct.models.MLModel, metadata: 
     inference_start_ns = time.monotonic_ns()
     output = session.infer(payload)
     inference_end_ns = time.monotonic_ns()
+    inference_ms = (inference_end_ns - inference_start_ns) / 1e6
+    if inference_ms >= slow_log_ms:
+      print(f'slow inference frame={frame_id} inference_ms={inference_ms:.2f}', flush=True)
     response_flags = flags & (FLAG_RESET | FLAG_ZSTD_REQUEST)
     response = TIMINGS.pack(received_ns, inference_start_ns, inference_end_ns) + output
     response = authenticate_payload(auth_key, RESPONSE, response_flags, session_id,
                                     frame_id, capture_ns, response)
     send_message(conn, RESPONSE, response_flags, session_id, frame_id, capture_ns, response)
+    service_ms = (time.monotonic_ns() - received_ns) / 1e6
+    if service_ms >= slow_log_ms:
+      print(f'slow service frame={frame_id} service_ms={service_ms:.2f}', flush=True)
     last_frame = frame_id
 
 
@@ -148,9 +160,10 @@ def main() -> None:
   parser.add_argument('--auth-key-file', type=Path)
   parser.add_argument('--startup-warmup', type=int, default=3)
   parser.add_argument('--frame-skip', type=int, default=2)
+  parser.add_argument('--slow-log-ms', type=float, default=40.0)
   args = parser.parse_args()
-  if args.startup_warmup < 1 or args.frame_skip < 1:
-    parser.error('startup warmup and frame skip must be positive')
+  if args.startup_warmup < 1 or args.frame_skip < 1 or args.slow_log_ms <= 0:
+    parser.error('startup warmup, frame skip, and slow log threshold must be positive')
   for path in (args.model, args.metadata, args.onnx):
     if not path.exists():
       parser.error(f'input not found: {path}')
@@ -160,6 +173,7 @@ def main() -> None:
   model_sha256 = sha256_file(args.onnx)
   identity = make_identity(metadata, model_sha256)
   auth_key = read_auth_key(args.auth_key_file)
+  qos_enabled = configure_user_interactive_qos()
   model = ct.models.MLModel(str(args.model), compute_units=ct.ComputeUnit.CPU_AND_NE)
   output_name = model.get_spec().description.output[0].name
   warmup = CoreMLPolicySession(model, metadata, output_name, args.frame_skip)
@@ -170,7 +184,7 @@ def main() -> None:
   gc.disable()
   ready_message = f"ready: {DEVICE_TYPE} backend={BACKEND} checkpoint={identity['model_checkpoint']}"
   ready_message += f" outputs={identity['output_floats']} authenticated={auth_key is not None}"
-  print(ready_message, flush=True)
+  print(f'{ready_message} qos={"user-interactive" if qos_enabled else "default"}', flush=True)
 
   with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as listener:
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -184,7 +198,7 @@ def main() -> None:
       with conn:
         try:
           serve_client(conn, peer, model, metadata, output_name, args.frame_skip,
-                       identity, auth_key, args.timeout)
+                       identity, auth_key, args.timeout, args.slow_log_ms)
         except (EOFError, OSError, ProtocolError) as error:
           print(f'client disconnected: {error}', flush=True)
 

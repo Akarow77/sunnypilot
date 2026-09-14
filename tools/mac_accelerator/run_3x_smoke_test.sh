@@ -19,6 +19,11 @@ DEVICE_DIR="/tmp/mac_accelerator"
 AUTH_ARGS=()
 IDENTITY_ARGS=(--expected-backend "$EXPECTED_BACKEND")
 
+if [[ "$(adb shell 'cat /data/params/d/IsOffroad 2>/dev/null' | tr -d '\r')" != "1" ]]; then
+  echo "Refusing to run: comma 3X is not off-road." >&2
+  exit 1
+fi
+
 LINK_INFO="$("$SCRIPT_DIR/setup_usb_ncm.sh")"
 printf '%s\n' "$LINK_INFO"
 MAC_ENDPOINT="$(printf '%s\n' "$LINK_INFO" | awk '/^Mac:/{print $2; exit}')"
@@ -42,11 +47,14 @@ fi
 if [[ -n "$COMPRESSION" ]]; then
   IDENTITY_ARGS+=(--compression "$COMPRESSION")
 fi
-adb shell "cd '$DEVICE_DIR' && PYTHONPATH=/data/openpilot python3 -u synthetic_client.py '$DEVICE_ENDPOINT' \
+adb shell "cd '$DEVICE_DIR' && exec sudo -u comma -- env \
+  PATH=/usr/comma/shims:/usr/local/venv/bin:/usr/local/bin:/usr/bin:/bin \
+  PYTHONPATH=/data/openpilot python3 -u synthetic_client.py '$DEVICE_ENDPOINT' \
   --port '$PORT' --frames '$FRAMES' --warmup-frames '$WARMUP_FRAMES' \
   --qualification-frames '$QUALIFICATION_FRAMES' \
   --frequency '$FREQUENCY' --deadline-ms '$DEADLINE_MS' \
   --qualification-timeout-ms '$QUALIFICATION_TIMEOUT_MS' \
   --synthetic-random-prefix-bytes '$SYNTHETIC_RANDOM_PREFIX_BYTES' \
   --publish-ui-state \
+  --realtime \
   --expected-output-floats '$EXPECTED_OUTPUT_FLOATS' ${IDENTITY_ARGS[*]} ${AUTH_ARGS[*]}"

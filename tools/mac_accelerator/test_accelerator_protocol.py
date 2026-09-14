@@ -2,6 +2,7 @@
 
 import json
 import socket
+import struct
 import threading
 import time
 import unittest
@@ -136,6 +137,32 @@ class AcceleratorProtocolTest(unittest.TestCase):
     worker.join(1)
     self.assertEqual(result.frame_id, 0)
     self.assertEqual(result.inference_ms, 1.0)
+    self.assertEqual(client.fallback.state, AcceleratorState.ACTIVE)
+
+  def test_float16_wire_output_is_restored_to_float32(self) -> None:
+    client_socket, server_socket = socket.socketpair()
+    self.addCleanup(client_socket.close)
+    self.addCleanup(server_socket.close)
+    client = AcceleratorClient('::1', deadline_ms=50)
+    client.socket = client_socket
+    client_socket.settimeout(.05)
+    client.identity = AcceleratorIdentity(DEVICE_TYPE, 'METAL', 'checkpoint', 'a' * 64,
+                                          {}, {'outputs': [1, 2]}, 2,
+                                          WARPED_BYTES + POLICY_INPUTS.size,
+                                          output_dtype='float16')
+
+    def run_server():
+      flags, session_id, frame_id, capture_ns, _ = recv_message(server_socket, REQUEST)
+      now = time.monotonic_ns()
+      payload = TIMINGS.pack(now, now, now) + struct.pack('<ee', 1.5, -2.0)
+      send_message(server_socket, RESPONSE, flags, session_id, frame_id, capture_ns, payload)
+
+    worker = threading.Thread(target=run_server)
+    worker.start()
+    result = client.infer(bytes(WARPED_BYTES), bytes(POLICY_INPUTS.size), frame_id=0,
+                          capture_ns=time.monotonic_ns(), reset=True)
+    worker.join(1)
+    self.assertEqual(struct.unpack('<ff', result.output), (1.5, -2.0))
     self.assertEqual(client.fallback.state, AcceleratorState.ACTIVE)
 
   def test_timeout_latches_failure(self) -> None:

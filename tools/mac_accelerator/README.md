@@ -200,7 +200,7 @@ Chestnut loading, state reporting, and latched small-model fallback onto a Mac w
 
 ## Tested baseline
 
-The repository was updated to official sunnypilot commit `c57f9a7`. The original
+The repository was updated to official sunnypilot commit `63a2a38`. The original
 full-model baseline below was recorded at commit `3c24eeea2518` on a MacBook Air M2
 (16 GB). Network and 3X preprocessing latency are not included in those rows.
 
@@ -242,6 +242,18 @@ The Core ML/ANE conversion materially improves inference speed on the same Mac:
 | Mac only, CPU + Neural Engine / 5 min at 20 Hz | 25.69 ms | 27.18 ms | 39.53 ms | 0 / 6,000 |
 | 3X USB, Zstd synthetic / 400 frames | 37.40 ms | 42.48 ms | 45.04 ms | 0 / 400 |
 | Warm Mac + 3X USB diagnostic | 46.88 ms | 53.51 ms | 53.77 ms | observed |
+| FP16 response + full validation / 200 frames | 40.77 ms | 44.29 ms | 44.48 ms | 0 / 200 |
+
+FP16 preserves the Core ML model's native output precision while reducing the Big
+Model response from about 73.8 KB to 36.9 KB. Reusing the comma-side finite-check and
+FP32 conversion buffers also removes per-frame validation allocations. These changes
+reduced mean output validation from 3.31 ms to about 0.35 ms.
+
+They do not make the link deterministic. One extended attempt latched failure after
+541 measured frames at 50.30 ms. A second attempt failed after 110 measured frames at
+50.12 ms; the Mac log identified a 52.97 ms Core ML inference and 53.94 ms total
+service time on that frame. The single-frame fail-closed behavior worked in both
+cases.
 
 An exact five-frame recorded-route temporal comparison against the original PyTorch
 model measured 0.584% maximum overall normalized RMSE. Individual output heads ranged

@@ -46,12 +46,17 @@ def main() -> None:
                       help='non-sensitive incompressible prefix for realistic transport tests')
   parser.add_argument('--publish-ui-state', action='store_true',
                       help='publish Chestnut-style Mac worker state on a comma checkout')
+  parser.add_argument('--realtime', action='store_true',
+                      help='use the same realtime CPU/priority class as modeld on a comma')
   args = parser.parse_args()
   if (args.frames < 1 or args.warmup_frames < args.qualification_frames or args.qualification_frames < 1 or args.frequency <= 0 or
       args.deadline_ms <= 0 or args.qualification_timeout_ms < args.deadline_ms or args.expected_output_floats < 1):
     parser.error('frames, frequency, and deadline must be positive; warmup frames cannot be negative')
   if not 0 <= args.synthetic_random_prefix_bytes <= WARPED_BYTES:
     parser.error('synthetic random prefix must fit inside the warped payload')
+  if args.realtime:
+    from openpilot.common.realtime import config_realtime_process
+    config_realtime_process(7, 54)
 
   policy = POLICY_INPUTS.pack(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.1, 0.1)
   random_prefix = random.Random(1).randbytes(args.synthetic_random_prefix_bytes)
@@ -59,6 +64,10 @@ def main() -> None:
   period = 1.0 / args.frequency
   latencies: list[float] = []
   inference_times: list[float] = []
+  prepare_times: list[float] = []
+  send_times: list[float] = []
+  receive_times: list[float] = []
+  validate_times: list[float] = []
   attempted = 0
 
   client = AcceleratorClient(
@@ -96,6 +105,10 @@ def main() -> None:
           raise RuntimeError('accelerator did not pass warm-up qualification')
         latencies.append(result.round_trip_ms)
         inference_times.append(result.inference_ms)
+        prepare_times.append(result.prepare_ms)
+        send_times.append(result.send_ms)
+        receive_times.append(result.receive_ms)
+        validate_times.append(result.validate_ms)
       next_frame += period
   except Exception as error:
     failed = True
@@ -114,6 +127,10 @@ def main() -> None:
     inference_summary += f'p99={percentile(inference_times, 99):.2f} max={max(inference_times):.2f}'
     print(round_trip_summary)
     print(inference_summary)
+    stage_summary = f'client_stage_ms prepare={statistics.fmean(prepare_times):.2f} '
+    stage_summary += f'send={statistics.fmean(send_times):.2f} receive={statistics.fmean(receive_times):.2f} '
+    stage_summary += f'validate={statistics.fmean(validate_times):.2f}'
+    print(stage_summary)
   print(f'deadline_misses={attempted - len(latencies)}/{attempted} deadline_ms={args.deadline_ms:.1f}')
   fallback_message = f'chestnut_style_fallback={client.fallback.state.value} frame={client.fallback.failure_frame}'
   fallback_message += f' reason={client.fallback.failure_reason}'
