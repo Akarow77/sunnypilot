@@ -60,6 +60,13 @@ class CoreMLPolicySessionTest(unittest.TestCase):
     self.assertTrue(np.all(second['features_buffer'] == 0))
     self.assertTrue(np.all(third['features_buffer'][:, -1] == 1.0))
 
+    session.reset()
+    session.infer(payload)
+    reset_call = model.calls[-1]
+    self.assertTrue(np.all(reset_call['img'][:, :6] == 0))
+    self.assertTrue(np.all(reset_call['features_buffer'] == 0))
+    self.assertEqual(reset_call['desire_pulse'][0, -1, 0], 1.0)
+
 
 if __name__ == '__main__':
   unittest.main()

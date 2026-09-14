@@ -56,6 +56,14 @@ class CoreMLPolicySession:
     self.output_shape = tuple(metadata['output_shapes']['outputs'])
     self.inputs = {name: np.zeros(shape, dtype=np.float32) for name, shape in shapes.items()}
 
+  def reset(self) -> None:
+    self.image_q.fill(0)
+    self.big_image_q.fill(0)
+    self.feature_q.fill(0)
+    self.desire_q.fill(0)
+    for value in self.inputs.values():
+      value.fill(0)
+
   def infer(self, payload: bytes) -> bytes:
     if len(payload) != REQUEST_BYTES:
       raise ProtocolError(f'request length {len(payload)} != {REQUEST_BYTES}')
@@ -128,7 +136,7 @@ def serve_client(conn: socket.socket, peer, model: ct.models.MLModel, metadata: 
       except ZstdError as error:
         raise ProtocolError(f'Zstd request failed: {error}') from error
     if flags & FLAG_RESET and last_frame >= 0:
-      session = CoreMLPolicySession(model, metadata, output_name, frame_skip)
+      session.reset()
       last_frame = -1
     if frame_id <= last_frame:
       raise ProtocolError(f'non-monotonic frame: {frame_id} <= {last_frame}')

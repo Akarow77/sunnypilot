@@ -243,6 +243,7 @@ The Core ML/ANE conversion materially improves inference speed on the same Mac:
 | 3X USB, Zstd synthetic / 400 frames | 37.40 ms | 42.48 ms | 45.04 ms | 0 / 400 |
 | Warm Mac + 3X USB diagnostic | 46.88 ms | 53.51 ms | 53.77 ms | observed |
 | FP16 response + full validation / 200 frames | 40.77 ms | 44.29 ms | 44.48 ms | 0 / 200 |
+| Recorded route, Metal warp + ANE / 3,150 frames | 21.75 ms | 23.56 ms | 55.72 ms | 1 / 3,150 |
 
 FP16 preserves the Core ML model's native output precision while reducing the Big
 Model response from about 73.8 KB to 36.9 KB. Reusing the comma-side finite-check and
@@ -254,6 +255,20 @@ They do not make the link deterministic. One extended attempt latched failure af
 50.12 ms; the Mac log identified a 52.97 ms Core ML inference and 53.94 ms total
 service time on that frame. The single-frame fail-closed behavior worked in both
 cases.
+
+The recorded-route row replays both saved 1928x1208 camera streams, applies the
+logged calibration and action-delay inputs, and preserves recurrent state across
+segments of the same route. A repeat over the 1,950-frame moving route measured
+21.76 ms mean, 24.08 ms p99, and two frames above 55 ms. This demonstrates that
+Mac-local camera warp plus ANE inference is normally well inside one model period,
+but rare scheduling/ANE outliers remain even without USB transport.
+
+At speeds of at least 5 m/s, 590 camera-frame-aligned outputs were compared with the
+recorded local Small Model. Big-versus-Small desired-curvature correlation was 0.927,
+with 0.00350 mean absolute error, 0.01546 p95 absolute error, and 0.05386 maximum
+absolute error. These are different models rather than equivalent backends, so the
+comparison describes behavioral divergence and does not qualify the Big Model for
+vehicle control.
 
 An exact five-frame recorded-route temporal comparison against the original PyTorch
 model measured 0.584% maximum overall normalized RMSE. Individual output heads ranged
