@@ -5,10 +5,11 @@ sunnypilot inference worker. It targets the comma 3X and the standard 20 Hz driv
 model. It includes Metal and Core ML/ANE workers, authenticated and checksummed
 USB-NCM transport, lossless Zstd requests, and a dependency-free 3X client.
 
-Do not use this experiment to control a vehicle. The live camera/modeld integration
-is not implemented and the sustained 50 ms end-to-end requirement has not passed.
-The current client recognizes the Mac as a user-space accelerator, sends synthetic
-warped tensors, and exercises a fail-closed shadow path only. A Mac cannot enumerate
+Do not use this experiment to control a vehicle. Live camera/modeld integration is
+implemented only as a non-controlling shadow, and the sustained deadline requirement
+has not passed. The client recognizes the Mac as a user-space accelerator, sends the
+same warped tensors used by the local model, and exercises a fail-closed shadow path.
+A Mac cannot enumerate
 as a native PCIe/USB GPU on the 3X; the authenticated service identity is the honest
 equivalent.
 
@@ -101,6 +102,36 @@ The setup is intentionally transient. The 3X `usb0` interface is raised through
 ADB and returns to its normal state after a reboot. The client files are copied
 only to `/tmp/mac_accelerator` on the 3X.
 
+## Run the live, non-controlling shadow
+
+This requires a sunnypilot Tinygrad model bundle with a separated warp and policy.
+The currently tested TSFM 20 Hz bundle has that layout. With the 3X off-road and the
+Mac app running, configure the authenticated USB endpoint and persistent 3X key:
+
+```bash
+tools/mac_accelerator/enable_live_shadow.sh
+```
+
+On the next on-road transition, `modeld_tinygrad` copies its already-computed warp
+into a size-one latest-frame queue. A daemon thread sends it to the Mac while the
+local TSFM model remains the sole publisher of `modelV2` and the sole control source.
+The shadow thread never publishes remote output. A malformed response, disconnect,
+or warp-to-output deadline miss latches the Mac icon orange without interrupting the
+local model.
+
+Per-frame timing and local-versus-Big curvature are written on the 3X under
+`/data/media/0/mac_accelerator_shadow/live-*.jsonl`. After a run, copy a log and run:
+
+```bash
+.venv/bin/python tools/mac_accelerator/summarize_live_shadow.py /path/to/live-log.jsonl
+```
+
+Disable the next run only while off-road:
+
+```bash
+tools/mac_accelerator/disable_live_shadow.sh
+```
+
 ## macOS app and dedicated qualification
 
 Build the native arm64 launcher app with the installed Command Line Tools:
@@ -184,9 +215,9 @@ Zstd, an absolute client deadline, and one request in flight. Loading allows a
 separate cold-start timeout but requires consecutive in-deadline frames before the
 accelerator becomes ready. Any active failure is latched until reset.
 
-The next stage must connect live 3X warps in shadow mode and measure the entire
-camera-warp-to-output deadline. The local model must remain the control source
-whenever the worker is late, warming up, disconnected, or invalid.
+The live stage reuses the separated Tinygrad warp without running a second QCOM warp
+and measures the complete warp-copy-to-output path. The local model remains the only
+control source while the worker is late, warming up, disconnected, or invalid.
 
 When the comma-side test is running, `MacAccelerator*` parameters map its state to
 the existing Chestnut icons: loading pulses, ready/active is green, and a latched

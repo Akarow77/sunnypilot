@@ -71,6 +71,7 @@ shadow-only.
 1. Loopback server/client on the Mac with synthetic warped inputs. Completed.
 2. Recorded-route Core ML versus PyTorch validation. Completed for a short sample.
 3. Wired comma 3X discovery and synthetic USB-NCM inference. Completed off-road.
-4. Live camera-warp shadow integration and fault injection. Not implemented.
+4. Live camera-warp shadow integration. Implemented for sunnypilot's separated
+   Tinygrad warp/policy bundles; fault-injection qualification remains pending.
 5. Sustained thermal and full-route qualification. Not passed.
 6. Any control-path proposal requires a separate safety design and review.

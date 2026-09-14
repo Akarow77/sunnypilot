@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hmac
 import json
 import math
@@ -35,6 +35,7 @@ class AcceleratorIdentity:
   request_bytes: int
   compressions: tuple[str, ...] = ()
   output_dtype: str = 'float32'
+  output_slices: dict[str, tuple[int, int]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,8 @@ class AcceleratorClient:
         request_bytes=int(response['request_bytes']),
         compressions=tuple(response.get('compressions', ())),
         output_dtype=str(response.get('output_dtype', 'float32')),
+        output_slices={name: (int(bounds[0]), int(bounds[1]))
+                       for name, bounds in response.get('output_slices', {}).items()},
       )
       self._validate_identity(identity)
       conn.settimeout(self.deadline_ms / 1000.0)
@@ -168,6 +171,9 @@ class AcceleratorClient:
       raise ProtocolError(f'unsupported output dtype: {identity.output_dtype}')
     if identity.output_dtype == 'float16' and np is None:
       raise ProtocolError('float16 output requires NumPy on the client')
+    for name, bounds in identity.output_slices.items():
+      if len(bounds) != 2 or not 0 <= bounds[0] <= bounds[1] <= identity.output_floats:
+        raise ProtocolError(f'invalid output slice {name}: {bounds}')
 
   def infer(self, warped: bytes, policy: bytes, *, frame_id: int, capture_ns: int,
             reset: bool = False) -> InferenceResult:

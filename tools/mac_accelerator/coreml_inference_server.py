@@ -106,6 +106,8 @@ def make_identity(metadata: dict, model_sha256: str) -> dict:
     'output_floats': math.prod(metadata['output_shapes']['outputs']),
     'output_dtype': 'float16',
     'output_shapes': {name: list(shape) for name, shape in metadata['output_shapes'].items()},
+    'output_slices': {name: [output_slice.start or 0, output_slice.stop]
+                      for name, output_slice in metadata['output_slices'].items()},
     'protocol': VERSION,
     'request_bytes': REQUEST_BYTES,
   }
