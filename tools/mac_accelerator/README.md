@@ -117,7 +117,8 @@ into a size-one latest-frame queue. A daemon thread sends it to the Mac while th
 local TSFM model remains the sole publisher of `modelV2` and the sole control source.
 The shadow thread never publishes remote output. A malformed response, disconnect,
 or warp-to-output deadline miss latches the Mac icon orange without interrupting the
-local model.
+local model. Initial cold frames remain in loading state until 20 consecutive
+warp-to-output results meet the configured deadline.
 
 Per-frame timing and local-versus-Big curvature are written on the 3X under
 `/data/media/0/mac_accelerator_shadow/live-*.jsonl`. After a run, copy a log and run:

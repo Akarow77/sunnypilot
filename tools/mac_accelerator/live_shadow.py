@@ -168,8 +168,7 @@ class LiveShadowWorker:
       expected_model_sha256=self.expected_model_sha256,
       expected_output_floats=18452,
       expected_backend='COREML_ANE',
-      # LiveShadowWorker qualifies the complete warp-to-output path below.
-      qualification_frames=1,
+      qualification_frames=self.qualification_frames,
       qualification_timeout_ms=500.0,
       compression='zstd-1',
     )
@@ -207,10 +206,14 @@ class LiveShadowWorker:
                               capture_ns=frame.capture_ns, reset=sequence == 0)
         completed_ns = time.monotonic_ns()
         warp_to_output_ms = (completed_ns - frame.warp_started_ns) / 1e6
-        if warp_to_output_ms > self.deadline_ms:
+        deadline_missed = warp_to_output_ms > self.deadline_ms
+        if deadline_missed:
+          qualified = 0
+        else:
+          qualified += 1
+        if deadline_missed and active_published:
           client.fallback.fail(sequence, f'warp-to-output deadline missed: {warp_to_output_ms:.2f} ms')
           raise RuntimeError(client.fallback.failure_reason)
-        qualified += 1
         if (not active_published and client.fallback.state is AcceleratorState.ACTIVE and
             qualified >= self.qualification_frames):
           self.ui_state.active()
@@ -227,6 +230,7 @@ class LiveShadowWorker:
           'roundTripMs': result.round_trip_ms,
           'inferenceMs': result.inference_ms,
           'warpToOutputMs': warp_to_output_ms,
+          'deadlineMiss': deadline_missed,
           'localDesiredCurvature': local_curvature,
           'bigDesiredCurvature': big_curvature,
           'curvatureDifference': (big_curvature - local_curvature

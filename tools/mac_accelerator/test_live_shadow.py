@@ -56,6 +56,18 @@ class FakeClient:
     self.closed = True
 
 
+class ColdFakeClient(FakeClient):
+  def __init__(self, *args, **kwargs):
+    super().__init__(*args, **kwargs)
+    self.calls = 0
+
+  def infer(self, *args, **kwargs):
+    if self.calls == 0:
+      time.sleep(0.03)
+    self.calls += 1
+    return super().infer(*args, **kwargs)
+
+
 def policy_inputs():
   return {
     'desire_pulse': np.zeros(8, dtype=np.float32),
@@ -110,6 +122,31 @@ class LiveShadowTest(unittest.TestCase):
       self.assertIn('"bigDesiredCurvature":1.0', line)
       self.assertIn('"localDesiredCurvature":0.5', line)
       self.assertTrue(FakeClient.instances[0].closed)
+
+  def test_cold_deadline_miss_stays_loading_until_qualified(self):
+    ui = FakeUIState()
+    with tempfile.TemporaryDirectory() as temp_dir:
+      key_path = Path(temp_dir) / 'auth.key'
+      key_path.write_bytes(b'k' * 32)
+      worker = LiveShadowWorker('::1%usb0', deadline_ms=20.0, auth_key_path=key_path,
+                                log_dir=Path(temp_dir), qualification_frames=1,
+                                client_factory=ColdFakeClient, ui_state=ui)
+      worker.start()
+      warped = FakeTensor(np.zeros(WARPED_SHAPE, dtype=np.uint8))
+      for frame_id in (1, 2):
+        self.assertTrue(worker.enqueue(warped, camera_frame_id=frame_id, capture_ns=time.monotonic_ns(),
+                                       v_ego=2.0, numpy_inputs=policy_inputs(), desire_key='desire_pulse'))
+        deadline = time.monotonic() + 1.0
+        while worker.completed < frame_id and time.monotonic() < deadline:
+          time.sleep(0.005)
+      worker.stop()
+
+      self.assertEqual(worker.completed, 2)
+      self.assertIsNone(worker.failed_reason)
+      self.assertIn('active', ui.states)
+      log_lines = list(Path(temp_dir).glob('live-*.jsonl'))[0].read_text().splitlines()
+      self.assertIn('"deadlineMiss":true', log_lines[0])
+      self.assertIn('"deadlineMiss":false', log_lines[1])
 
 
 if __name__ == '__main__':
