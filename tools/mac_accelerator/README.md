@@ -34,6 +34,16 @@ Compile the policy-only worker artifact used by the USB prototype:
 tools/mac_accelerator/compile_policy.sh
 ```
 
+The official big model can also be compiled, but the tested M2 Air cannot run it at
+20 Hz:
+
+```bash
+git lfs pull --include=openpilot/selfdrive/modeld/models/big_driving_supercombo.onnx
+MODEL="$PWD/openpilot/selfdrive/modeld/models/big_driving_supercombo.onnx" \
+OUTPUT="$PWD/tools/mac_accelerator/artifacts/big_driving_policy_metal.pkl" \
+  tools/mac_accelerator/compile_policy.sh
+```
+
 ## Run with a comma 3X
 
 Keep the 3X powered through OBD-C and connect its auxiliary port to the Mac with a
@@ -77,6 +87,19 @@ DEV=METAL JIT=2 .venv/bin/python tools/mac_accelerator/compare_backends.py
 This feeds the same 3X-sized frames and policy inputs through both recurrent runners
 and reports absolute and normalized output error for every frame.
 
+## Replay a local route
+
+Copy a completed segment's `fcamera.hevc`, `ecamera.hevc`, and `rlog.zst` into one
+directory, then run:
+
+```bash
+DEV=METAL JIT=2 .venv/bin/python tools/mac_accelerator/route_model_benchmark.py \
+  /path/to/segment --artifact /path/to/driving_tinygrad.pkl --frames 200
+```
+
+The replay streams both HEVC cameras, rebuilds the padded 3X NV12 buffers, and uses
+the recorded device type, sensor, right-hand-drive state, and calibrated transform.
+
 ## Transport sizing
 
 Sending both padded 3X NV12 frames would require about 149.4 MB/s at 20 Hz, before
@@ -98,7 +121,8 @@ over the deadline on the 3X. The local model must remain the control source when
 the worker is late, warming up, disconnected, or invalid.
 
 See [PROTOCOL.md](PROTOCOL.md) for the proposed split, message contents, and staged
-failure-testing plan.
+failure-testing plan. [CHESTNUT_DESIGN.md](CHESTNUT_DESIGN.md) maps sunnypilot's
+Chestnut loading, state reporting, and latched small-model fallback onto a Mac worker.
 
 ## Tested baseline
 
@@ -126,3 +150,14 @@ Actual 3X USB-NCM policy-only synthetic shadow results, after five warm-up frame
 The long run missed the 50 ms period on 1% of frames, and the post-reboot sample also
 had misses. This is enough for a shadow experiment with local fallback, but it is not
 safe or deterministic enough to become the vehicle's control source.
+
+Actual calibrated route replay, using the same 200 camera-frame pairs:
+
+| Model | Output floats | Mean | p99 | Max | Over 50 ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Small | 2,576 | 12.79 ms | 28.25 ms | 35.43 ms | 0 / 200 |
+| Big | 18,452 | 114.87 ms | 118.26 ms | 147.28 ms | 200 / 200 |
+
+Both produced finite outputs, but the official big model is not real-time on the
+MacBook Air M2. Compiling successfully is not sufficient to use it as a 20 Hz driving
+model.

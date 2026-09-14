@@ -12,7 +12,7 @@ if [[ ! -x "$REPO_ROOT/.venv/bin/python" ]]; then
   exit 1
 fi
 
-MODEL="$REPO_ROOT/openpilot/selfdrive/modeld/models/driving_supercombo.onnx"
+MODEL="${MODEL:-$REPO_ROOT/openpilot/selfdrive/modeld/models/driving_supercombo.onnx}"
 if [[ "$(wc -c < "$MODEL")" -lt 1000000 ]]; then
   echo "The driving model is still a Git LFS pointer." >&2
   echo "Run: source .venv/bin/activate && git lfs pull --include=openpilot/selfdrive/modeld/models/driving_supercombo.onnx" >&2

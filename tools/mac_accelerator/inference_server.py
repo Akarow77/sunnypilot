@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import socket
 import time
 from pathlib import Path
@@ -13,9 +14,9 @@ import numpy as np
 from openpilot.selfdrive.modeld.helpers import load_oob
 
 from compile_policy import REMOTE_INPUTS, make_remote_input_queues
-from transport import (FLAG_RESET, OUTPUT_FLOATS, POLICY_INPUTS, REQUEST, REQUEST_BYTES,
-                       RESPONSE, TIMINGS, WARPED_BYTES, WARPED_SHAPE, ProtocolError,
-                       recv_message, send_message)
+from transport import (FLAG_RESET, POLICY_INPUTS, REQUEST, REQUEST_BYTES, RESPONSE,
+                       TIMINGS, WARPED_BYTES, WARPED_SHAPE, ProtocolError, recv_message,
+                       send_message)
 
 
 class PolicySession:
@@ -24,6 +25,7 @@ class PolicySession:
     self.queues, self.npy, self.frames = make_remote_input_queues(
       artifact['metadata'], artifact['input_devices']['model'])
     self.output_slices = artifact['metadata']['output_slices']
+    self.output_floats = math.prod(next(iter(artifact['metadata']['output_shapes'].values())))
 
   def infer(self, payload: bytes) -> bytes:
     if len(payload) != REQUEST_BYTES:
@@ -37,8 +39,8 @@ class PolicySession:
 
     output, = self.artifact['run_policy'](**{name: self.queues[name] for name in REMOTE_INPUTS})
     result = output.numpy()[0]
-    if result.size != OUTPUT_FLOATS:
-      raise ProtocolError(f"model output length {result.size} != {OUTPUT_FLOATS}")
+    if result.size != self.output_floats:
+      raise ProtocolError(f"model output length {result.size} != {self.output_floats}")
     if not np.all(np.isfinite(result)):
       raise ProtocolError("model produced non-finite output")
     self.npy['prev_feat'][:] = result[self.output_slices['hidden_state']]

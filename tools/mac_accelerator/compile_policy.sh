@@ -6,7 +6,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ARTIFACT_DIR="${ARTIFACT_DIR:-$SCRIPT_DIR/artifacts}"
 OUTPUT="${OUTPUT:-$ARTIFACT_DIR/driving_policy_metal.pkl}"
 BENCHMARK_RUNS="${BENCHMARK_RUNS:-10}"
-MODEL="$REPO_ROOT/openpilot/selfdrive/modeld/models/driving_supercombo.onnx"
+MODEL="${MODEL:-$REPO_ROOT/openpilot/selfdrive/modeld/models/driving_supercombo.onnx}"
 
 if [[ ! -x "$REPO_ROOT/.venv/bin/python" ]]; then
   echo "Missing $REPO_ROOT/.venv. Run: uv sync --frozen --all-extras" >&2

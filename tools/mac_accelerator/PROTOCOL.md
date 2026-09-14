@@ -10,8 +10,9 @@ camera warp. It sends two contiguous `uint8[6,128,256]` tensors to the Mac. The 
 keeps the recurrent image, desire, and feature queues and runs the driving policy.
 
 Keeping the warp on the 3X reduces the 20 Hz payload from about 149.4 MB/s of padded
-NV12 data to about 7.9 MB/s. The Mac returns one `float32[2576]` model output, about
-10.3 KB per inference.
+NV12 data to about 7.9 MB/s. The Mac returns the model-dependent float32 output:
+2,576 values (about 10.3 KB) for the small model or 18,452 values (about 73.8 KB) for
+the tested official big model.
 
 ## Request
 
@@ -48,6 +49,10 @@ inference start, inference end), followed by the little-endian float32 model out
 The header echoes the request session, frame, and capture timestamp. Monotonic clocks
 on the two machines are not compared directly; the client measures the round trip on
 its own clock.
+
+Before live integration, add a handshake that binds a session to the model hash,
+input/output shapes, backend, and deadline. The current synthetic client supplies the
+expected output length out of band and is not sufficient for automatic model changes.
 
 ## Failure behavior
 

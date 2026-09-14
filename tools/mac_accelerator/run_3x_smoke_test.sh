@@ -7,6 +7,7 @@ WARMUP_FRAMES="${WARMUP_FRAMES:-5}"
 FREQUENCY="${FREQUENCY:-20}"
 DEADLINE_MS="${DEADLINE_MS:-50}"
 PORT="${PORT:-8066}"
+EXPECTED_OUTPUT_FLOATS="${EXPECTED_OUTPUT_FLOATS:-2576}"
 DEVICE_DIR="/tmp/mac_accelerator"
 
 LINK_INFO="$("$SCRIPT_DIR/setup_usb_ncm.sh")"
@@ -16,7 +17,8 @@ MAC_ADDRESS="${MAC_ENDPOINT%\%*}"
 DEVICE_ENDPOINT="${MAC_ADDRESS}%usb0"
 
 adb shell "mkdir -p '$DEVICE_DIR'"
-adb push "$SCRIPT_DIR/transport.py" "$SCRIPT_DIR/synthetic_client.py" "$DEVICE_DIR/"
+adb push "$SCRIPT_DIR/fallback.py" "$SCRIPT_DIR/transport.py" "$SCRIPT_DIR/synthetic_client.py" "$DEVICE_DIR/"
 adb shell "cd '$DEVICE_DIR' && python3 synthetic_client.py '$DEVICE_ENDPOINT' \
   --port '$PORT' --frames '$FRAMES' --warmup-frames '$WARMUP_FRAMES' \
-  --frequency '$FREQUENCY' --deadline-ms '$DEADLINE_MS'"
+  --frequency '$FREQUENCY' --deadline-ms '$DEADLINE_MS' \
+  --expected-output-floats '$EXPECTED_OUTPUT_FLOATS'"
