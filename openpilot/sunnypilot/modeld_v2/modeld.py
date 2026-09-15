@@ -448,7 +448,7 @@ def main(demo=False):
         # Use the same lossless transport path qualified by the 3X USB test.
         # Remote results remain observational and never replace local output.
         'compression': 'zstd-1',
-      }, copy_budget_ms=8.0)
+      }, copy_budget_ms=10.0)
       atexit.register(shadow.close)
       shadow.start()
     except Exception:

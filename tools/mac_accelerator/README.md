@@ -128,7 +128,7 @@ Missing camera frames reset recurrent queues and readiness; duplicate/backward,
 stale, uncalibrated, or unsynchronized inputs fail the session.
 
 **The GPU-to-host readback is still synchronous.** The initial real-device probe is
-restricted to a parked car with lateral control inactive and uses an 8 ms snapshot
+restricted to a parked car with lateral control inactive and uses a 10 ms snapshot
 budget so the actual QCOM readback cost can be measured. Moving above 0.5 m/s or
 activating lateral control stops frame delivery and the worker fails closed. The
 budget disables future snapshots after an overrun; it cannot prevent or undo the
