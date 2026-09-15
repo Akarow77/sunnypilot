@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import socket
 import struct
+import time
 import zlib
 
 
@@ -33,11 +34,16 @@ class ProtocolError(RuntimeError):
   pass
 
 
-def recv_exact(sock: socket.socket, size: int) -> bytes:
+def recv_exact(sock: socket.socket, size: int, deadline_ns: int | None = None) -> bytes:
   buffer = bytearray(size)
   view = memoryview(buffer)
   received = 0
   while received < size:
+    if deadline_ns is not None:
+      remaining = (deadline_ns - time.monotonic_ns()) / 1e9
+      if remaining <= 0:
+        raise TimeoutError('receive absolute deadline expired')
+      sock.settimeout(remaining)
     count = sock.recv_into(view[received:])
     if not count:
       raise EOFError("peer closed the connection")
@@ -55,8 +61,10 @@ def send_message(sock: socket.socket, msg_type: int, flags: int, session_id: int
   sock.sendall(header + payload)
 
 
-def recv_message(sock: socket.socket, expected_type: int) -> tuple[int, int, int, int, bytes]:
-  raw_header = recv_exact(sock, HEADER.size)
+def recv_message(sock: socket.socket, expected_type: int, *, deadline_ns: int | None = None) -> tuple[int, int, int, int, bytes]:
+  if deadline_ns is None and (timeout := sock.gettimeout()) is not None:
+    deadline_ns = time.monotonic_ns() + int(timeout * 1e9)
+  raw_header = recv_exact(sock, HEADER.size, deadline_ns)
   magic, version, msg_type, flags, session_id, frame_id, capture_ns, payload_len, checksum = HEADER.unpack(raw_header)
   if magic != MAGIC:
     raise ProtocolError(f"bad magic: {magic!r}")
@@ -66,7 +74,7 @@ def recv_message(sock: socket.socket, expected_type: int) -> tuple[int, int, int
     raise ProtocolError(f"unexpected message type: {msg_type}")
   if payload_len > MAX_PAYLOAD_BYTES:
     raise ProtocolError(f"payload too large: {payload_len}")
-  payload = recv_exact(sock, payload_len)
+  payload = recv_exact(sock, payload_len, deadline_ns)
   actual_checksum = zlib.crc32(payload) & 0xFFFFFFFF
   if actual_checksum != checksum:
     raise ProtocolError(f"checksum mismatch: {actual_checksum:#x} != {checksum:#x}")

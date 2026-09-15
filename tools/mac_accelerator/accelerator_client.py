@@ -20,7 +20,7 @@ from accelerator_protocol import authenticate_payload, canonical_json, make_auth
 from compression import ZstdCodec
 from fallback import AcceleratorState, FallbackLatch
 from transport import (DEVICE_TYPE, FLAG_RESET, FLAG_ZSTD_REQUEST, HELLO, HELLO_RESPONSE, POLICY_INPUTS,
-                       REQUEST, RESPONSE, TIMINGS, VERSION, WARPED_BYTES, ProtocolError,
+                       MAX_PAYLOAD_BYTES, REQUEST, RESPONSE, TIMINGS, VERSION, WARPED_BYTES, ProtocolError,
                        recv_message, send_message)
 
 @dataclass(frozen=True)
@@ -36,6 +36,7 @@ class AcceleratorIdentity:
   compressions: tuple[str, ...] = ()
   output_dtype: str = 'float32'
   output_slices: dict[str, tuple[int, int]] = field(default_factory=dict)
+  frame_skip: int | None = None
 
 
 @dataclass(frozen=True)
@@ -56,9 +57,9 @@ class AcceleratorClient:
                expected_model_sha256: str | None = None, expected_output_floats: int | None = None,
                expected_backend: str = 'METAL', qualification_frames: int = 1,
                qualification_timeout_ms: float = 100.0, compression: str | None = None):
-    if deadline_ms <= 0:
+    if not math.isfinite(deadline_ms) or deadline_ms <= 0:
       raise ValueError('deadline must be positive')
-    if qualification_frames < 1 or qualification_timeout_ms < deadline_ms:
+    if qualification_frames < 1 or not math.isfinite(qualification_timeout_ms) or qualification_timeout_ms < deadline_ms:
       raise ValueError('qualification frames must be positive and timeout must cover the active deadline')
     self.host = host
     self.port = port
@@ -107,6 +108,8 @@ class AcceleratorClient:
       if session_id != self.session_id:
         raise ProtocolError('hello session identity mismatch')
       response = json.loads(payload)
+      if not isinstance(response, dict) or response.get('protocol') != VERSION:
+        raise ProtocolError('invalid hello response')
       response_auth = response.pop('auth', None)
       if self.auth_key is not None:
         expected_auth = make_auth(self.auth_key, nonce, response)
@@ -128,6 +131,7 @@ class AcceleratorClient:
         output_dtype=str(response.get('output_dtype', 'float32')),
         output_slices={name: (int(bounds[0]), int(bounds[1]))
                        for name, bounds in response.get('output_slices', {}).items()},
+        frame_skip=response.get('frame_skip'),
       )
       self._validate_identity(identity)
       conn.settimeout(self.deadline_ms / 1000.0)
@@ -171,16 +175,21 @@ class AcceleratorClient:
       raise ProtocolError(f'unsupported output dtype: {identity.output_dtype}')
     if identity.output_dtype == 'float16' and np is None:
       raise ProtocolError('float16 output requires NumPy on the client')
+    if not 0 < identity.output_floats <= (MAX_PAYLOAD_BYTES - TIMINGS.size - 32) // 4:
+      raise ProtocolError('invalid output count')
     for name, bounds in identity.output_slices.items():
       if len(bounds) != 2 or not 0 <= bounds[0] <= bounds[1] <= identity.output_floats:
         raise ProtocolError(f'invalid output slice {name}: {bounds}')
 
   def infer(self, warped: bytes, policy: bytes, *, frame_id: int, capture_ns: int,
-            reset: bool = False) -> InferenceResult:
+            reset: bool = False, deadline_ns: int | None = None) -> InferenceResult:
     if self.socket is None or self.identity is None:
       raise RuntimeError('accelerator is not connected')
     if self.fallback.state is AcceleratorState.FAILED:
       raise RuntimeError(f'accelerator failure is latched: {self.fallback.failure_reason}')
+    if reset:
+      self.fallback.reset()
+      self.qualification_count = 0
     if self.identity.output_dtype == 'float16' and self._output_buffer is None:
       self._prepare_output_buffers(self.identity)
     if frame_id != self.next_frame:
@@ -192,13 +201,10 @@ class AcceleratorClient:
     stage = 'prepare'
     prepared_ns = sent_ns = received_ns = completed_ns = None
     flags = FLAG_RESET if reset else 0
-    request_payload = warped + policy
-    if self.codec is not None:
-      request_payload = self.codec.compress(request_payload)
-      flags |= FLAG_ZSTD_REQUEST
     request_deadline_ms = (self.qualification_timeout_ms if self.fallback.state is AcceleratorState.LOADING
                            else self.deadline_ms)
-    deadline_ns = started_ns + int(request_deadline_ms * 1e6)
+    own_deadline_ns = started_ns + int(request_deadline_ms * 1e6)
+    deadline_ns = min(deadline_ns, own_deadline_ns) if deadline_ns is not None else own_deadline_ns
 
     def set_remaining_timeout() -> None:
       remaining = (deadline_ns - time.monotonic_ns()) / 1e9
@@ -208,6 +214,10 @@ class AcceleratorClient:
       self.socket.settimeout(remaining)
 
     try:
+      request_payload = warped + policy
+      if self.codec is not None:
+        request_payload = self.codec.compress(request_payload)
+        flags |= FLAG_ZSTD_REQUEST
       request = authenticate_payload(self.auth_key, REQUEST, flags, self.session_id, frame_id,
                                      capture_ns, request_payload)
       prepared_ns = time.monotonic_ns()
@@ -217,7 +227,7 @@ class AcceleratorClient:
       sent_ns = time.monotonic_ns()
       stage = 'receive'
       set_remaining_timeout()
-      response_flags, session_id, response_frame, response_capture, response = recv_message(self.socket, RESPONSE)
+      response_flags, session_id, response_frame, response_capture, response = recv_message(self.socket, RESPONSE, deadline_ns=deadline_ns)
       received_ns = time.monotonic_ns()
       stage = 'validate'
       if (session_id, response_frame, response_capture) != (self.session_id, frame_id, capture_ns):
@@ -230,7 +240,9 @@ class AcceleratorClient:
       expected_bytes = TIMINGS.size + self.identity.output_floats * output_itemsize
       if len(response) != expected_bytes:
         raise ProtocolError(f'invalid response length: {len(response)} != {expected_bytes}')
-      _, inference_start_ns, inference_end_ns = TIMINGS.unpack_from(response)
+      server_receive_ns, inference_start_ns, inference_end_ns = TIMINGS.unpack_from(response)
+      if not server_receive_ns <= inference_start_ns <= inference_end_ns:
+        raise ProtocolError('invalid server timing order')
       wire_output = response[TIMINGS.size:]
       if np is not None:
         wire_dtype = '<f2' if self.identity.output_dtype == 'float16' else '<f4'

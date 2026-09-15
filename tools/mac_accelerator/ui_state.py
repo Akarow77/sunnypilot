@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sys
+import time
 
 
 PARAM_KEYS = (
@@ -16,6 +17,7 @@ PARAM_KEYS = (
 
 
 class NullUIState:
+  def heartbeat(self) -> None: pass
   def loading(self) -> None: pass
   def ready(self) -> None: pass
   def active(self) -> None: pass
@@ -27,14 +29,23 @@ class MacAcceleratorUIState:
   def __init__(self):
     from openpilot.common.params import Params
     self.params = Params()
+    self.last_heartbeat = 0.0
     for key in PARAM_KEYS:
       self.params.check_key(key)
+    self.params.check_key('MacAcceleratorHeartbeat')
+
+  def heartbeat(self) -> None:
+    now = time.monotonic()
+    if now - self.last_heartbeat >= 0.25:
+      self.params.put('MacAcceleratorHeartbeat', now)
+      self.last_heartbeat = now
 
   def _set(self, *, present: bool, loading: bool, ready: bool,
            active: bool, failed: bool) -> None:
     values = dict(zip(PARAM_KEYS, (present, loading, ready, active, failed), strict=True))
     for key, value in values.items():
       self.params.put_bool(key, value)
+    self.heartbeat()
 
   def loading(self) -> None:
     self._set(present=True, loading=True, ready=False, active=False, failed=False)

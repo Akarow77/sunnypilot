@@ -24,9 +24,13 @@ capture monotonic timestamp, payload length, and CRC32. Payloads are capped at
 
 The client begins each connection with a nonce-bearing JSON `HELLO`. The server
 returns an identity containing its device type, backend, model checkpoint,
-source-model SHA-256, input/output shapes, output length and dtype, request length, and
-supported compression modes. The client rejects any identity that differs from
+source-model SHA-256, input/output shapes, output slices, frame skip, output length
+and dtype, request length, and supported compression modes. The client rejects any identity that differs from
 its configured expectations.
+
+The source hash is currently a server declaration computed from `--onnx`; it is
+not cryptographically bound to `--model` (the Core ML package). Authentication
+does not by itself establish conversion provenance or numerical equivalence.
 
 When a shared key is configured, both sides prove possession with HMAC-SHA256
 over canonical handshake JSON. Every inference request and response also carries
@@ -49,8 +53,10 @@ complete request round trip with its own clock.
 
 Only one request may be in flight. Frame IDs must be sequential at the client and
 strictly increasing at the server. A newer camera frame may replace an unsent old
-frame, but queues must never advance for a dropped, duplicated, or rejected
-request.
+frame. The shadow preserves real camera frame IDs separately from sequential
+wire IDs, resetting recurrent queues and qualification after any camera gap.
+Duplicate/backward frames are rejected. Big Model requires `frame_skip=2` and
+66 contiguous context frames before comparison/readiness.
 
 ## Readiness and failure behavior
 
@@ -60,11 +66,19 @@ deadline. Once active, a bad identity, malformed length, checksum or HMAC error,
 stale response, non-finite output, disconnect, or deadline miss latches the
 client into the failed state until an explicit reset or ignition cycle.
 
-A remote request must never block the local `modeld` path. The frame that causes
-failure is discarded, and the normal local model remains the only published
-control source. Current USB tests do not meet a sustained hard 50 ms
-camera-warp-to-output deadline, so the implementation remains synthetic and
-shadow-only.
+Network/compression/logging work runs in a separate, non-realtime process. Local
+model messages are published before the optional host snapshot. Readback is still
+synchronous: the 2 ms snapshot tripwire prevents subsequent copies, not the first
+overrun. No zero-interference claim is established. Current USB and Mac-only tests
+do not establish a sustained hard deadline, so the implementation remains shadow-only.
+
+Receive timeouts use one absolute deadline across header, payload, and fragmented
+reads. Active live checks include the full snapshot-to-response age (default 55 ms)
+and camera EOF age (150 ms). Warm-up allows a 500 ms individual request but requires
+66 consecutive in-limit frames. A 500 ms input stall fails the worker; a 2 s stale
+heartbeat prevents the 3X UI remaining green after worker death. Terminal failures
+are logged separately from completed-frame deadline misses so missing responses
+are not mistaken for successful frames. These are diagnostic, not safety, limits.
 
 ## Development stages
 

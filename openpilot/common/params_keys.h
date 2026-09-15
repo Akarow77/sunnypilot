@@ -144,6 +144,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"MacAcceleratorModelError", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION | CLEAR_ON_IGNITION_ON, BOOL}},
     {"MacAcceleratorPresent", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION | CLEAR_ON_IGNITION_ON, BOOL}},
     {"MacAcceleratorReady", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION | CLEAR_ON_IGNITION_ON, BOOL}},
+    {"MacAcceleratorHeartbeat", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION | CLEAR_ON_IGNITION_ON, FLOAT}},
     {"MacAcceleratorShadowEnabled", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"MacAcceleratorHost", {PERSISTENT, STRING}},
     {"MacAcceleratorPort", {PERSISTENT, INT, "8066"}},

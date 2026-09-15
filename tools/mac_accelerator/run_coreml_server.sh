@@ -17,9 +17,14 @@ fi
 mkdir -p "$COREML_TMPDIR"
 export TMPDIR="$COREML_TMPDIR"
 
-LINK_INFO="$($SCRIPT_DIR/setup_usb_ncm.sh)"
-printf '%s\n' "$LINK_INFO"
-MAC_ENDPOINT="$(printf '%s\n' "$LINK_INFO" | awk '/^Mac:/{print $2; exit}')"
+if [[ "${MAC_ACCELERATOR_LOCAL_TEST:-0}" == "1" ]]; then
+  MAC_ENDPOINT="::1"
+  echo "Mac-only test mode: localhost; no comma connection required."
+else
+  LINK_INFO="$($SCRIPT_DIR/setup_usb_ncm.sh)"
+  printf '%s\n' "$LINK_INFO"
+  MAC_ENDPOINT="$(printf '%s\n' "$LINK_INFO" | awk '/^Mac:/{print $2; exit}')"
+fi
 if [[ -z "$MAC_ENDPOINT" ]]; then
   echo "Could not discover the Mac USB endpoint." >&2
   exit 1

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import socket
+import threading
+import time
 import unittest
 import zlib
 
@@ -8,6 +10,28 @@ from transport import HEADER, MAGIC, REQUEST, VERSION, ProtocolError, recv_messa
 
 
 class TransportTest(unittest.TestCase):
+  def test_slow_trickle_cannot_extend_absolute_deadline(self):
+    sender, receiver = socket.socketpair()
+    receiver.settimeout(.2)
+    def trickle():
+      try:
+        for _ in range(20):
+          sender.sendall(b'x')
+          time.sleep(.03)
+      except OSError:
+        pass
+    worker = threading.Thread(target=trickle)
+    worker.start()
+    started = time.monotonic()
+    try:
+      with self.assertRaises(TimeoutError):
+        recv_message(receiver, REQUEST, deadline_ns=time.monotonic_ns() + 120_000_000)
+      self.assertLess(time.monotonic() - started, .3)
+    finally:
+      receiver.close()
+      sender.close()
+      worker.join(1)
+
   def test_round_trip(self) -> None:
     sender, receiver = socket.socketpair()
     self.addCleanup(sender.close)

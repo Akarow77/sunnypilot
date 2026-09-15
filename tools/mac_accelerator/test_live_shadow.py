@@ -1,152 +1,216 @@
-#!/usr/bin/env python3
-
+import ast
+from dataclasses import replace
+import fcntl
 from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import Mock, patch
 
 import numpy as np
 
 from accelerator_client import AcceleratorIdentity, InferenceResult
-from fallback import FallbackLatch
-from live_shadow import LiveShadowWorker, pack_policy_inputs
-from transport import DEVICE_TYPE, POLICY_INPUTS, WARPED_BYTES, WARPED_SHAPE
+from live_shadow import JsonLog, ShadowSession, run
+from shadow_ipc import FrameMailbox, ShadowPublisher
+from transport import DEVICE_TYPE, REQUEST_BYTES, WARPED_BYTES, WARPED_SHAPE
 
 
-class FakeUIState:
-  def __init__(self):
-    self.states = []
-
-  def loading(self): self.states.append('loading')
-  def ready(self): self.states.append('ready')
-  def active(self): self.states.append('active')
-  def failed(self): self.states.append('failed')
+def identity():
+  return AcceleratorIdentity(DEVICE_TYPE, 'COREML_ANE', 'big', 'a' * 64,
+    {'img': [1, 12, 128, 256], 'big_img': [1, 12, 128, 256], 'desire_pulse': [1, 33, 8],
+     'traffic_convention': [1, 2], 'action_t': [1, 2], 'features_buffer': [1, 32, 32, 512]},
+    {'outputs': [1, 18452]}, 18452, REQUEST_BYTES, ('zstd-1',), 'float16', {'action': (2062, 2066)}, 2)
 
 
-class FakeTensor:
-  def __init__(self, value):
-    self.value = value
-
-  def numpy(self):
-    return self.value
-
-
-class FakeClient:
-  instances = []
-
-  def __init__(self, _host, _port, **kwargs):
-    self.fallback = FallbackLatch(kwargs['deadline_ms'])
-    self.closed = False
-    self.__class__.instances.append(self)
-
-  def connect(self):
-    return AcceleratorIdentity(
-      DEVICE_TYPE, 'COREML_ANE', 'big', 'a' * 64, {}, {'outputs': [1, 18452]},
-      18452, WARPED_BYTES + POLICY_INPUTS.size, ('zstd-1',), 'float16',
-      {'action': (10, 14)},
-    )
-
-  def infer(self, _warped, _policy, *, frame_id, capture_ns, reset=False):
-    self.fallback.activate()
-    output = np.zeros(18452, dtype='<f4')
-    output[10] = 4.0
-    return InferenceResult(frame_id, memoryview(output).cast('B'), 10.0, 5.0, 1.0, 1.0, 2.0, 1.0)
-
-  def close(self):
-    self.closed = True
+def frame(frame_id, capture_ns):
+  return {'camera_frame_id': frame_id, 'extra_frame_id': frame_id, 'capture_ns': capture_ns,
+    'extra_capture_ns': capture_ns, 'calibrated': True, 'model_started_ns': capture_ns + 10_000_000,
+    'local_published_ns': capture_ns + 25_000_000, 'copy_started_ns': capture_ns + 30_000_000,
+    'queued_ns': capture_ns + 31_000_000, 'readback_ms': 0.1, 'v_ego': 10., 'local_curvature': .01,
+    'policy': [0.] * 8 + [1., 0., .2, .8]}
 
 
-class ColdFakeClient(FakeClient):
-  def __init__(self, *args, **kwargs):
-    super().__init__(*args, **kwargs)
-    self.calls = 0
-
-  def infer(self, *args, **kwargs):
-    if self.calls == 0:
-      time.sleep(0.03)
-    self.calls += 1
-    return super().infer(*args, **kwargs)
-
-
-def policy_inputs():
-  return {
-    'desire_pulse': np.zeros(8, dtype=np.float32),
-    'traffic_convention': np.array([1.0, 0.0], dtype=np.float32),
-    'action_t': np.array([0.2, 0.8], dtype=np.float32),
-  }
-
-
-class LiveShadowTest(unittest.TestCase):
+class ShadowStateTests(unittest.TestCase):
   def setUp(self):
-    FakeClient.instances.clear()
+    self.ui, self.log, self.client = Mock(), Mock(), Mock()
+    output = np.zeros(18452, dtype='<f4')
+    output[2062] = 2.
+    self.client.infer.return_value = InferenceResult(0, output.tobytes(), 25., 20., 1., 1., 1., 1.)
+    self.session = ShadowSession(self.client, identity(), self.ui, self.log)
+    self.now = 1_000_000_000
 
-  def test_policy_input_layout(self):
-    packed = pack_policy_inputs(policy_inputs(), 'desire_pulse')
-    self.assertEqual(len(packed), POLICY_INPUTS.size)
-    self.assertEqual(POLICY_INPUTS.unpack(packed)[8:], (1.0, 0.0, 0.20000000298023224, 0.800000011920929))
+  def process(self, index, *, delay_ms=0, **overrides):
+    self.now += 50_000_000
+    sample = {**frame(index, self.now), **overrides}
+    with patch('live_shadow.time.monotonic_ns', side_effect=[self.now + 40_000_000, self.now + int((40 + delay_ms) * 1e6)]):
+      return self.session.process(sample, bytes(WARPED_BYTES))
 
-  def test_latest_frame_replaces_unsent_frame(self):
-    ui = FakeUIState()
-    worker = LiveShadowWorker('::1%usb0', ui_state=ui)
-    warped = FakeTensor(np.zeros(WARPED_SHAPE, dtype=np.uint8))
-    for frame_id in (1, 2):
-      self.assertTrue(worker.enqueue(warped, camera_frame_id=frame_id, capture_ns=frame_id,
-                                     v_ego=10.0, numpy_inputs=policy_inputs(), desire_key='desire_pulse'))
-    self.assertEqual(worker.dropped, 1)
-    self.assertEqual(worker.queue.get_nowait().camera_frame_id, 2)
+  def test_loading_is_not_green_and_full_context_is_required(self):
+    for i in range(65):
+      self.assertFalse(self.process(i)['qualified'])
+    self.ui.ready.assert_not_called()
+    self.ui.active.assert_not_called()
+    row = self.process(65)
+    self.assertTrue(row['comparable'])
+    self.assertAlmostEqual(row['curvatureDifference'], .01)
+    self.ui.active.assert_called_once()
 
-  def test_worker_logs_shadow_without_publishing_control(self):
-    ui = FakeUIState()
-    with tempfile.TemporaryDirectory() as temp_dir:
-      key_path = Path(temp_dir) / 'auth.key'
-      key_path.write_bytes(b'k' * 32)
-      worker = LiveShadowWorker('::1%usb0', auth_key_path=key_path, log_dir=Path(temp_dir),
-                                qualification_frames=1, client_factory=FakeClient, ui_state=ui)
-      worker.start()
-      warped = FakeTensor(np.zeros(WARPED_SHAPE, dtype=np.uint8))
-      self.assertTrue(worker.enqueue(warped, camera_frame_id=9, capture_ns=time.monotonic_ns(),
-                                     v_ego=2.0, numpy_inputs=policy_inputs(), desire_key='desire_pulse'))
-      worker.record_local_action(9, 0.5)
-      deadline = time.monotonic() + 1.0
-      while worker.completed < 1 and time.monotonic() < deadline:
-        time.sleep(0.01)
-      worker.stop()
+  def test_gap_resets_recurrence_and_qualification(self):
+    for i in range(66):
+      self.process(i)
+    row = self.process(70)
+    self.assertFalse(row['qualified'])
+    self.assertEqual(row['missingFrames'], 4)
+    self.assertTrue(self.client.infer.call_args.kwargs['reset'])
+    self.assertEqual(row['epoch'], 2)
 
-      self.assertEqual(worker.completed, 1)
-      self.assertIsNone(worker.failed_reason)
-      self.assertIn('active', ui.states)
-      logs = list(Path(temp_dir).glob('live-*.jsonl'))
-      self.assertEqual(len(logs), 1)
-      line = logs[0].read_text().strip()
-      self.assertIn('"cameraFrameId":9', line)
-      self.assertIn('"bigDesiredCurvature":1.0', line)
-      self.assertIn('"localDesiredCurvature":0.5', line)
-      self.assertTrue(FakeClient.instances[0].closed)
+  def test_duplicate_frame_rejected_before_remote_inference(self):
+    self.process(1)
+    with self.assertRaisesRegex(RuntimeError, 'duplicate'):
+      self.process(1)
+    self.assertEqual(self.client.infer.call_count, 1)
 
-  def test_cold_deadline_miss_stays_loading_until_qualified(self):
-    ui = FakeUIState()
-    with tempfile.TemporaryDirectory() as temp_dir:
-      key_path = Path(temp_dir) / 'auth.key'
-      key_path.write_bytes(b'k' * 32)
-      worker = LiveShadowWorker('::1%usb0', deadline_ms=20.0, auth_key_path=key_path,
-                                log_dir=Path(temp_dir), qualification_frames=1,
-                                client_factory=ColdFakeClient, ui_state=ui)
-      worker.start()
-      warped = FakeTensor(np.zeros(WARPED_SHAPE, dtype=np.uint8))
-      for frame_id in (1, 2):
-        self.assertTrue(worker.enqueue(warped, camera_frame_id=frame_id, capture_ns=time.monotonic_ns(),
-                                       v_ego=2.0, numpy_inputs=policy_inputs(), desire_key='desire_pulse'))
-        deadline = time.monotonic() + 1.0
-        while worker.completed < frame_id and time.monotonic() < deadline:
-          time.sleep(0.005)
-      worker.stop()
+  def test_stale_future_unsynchronized_uncalibrated_rejected(self):
+    for overrides in ({'capture_ns': 1}, {'capture_ns': 99_000_000_000},
+                      {'extra_capture_ns': 1}, {'calibrated': False}, {'v_ego': float('nan')}):
+      with self.subTest(overrides=overrides), self.assertRaises(RuntimeError):
+        self.process(1, **overrides)
+    self.client.infer.assert_not_called()
 
-      self.assertEqual(worker.completed, 2)
-      self.assertIsNone(worker.failed_reason)
-      self.assertIn('active', ui.states)
-      log_lines = list(Path(temp_dir).glob('live-*.jsonl'))[0].read_text().splitlines()
-      self.assertIn('"deadlineMiss":true', log_lines[0])
-      self.assertIn('"deadlineMiss":false', log_lines[1])
+  def test_failure_frame_is_logged_before_latching(self):
+    for i in range(66):
+      self.process(i)
+    with self.assertRaisesRegex(RuntimeError, 'deadline'):
+      self.process(66, delay_ms=70)
+    self.assertTrue(self.log.write.call_args.args[0]['deadlineMiss'])
+    self.session.fail('deadline', 66)
+    self.assertTrue(self.session.failed)
+    self.ui.failed.assert_called_once()
+    self.client.close.assert_called_once()
+
+  def test_log_failure_does_not_prevent_failed_ui_and_close(self):
+    self.log.write.side_effect = OSError('disk full')
+    self.session.fail('disk full')
+    self.ui.failed.assert_called_once()
+    self.client.close.assert_called_once()
+
+  def test_context_contract_is_pinned(self):
+    with self.assertRaisesRegex(ValueError, 'contract'):
+      ShadowSession(self.client, replace(identity(), frame_skip=1), self.ui, self.log)
+
+
+class MailboxTests(unittest.TestCase):
+  def test_invalid_publish_preserves_previous_packet(self):
+    with tempfile.TemporaryDirectory() as directory:
+      mailbox = FrameMailbox(Path(directory) / 'frames', create=True)
+      self.addCleanup(mailbox.close)
+      mailbox.publish(bytes(WARPED_BYTES), {'frame': 1})
+      for metadata in ({'bad': float('nan')}, {'bad': 'x' * 5000}):
+        with self.assertRaises(ValueError):
+          mailbox.publish(b'x' * WARPED_BYTES, metadata)
+        seq, meta, pixels = mailbox.receive(0)
+        self.assertEqual((seq, meta['frame'], pixels), (1, 1, bytes(WARPED_BYTES)))
+
+  def test_latest_frame_and_exclusion(self):
+    with tempfile.TemporaryDirectory() as directory:
+      path = Path(directory) / 'frames'
+      writer = FrameMailbox(path, create=True)
+      reader = FrameMailbox(path)
+      self.addCleanup(writer.close)
+      self.addCleanup(reader.close)
+      data = bytes(WARPED_BYTES)
+      self.assertTrue(writer.publish(data, {'frame': 1}))
+      self.assertTrue(writer.publish(data, {'frame': 2}))
+      seq, meta, pixels = reader.receive(0)
+      self.assertEqual((seq, meta['frame'], pixels), (2, 2, data))
+      fcntl.flock(reader.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      try:
+        started = time.monotonic()
+        self.assertFalse(writer.publish(data, {'frame': 3}))
+        self.assertLess(time.monotonic() - started, .02)
+      finally:
+        fcntl.flock(reader.fd, fcntl.LOCK_UN)
+
+  def test_readback_error_cannot_escape_and_is_latched(self):
+    publisher = ShadowPublisher({})
+    self.addCleanup(publisher.close)
+    publisher.process = Mock()
+    publisher.process.poll.return_value = None
+    tensor = Mock()
+    tensor.numpy.side_effect = RuntimeError('device failure')
+    self.assertFalse(publisher.capture(tensor))
+    self.assertFalse(publisher.capture(tensor))
+    self.assertEqual(tensor.numpy.call_count, 1)
+    self.assertIn('device failure', publisher.failed_reason)
+
+  def test_dead_worker_never_reads_tensor(self):
+    publisher = ShadowPublisher({})
+    self.addCleanup(publisher.close)
+    publisher.process = Mock()
+    publisher.process.poll.return_value = 1
+    tensor = Mock()
+    self.assertFalse(publisher.capture(tensor))
+    tensor.numpy.assert_not_called()
+    self.assertIn('exited', publisher.failed_reason)
+
+  def test_close_is_idempotent(self):
+    publisher = ShadowPublisher({})
+    publisher.close()
+    publisher.close()
+
+  def test_slow_readback_disables_future_copies(self):
+    publisher = ShadowPublisher({}, copy_budget_ms=1)
+    self.addCleanup(publisher.close)
+    publisher.process = Mock()
+    publisher.process.poll.return_value = None
+    tensor = Mock()
+    tensor.numpy.return_value = np.zeros(WARPED_SHAPE, dtype=np.uint8)
+    with patch('shadow_ipc.time.monotonic_ns', side_effect=[0, 2_000_000]):
+      self.assertFalse(publisher.capture(tensor))
+    self.assertIn('budget', publisher.failed_reason)
+
+  def test_modeld_publishes_before_snapshot(self):
+    path = Path(__file__).resolve().parents[2] / 'openpilot/sunnypilot/modeld_v2/modeld.py'
+    tree = ast.parse(path.read_text())
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+    publishes = [n.lineno for n in calls if isinstance(n.func.value, ast.Name) and n.func.value.id == 'pm' and n.func.attr == 'send']
+    captures = [n.lineno for n in calls if isinstance(n.func.value, ast.Name) and n.func.value.id == 'shadow' and n.func.attr == 'capture']
+    self.assertEqual(len(captures), 1)
+    self.assertGreater(captures[0], max(publishes))
+
+
+class WorkerLifecycleTests(unittest.TestCase):
+  def test_no_first_frame_times_out_without_connecting(self):
+    with tempfile.TemporaryDirectory() as directory, patch('live_shadow.make_ui_state') as make_ui, \
+         patch('live_shadow.os.getppid', return_value=1), patch('live_shadow.time.monotonic', side_effect=[0, 16]), \
+         patch('live_shadow.AcceleratorClient') as client:
+      mailbox = Mock()
+      mailbox.receive.return_value = None
+      self.assertEqual(run(mailbox, {'log_dir': directory}, 1), 1)
+      client.assert_not_called()
+      make_ui.return_value.failed.assert_called_once()
+      self.assertIn('no first camera', next(Path(directory).glob('live-*.jsonl')).read_text())
+
+  def test_stalled_source_latches_and_closes_client(self):
+    with tempfile.TemporaryDirectory() as directory, patch('live_shadow.make_ui_state'), \
+         patch('live_shadow.os.getppid', return_value=1), patch('live_shadow.time.monotonic', side_effect=[0, .1, 1]), \
+         patch('live_shadow.read_auth_key', return_value=b'x' * 32), \
+         patch('live_shadow.AcceleratorClient') as client, patch('live_shadow.ShadowSession') as session:
+      mailbox = Mock()
+      mailbox.receive.side_effect = [(1, {'camera_frame_id': 1}, b''), None, None]
+      self.assertEqual(run(mailbox, {'log_dir': directory, 'host': '::1', 'expected_model_sha256': 'a' * 64}, 1), 1)
+      self.assertIn('500ms', session.return_value.fail.call_args.args[0])
+      client.return_value.close.assert_called_once()
+
+  def test_log_quota_rejects_without_deleting_existing_data(self):
+    with tempfile.TemporaryDirectory() as directory:
+      path = Path(directory) / 'test.jsonl'
+      log = JsonLog(path, max_bytes=20)
+      self.addCleanup(log.close)
+      log.write({'ok': 1})
+      with self.assertRaises(OSError):
+        log.write({'large': 'x' * 30})
+      self.assertEqual(path.read_text(), '{"ok":1}\n')
 
 
 if __name__ == '__main__':

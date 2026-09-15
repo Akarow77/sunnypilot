@@ -4,6 +4,10 @@
 from __future__ import annotations
 
 
+def mac_accelerator_heartbeat_fresh(heartbeat: float | None, now: float) -> bool:
+  return heartbeat is not None and 0 <= now - heartbeat <= 2.0
+
+
 def mac_accelerator_state(*, present: bool, loading: bool, ready: bool,
                           active: bool, failed: bool) -> str | None:
   if not present:

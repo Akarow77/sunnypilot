@@ -1,253 +1,228 @@
 #!/usr/bin/env python3
-"""Non-controlling live shadow worker for a comma 3X.
-
-The modeld thread only copies the already-computed warp and performs a nonblocking
-latest-frame enqueue. Network inference and logging happen on a daemon thread. No
-remote output is ever published to cereal or returned to modeld.
-"""
+"""Independent Mac Big Model shadow process. Remote outputs are logged only."""
 
 from __future__ import annotations
 
-from collections import OrderedDict
-from dataclasses import dataclass
+import argparse
+from dataclasses import asdict
 import json
+import math
+import os
 from pathlib import Path
-from queue import Empty, Full, Queue
-import sys
-import threading
 import time
-from typing import Any
 
 import numpy as np
 
 from accelerator_client import AcceleratorClient
 from accelerator_protocol import read_auth_key
-from fallback import AcceleratorState
-from transport import POLICY_INPUTS, WARPED_BYTES, WARPED_SHAPE
+from shadow_ipc import FrameMailbox
+from transport import POLICY_INPUTS
 from ui_state import make_ui_state
 
-
-AUTH_KEY_PATH = Path('/data/mac_accelerator/auth.key')
-LOG_DIR = Path('/data/media/0/mac_accelerator_shadow')
-
-
-@dataclass(frozen=True)
-class ShadowFrame:
-  camera_frame_id: int
-  capture_ns: int
-  warp_started_ns: int
-  queued_ns: int
-  v_ego: float
-  warped: bytes
-  policy: bytes
+AUTH_KEY_PATH = '/data/mac_accelerator/auth.key'
+LOG_DIR = '/data/media/0/mac_accelerator_shadow'
 
 
-def pack_policy_inputs(numpy_inputs: dict[str, np.ndarray], desire_key: str) -> bytes:
-  desire = np.asarray(numpy_inputs[desire_key], dtype=np.float32).reshape(-1)
-  traffic = np.asarray(numpy_inputs['traffic_convention'], dtype=np.float32).reshape(-1)
-  action_t = np.asarray(numpy_inputs['action_t'], dtype=np.float32).reshape(-1)
-  if desire.size != 8 or traffic.size != 2 or action_t.size != 2:
-    raise ValueError(f'incompatible policy inputs: desire={desire.size} traffic={traffic.size} action_t={action_t.size}')
-  return POLICY_INPUTS.pack(*(desire.tolist() + traffic.tolist() + action_t.tolist()))
+class JsonLog:
+  def __init__(self, path: Path, max_bytes: int = 32 * 1024 * 1024):
+    self.file = path.open('x', buffering=1)
+    os.chmod(path, 0o600)
+    self.bytes = 0
+    self.max_bytes = max_bytes
+
+  def write(self, entry: dict):
+    line = json.dumps(entry, allow_nan=False, separators=(',', ':')) + '\n'
+    self.bytes += len(line.encode())
+    if self.bytes > self.max_bytes:
+      raise OSError('shadow log size limit reached')
+    self.file.write(line)
+
+  def close(self):
+    self.file.close()
 
 
-class LiveShadowWorker:
-  """Latest-frame-only remote inference worker with latched failure behavior."""
+class ShadowSession:
+  """Testable per-frame state machine: qualified contiguous context or failure."""
+  def __init__(self, client, identity, ui, log, *, deadline_ms=55.0, max_capture_age_ms=150.0,
+               qualification_frames=20):
+    if not 0 < deadline_ms <= 500 or not math.isfinite(max_capture_age_ms) or max_capture_age_ms < deadline_ms:
+      raise ValueError('invalid shadow timing limits')
+    shapes = identity.input_shapes
+    if (shapes.get('img') != [1, 12, 128, 256] or shapes.get('big_img') != [1, 12, 128, 256]
+        or shapes.get('desire_pulse') != [1, 33, 8] or shapes.get('action_t') != [1, 2]
+        or shapes.get('traffic_convention') != [1, 2] or shapes.get('features_buffer') != [1, 32, 32, 512]
+        or identity.output_floats != 18452 or identity.output_shapes != {'outputs': [1, 18452]}
+        or identity.output_slices.get('action') != (2062, 2066) or identity.frame_skip != 2):
+      raise ValueError('incompatible Big Model temporal/input/output contract')
+    self.client, self.identity, self.ui, self.log = client, identity, ui, log
+    self.deadline_ms, self.max_capture_age_ms = deadline_ms, max_capture_age_ms
+    self.required = max(qualification_frames, 66)
+    self.sequence = 0
+    self.epoch = 0
+    self.context_frames = 0
+    self.good_frames = 0
+    self.previous = None
+    self.active = False
+    self.failed = False
+    self.ui.loading()
+    self.log.write({'event': 'session', 'identity': asdict(identity), 'requiredContextFrames': self.required,
+                    'deadlineMs': deadline_ms, 'maxCaptureAgeMs': max_capture_age_ms, 'controlSource': 'local'})
 
-  def __init__(self, host: str, *, port: int = 8066, deadline_ms: float = 55.0,
-               expected_model_sha256: str | None = None, auth_key_path: Path = AUTH_KEY_PATH,
-               log_dir: Path = LOG_DIR, qualification_frames: int = 20,
-               client_factory=AcceleratorClient, ui_state=None):
-    self.host = host
-    self.port = port
-    self.deadline_ms = deadline_ms
-    self.expected_model_sha256 = expected_model_sha256 or None
-    self.auth_key_path = auth_key_path
-    self.log_dir = log_dir
-    self.qualification_frames = qualification_frames
-    self.client_factory = client_factory
-    self.ui_state = ui_state or make_ui_state(True)
-    self.queue: Queue[ShadowFrame] = Queue(maxsize=1)
-    self.stop_event = threading.Event()
-    self.local_actions: OrderedDict[int, float] = OrderedDict()
-    self.local_lock = threading.Lock()
-    self.thread: threading.Thread | None = None
-    self.failed_reason: str | None = None
-    self.enqueued = 0
-    self.dropped = 0
-    self.completed = 0
+  def process(self, frame: dict, pixels: bytes):
+    if self.failed:
+      raise RuntimeError('shadow failure is latched')
+    now = time.monotonic_ns()
+    capture = frame['capture_ns']
+    age_ms = (now - capture) / 1e6
+    if not 0 <= age_ms <= self.max_capture_age_ms:
+      raise RuntimeError(f'stale/future input frame: age={age_ms:.2f}ms')
+    if not frame['calibrated'] or abs(capture - frame['extra_capture_ns']) > 10_000_000:
+      raise RuntimeError('uncalibrated or unsynchronized camera frame')
+    if not capture <= frame['model_started_ns'] <= frame['local_published_ns'] <= frame['copy_started_ns'] <= frame['queued_ns'] <= now:
+      raise RuntimeError('invalid frame timestamp order')
+    if not math.isfinite(frame['v_ego']) or frame['v_ego'] < 0 or not math.isfinite(frame['local_curvature']):
+      raise RuntimeError('invalid local comparison values')
+    frame_id = frame['camera_frame_id']
+    reset = self.previous is None
+    missing = 0
+    if self.previous is not None:
+      previous_id, previous_capture = self.previous
+      if frame_id <= previous_id or capture <= previous_capture:
+        raise RuntimeError('duplicate/backward camera frame')
+      missing = max(0, frame_id - previous_id - 1)
+      reset = bool(missing or not 25_000_000 <= capture - previous_capture <= 75_000_000)
+    if reset:
+      self.epoch += 1
+      self.context_frames = self.good_frames = 0
+      self.active = False
+      self.ui.loading()
+      self.log.write({'event': 'contextReset', 'epoch': self.epoch, 'cameraFrameId': frame_id, 'missingFrames': missing})
+    policy_values = frame['policy']
+    if len(policy_values) != 12 or not all(math.isfinite(v) for v in policy_values):
+      raise RuntimeError('invalid policy inputs')
+    deadline_ns = (frame['copy_started_ns'] + int(self.deadline_ms * 1e6)) if self.active else None
+    result = self.client.infer(pixels, POLICY_INPUTS.pack(*policy_values), frame_id=self.sequence,
+                               capture_ns=capture, reset=reset, deadline_ns=deadline_ns)
+    finished_ns = time.monotonic_ns()
+    copy_to_output_ms = (finished_ns - frame['copy_started_ns']) / 1e6
+    capture_to_output_ms = (finished_ns - capture) / 1e6
+    late = copy_to_output_ms > self.deadline_ms or capture_to_output_ms > self.max_capture_age_ms
+    was_active = self.active
+    self.context_frames += 1
+    self.good_frames = self.good_frames + 1 if not late else 0
+    qualified = self.context_frames >= self.required and self.good_frames >= self.required
+    if qualified and not self.active:
+      self.ui.active()
+      self.active = True
+    big_curvature = float(np.frombuffer(result.output, dtype='<f4')[2062] / max(1.0, frame['v_ego']) ** 2)
+    comparable = qualified and not late and frame['v_ego'] >= 5.0
+    entry = {
+      'event': 'frame', 'cameraFrameId': frame_id, 'extraFrameId': frame['extra_frame_id'],
+      'sequence': self.sequence, 'epoch': self.epoch, 'captureNs': capture,
+      'vEgo': frame['v_ego'], 'copyToOutputMs': copy_to_output_ms, 'captureToOutputMs': capture_to_output_ms,
+      'localModelMs': (frame['local_published_ns'] - frame['model_started_ns']) / 1e6,
+      'readbackMs': frame['readback_ms'], 'snapshotMs': (frame['queued_ns'] - frame['copy_started_ns']) / 1e6,
+      'queueWaitMs': (now - frame['queued_ns']) / 1e6,
+      'roundTripMs': result.round_trip_ms, 'inferenceMs': result.inference_ms,
+      'deadlineMiss': late, 'qualified': qualified, 'comparable': comparable,
+      'localDesiredCurvature': frame['local_curvature'], 'bigRawDesiredCurvature': big_curvature,
+      'curvatureDifference': big_curvature - frame['local_curvature'] if comparable else None,
+      'missingFrames': missing, 'producerDrops': frame.get('producer_busy_drops', 0),
+    }
+    self.log.write(entry)
+    self.ui.heartbeat()
+    self.sequence += 1
+    self.previous = frame_id, capture
+    if late and was_active:
+      raise RuntimeError(f'shadow deadline missed: copy={copy_to_output_ms:.2f}ms capture={capture_to_output_ms:.2f}ms')
+    return entry
 
-  @classmethod
-  def from_params(cls, params):
-    if not params.get_bool('MacAcceleratorShadowEnabled'):
-      return None
-    host = params.get('MacAcceleratorHost')
-    if not host:
-      worker = cls('')
-      worker.fail('MacAcceleratorHost is not configured')
-      return worker
-    return cls(
-      host,
-      port=params.get('MacAcceleratorPort', return_default=True),
-      deadline_ms=params.get('MacAcceleratorDeadlineMs', return_default=True),
-      expected_model_sha256=params.get('MacAcceleratorExpectedModelSHA256'),
-    )
-
-  def start(self) -> None:
-    if self.failed_reason is not None or self.thread is not None:
-      return
-    self.ui_state.loading()
-    self.thread = threading.Thread(target=self._run, name='mac-accelerator-shadow', daemon=True)
-    self.thread.start()
-
-  def stop(self) -> None:
-    self.stop_event.set()
-    if self.thread is not None:
-      self.thread.join(timeout=2.0)
-
-  def fail(self, reason: str) -> None:
-    if self.failed_reason is None:
-      self.failed_reason = reason
-      print(f'Mac accelerator live shadow failed: {reason}', file=sys.stderr, flush=True)
-      self.ui_state.failed()
-
-  def enqueue(self, warped_tensor: Any, *, camera_frame_id: int, capture_ns: int,
-              v_ego: float, numpy_inputs: dict[str, np.ndarray], desire_key: str) -> bool:
-    if self.failed_reason is not None:
-      return False
-    warp_started_ns = time.monotonic_ns()
+  def fail(self, reason: str, frame_id=None):
+    self.failed = True
     try:
-      warped_array = np.asarray(warped_tensor.numpy())
-      if warped_array.shape != WARPED_SHAPE or warped_array.dtype != np.uint8 or warped_array.nbytes != WARPED_BYTES:
-        raise ValueError(f'invalid live warp: shape={warped_array.shape} dtype={warped_array.dtype}')
-      frame = ShadowFrame(
-        camera_frame_id=camera_frame_id,
-        capture_ns=capture_ns,
-        warp_started_ns=warp_started_ns,
-        queued_ns=time.monotonic_ns(),
-        v_ego=v_ego,
-        warped=warped_array.tobytes(),
-        policy=pack_policy_inputs(numpy_inputs, desire_key),
-      )
-    except Exception as error:
-      self.fail(f'live warp capture failed: {type(error).__name__}: {error}')
-      return False
-
+      self.log.write({'event': 'failure', 'error': reason, 'cameraFrameId': frame_id, 'completed': self.sequence})
+    except Exception:
+      pass
     try:
-      self.queue.put_nowait(frame)
-    except Full:
-      try:
-        self.queue.get_nowait()
-      except Empty:
-        pass
-      self.dropped += 1
-      try:
-        self.queue.put_nowait(frame)
-      except Full:
-        self.dropped += 1
-        return False
-    self.enqueued += 1
-    return True
-
-  def record_local_action(self, camera_frame_id: int, desired_curvature: float) -> None:
-    with self.local_lock:
-      self.local_actions[camera_frame_id] = desired_curvature
-      while len(self.local_actions) > 128:
-        self.local_actions.popitem(last=False)
-
-  def _take_local_action(self, camera_frame_id: int) -> float | None:
-    with self.local_lock:
-      return self.local_actions.pop(camera_frame_id, None)
-
-  def _make_client(self):
-    return self.client_factory(
-      self.host,
-      self.port,
-      deadline_ms=self.deadline_ms,
-      auth_key=read_auth_key(self.auth_key_path),
-      expected_model_sha256=self.expected_model_sha256,
-      expected_output_floats=18452,
-      expected_backend='COREML_ANE',
-      qualification_frames=self.qualification_frames,
-      qualification_timeout_ms=500.0,
-      compression='zstd-1',
-    )
-
-  @staticmethod
-  def _big_curvature(output: bytes | memoryview, output_slices: dict[str, tuple[int, int]], v_ego: float) -> float | None:
-    action_slice = output_slices.get('action')
-    if action_slice is None or action_slice[1] - action_slice[0] < 1:
-      return None
-    values = np.frombuffer(output, dtype='<f4')
-    return float(values[action_slice[0]] / max(1.0, v_ego) ** 2)
-
-  def _run(self) -> None:
-    client = None
-    log_file = None
-    try:
-      client = self._make_client()
-      identity = client.connect()
-      if 'action' not in identity.output_slices:
-        raise RuntimeError('accelerator identity does not publish the Big Model action slice')
-      self.ui_state.ready()
-      self.log_dir.mkdir(parents=True, exist_ok=True)
-      log_path = self.log_dir / f'live-{time.monotonic_ns()}.jsonl'
-      log_file = log_path.open('a', buffering=1)
-      sequence = 0
-      qualified = 0
-      active_published = False
-      while not self.stop_event.is_set():
-        try:
-          frame = self.queue.get(timeout=0.25)
-        except Empty:
-          continue
-        infer_started_ns = time.monotonic_ns()
-        result = client.infer(frame.warped, frame.policy, frame_id=sequence,
-                              capture_ns=frame.capture_ns, reset=sequence == 0)
-        completed_ns = time.monotonic_ns()
-        warp_to_output_ms = (completed_ns - frame.warp_started_ns) / 1e6
-        deadline_missed = warp_to_output_ms > self.deadline_ms
-        if deadline_missed:
-          qualified = 0
-        else:
-          qualified += 1
-        if deadline_missed and active_published:
-          client.fallback.fail(sequence, f'warp-to-output deadline missed: {warp_to_output_ms:.2f} ms')
-          raise RuntimeError(client.fallback.failure_reason)
-        if (not active_published and client.fallback.state is AcceleratorState.ACTIVE and
-            qualified >= self.qualification_frames):
-          self.ui_state.active()
-          active_published = True
-        big_curvature = self._big_curvature(result.output, identity.output_slices, frame.v_ego)
-        local_curvature = self._take_local_action(frame.camera_frame_id)
-        entry = {
-          'cameraFrameId': frame.camera_frame_id,
-          'sequence': sequence,
-          'captureNs': frame.capture_ns,
-          'vEgo': frame.v_ego,
-          'warpCopyMs': (frame.queued_ns - frame.warp_started_ns) / 1e6,
-          'queueWaitMs': (infer_started_ns - frame.queued_ns) / 1e6,
-          'roundTripMs': result.round_trip_ms,
-          'inferenceMs': result.inference_ms,
-          'warpToOutputMs': warp_to_output_ms,
-          'deadlineMiss': deadline_missed,
-          'localDesiredCurvature': local_curvature,
-          'bigDesiredCurvature': big_curvature,
-          'curvatureDifference': (big_curvature - local_curvature
-                                  if big_curvature is not None and local_curvature is not None else None),
-          'producerDrops': self.dropped,
-        }
-        log_file.write(json.dumps(entry, separators=(',', ':')) + '\n')
-        sequence += 1
-        self.completed += 1
-    except Exception as error:
-      if log_file is not None:
-        log_file.write(json.dumps({'error': f'{type(error).__name__}: {error}',
-                                   'completed': self.completed, 'producerDrops': self.dropped},
-                                  separators=(',', ':')) + '\n')
-      self.fail(f'{type(error).__name__}: {error}')
+      self.ui.failed()
     finally:
-      if client is not None:
-        client.close()
-      if log_file is not None:
-        log_file.close()
+      self.client.close()
+
+
+def run(mailbox: FrameMailbox, config: dict, parent_pid: int):
+  ui = make_ui_state(config.get('publish_ui', True))
+  log = client = session = None
+  last_sequence = 0
+  started = last_frame_time = time.monotonic()
+  current_frame = None
+  try:
+    ui.loading()
+    directory = Path(config.get('log_dir', LOG_DIR))
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    used = sum(p.stat().st_size for p in directory.glob('live-*.jsonl'))
+    if used >= 256 * 1024 * 1024:
+      raise OSError('shadow log directory limit reached; archive logs before restarting')
+    log = JsonLog(directory / f'live-{time.monotonic_ns()}.jsonl')
+    while os.getppid() == parent_pid:
+      packet = mailbox.receive(last_sequence)
+      if packet is None:
+        ui.heartbeat()
+        if session is not None and time.monotonic() - last_frame_time > 0.5:
+          raise TimeoutError('no camera frames for 500ms')
+        if session is None and time.monotonic() - started > 15:
+          raise TimeoutError('no first camera frame within 15s')
+        time.sleep(0.002)
+        continue
+      last_sequence, current_frame, pixels = packet
+      last_frame_time = time.monotonic()
+      if session is None:
+        key = read_auth_key(Path(config.get('auth_key_path', AUTH_KEY_PATH)))
+        expected_hash = config['expected_model_sha256']
+        if len(expected_hash) != 64 or any(c not in '0123456789abcdef' for c in expected_hash):
+          raise ValueError('a pinned Big Model SHA-256 is required')
+        client = AcceleratorClient(config['host'], config.get('port', 8066), auth_key=key,
+                                   expected_model_sha256=expected_hash, expected_backend='COREML_ANE',
+                                   expected_output_floats=18452, deadline_ms=config.get('deadline_ms', 55.0),
+                                   qualification_frames=66, qualification_timeout_ms=500, compression='zstd-1')
+        identity = client.connect(timeout=2)
+        session = ShadowSession(client, identity, ui, log, deadline_ms=config.get('deadline_ms', 55.0))
+        if newer := mailbox.receive(last_sequence):
+          last_sequence, current_frame, pixels = newer
+      session.process(current_frame, pixels)
+  except Exception as error:
+    reason = f'{type(error).__name__}: {error}'
+    if session is not None:
+      session.fail(reason, current_frame.get('camera_frame_id') if current_frame else None)
+    else:
+      try:
+        if log is not None:
+          log.write({'event': 'failure', 'error': reason})
+      except Exception:
+        pass
+      finally:
+        ui.failed()
+    return 1
+  finally:
+    if client is not None:
+      client.close()
+    if log is not None:
+      log.close()
+  ui.disconnected()
+  return 0
+
+
+def main():
+  parser = argparse.ArgumentParser()
+  parser.add_argument('--mailbox', type=Path, required=True)
+  parser.add_argument('--config', required=True)
+  parser.add_argument('--parent-pid', type=int, required=True)
+  args = parser.parse_args()
+  mailbox = FrameMailbox(args.mailbox)
+  try:
+    raise SystemExit(run(mailbox, json.loads(args.config), args.parent_pid))
+  finally:
+    mailbox.close()
+
+
+if __name__ == '__main__':
+  main()

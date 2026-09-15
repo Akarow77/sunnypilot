@@ -6,9 +6,11 @@ import struct
 import threading
 import time
 import unittest
+from unittest.mock import Mock
+from pathlib import Path
 
 from accelerator_client import AcceleratorClient, AcceleratorIdentity
-from accelerator_protocol import (authenticate_payload, canonical_json, make_auth,
+from accelerator_protocol import (authenticate_payload, canonical_json, make_auth, read_auth_key,
                                   server_handshake, verify_payload)
 from fallback import AcceleratorState
 from transport import (DEVICE_TYPE, HELLO, HELLO_RESPONSE, POLICY_INPUTS, REQUEST,
@@ -32,6 +34,16 @@ def identity() -> dict:
 
 
 class AcceleratorProtocolTest(unittest.TestCase):
+  def test_binary_key_preserves_whitespace_bytes(self):
+    path = Mock(spec=Path)
+    path.read_bytes.return_value = b'\n' + b'k' * 30 + b' '
+    self.assertEqual(read_auth_key(path), path.read_bytes.return_value)
+
+  def test_nonfinite_deadline_rejected(self):
+    for value in (float('nan'), float('inf')):
+      with self.assertRaises(ValueError):
+        AcceleratorClient('::1', deadline_ms=value)
+
   def test_payload_authentication_rejects_tampering(self) -> None:
     key = b'k' * 32
     wire = authenticate_payload(key, REQUEST, 1, 7, 9, 11, b'payload')

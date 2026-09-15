@@ -3,7 +3,8 @@
 This directory contains a bench-only prototype for using an Apple Silicon Mac as a
 sunnypilot inference worker. It targets the comma 3X and the standard 20 Hz driving
 model. It includes Metal and Core ML/ANE workers, authenticated and checksummed
-USB-NCM transport, lossless Zstd requests, and a dependency-free 3X client.
+USB-NCM transport and lossless Zstd requests. Live Big Model shadow uses NumPy on
+the 3X; the framing layer itself has only standard-library dependencies.
 
 Do not use this experiment to control a vehicle. Live camera/modeld integration is
 implemented only as a non-controlling shadow, and the sustained deadline requirement
@@ -112,13 +113,30 @@ Mac app running, configure the authenticated USB endpoint and persistent 3X key:
 tools/mac_accelerator/enable_live_shadow.sh
 ```
 
-On the next on-road transition, `modeld_tinygrad` copies its already-computed warp
-into a size-one latest-frame queue. A daemon thread sends it to the Mac while the
-local TSFM model remains the sole publisher of `modelV2` and the sole control source.
-The shadow thread never publishes remote output. A malformed response, disconnect,
-or warp-to-output deadline miss latches the Mac icon orange without interrupting the
-local model. Initial cold frames remain in loading state until 20 consecutive
-warp-to-output results meet the configured deadline.
+On the next on-road transition, `modeld_tinygrad` takes a snapshot of its computed
+warp **after all local model messages are published**. A bounded, nonblocking mmap
+mailbox feeds a separate process, which drops inherited Linux realtime scheduling
+before importing inference, compression, networking, and logging code. The local
+TSFM model remains the sole publisher of control-related model messages.
+
+The shadow process never publishes remote output. A malformed response, disconnect,
+or active copy-to-output deadline miss stops the shadow session. Initial cold
+frames remain in loading state until at least 66 contiguous frames have populated
+the Big Model temporal context and 66 consecutive results meet both timing limits.
+Missing camera frames reset recurrent queues and readiness; duplicate/backward,
+stale, uncalibrated, or unsynchronized inputs fail the session.
+
+**The GPU-to-host readback is still synchronous.** A 2 ms snapshot budget disables
+future snapshots after an overrun; it cannot prevent or undo the first slow copy.
+Moving this work after publication and isolating the worker does not prove zero
+impact on the next local frame. This revised integration has not been tested or
+installed on the disconnected 3X. Real-device A/B timing remains required.
+
+The worker connects only when the first frame arrives, detects a 500 ms source
+stall, and emits a heartbeat at most four times per second. The UI rejects missing,
+future, or more-than-two-second-old heartbeats. Logs stop at 32 MiB per session;
+startup refuses a directory already at 256 MiB (existing logs are not deleted).
+These are diagnostic thresholds, not a vehicle-control safety specification.
 
 Per-frame timing and local-versus-Big curvature are written on the 3X under
 `/data/media/0/mac_accelerator_shadow/live-*.jsonl`. After a run, copy a log and run:
@@ -126,6 +144,12 @@ Per-frame timing and local-versus-Big curvature are written on the 3X under
 ```bash
 .venv/bin/python tools/mac_accelerator/summarize_live_shadow.py /path/to/live-log.jsonl
 ```
+
+`copyToOutputMs` includes snapshot, queue, compression, transfer, inference, and
+validation. `captureToOutputMs` additionally includes time since camera EOF; it is
+not the same as sensor exposure latency. Only qualified frames above 5 m/s enter
+the curvature summary. This compares raw Big Model curvature with the local
+postprocessed action: difference is not an accuracy score or proof of superiority.
 
 Disable the next run only while off-road:
 
@@ -146,6 +170,29 @@ The app creates a mode-0600 shared key under the user's Application Support
 directory, keeps the Mac awake, limits auxiliary math-library threads, and starts
 the Core ML/ANE worker. It shows server and authenticated 3X connection status but
 does not publish vehicle-control outputs.
+
+The app requires macOS 15 or newer for the converted model. Select **Mac-only test
+(localhost, no 3X)** before Start to avoid ADB/USB setup. Server Ready / Client
+connected are service states, not driving readiness or a latency qualification.
+
+For an end-to-end Mac-only test including the independent shadow process:
+
+```bash
+.coreml-venv/bin/python tools/mac_accelerator/local_shadow_benchmark.py \
+  --frames 300 --output-dir tools/mac_accelerator/artifacts/local-test-001
+```
+
+Use a new output directory each run. `--drop-at 100` injects a missing camera
+frame; `--stall-at 220` pauses the producer for 700 ms; `--disconnect-at 100`
+terminates the test server. Failure injections intentionally exit nonzero and must
+be checked against the recorded reason. Synthetic camera timestamps and curvature
+cannot validate a real driving model. Exit zero indicates plumbing completed;
+`sustainedDeadlinePass` separately records strict deadline completion/readiness.
+
+The current handshake hashes the source ONNX, not the converted Core ML package.
+It authenticates the peer's source-model declaration, **not conversion provenance**.
+Do not replace the package independently of its source/metadata; reproducible
+artifact provenance and longer numerical validation remain outstanding.
 
 To test the hypothesis that other Mac workloads caused latency spikes, quit heavy
 applications and run the paced five-minute qualification:
@@ -217,8 +264,10 @@ separate cold-start timeout but requires consecutive in-deadline frames before t
 accelerator becomes ready. Any active failure is latched until reset.
 
 The live stage reuses the separated Tinygrad warp without running a second QCOM warp
-and measures the complete warp-copy-to-output path. The local model remains the only
-control source while the worker is late, warming up, disconnected, or invalid.
+and measures copy-to-output plus camera-EOF-to-output timing. The local model remains
+the only control source while the worker is late, warming up, disconnected, or
+invalid. Shared CPU, memory bandwidth, and synchronous readback effects still need
+real-device qualification.
 
 When the comma-side test is running, `MacAccelerator*` parameters map its state to
 the existing Chestnut icons: loading pulses, ready/active is green, and a latched

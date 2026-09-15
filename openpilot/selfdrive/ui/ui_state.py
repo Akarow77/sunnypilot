@@ -14,7 +14,7 @@ from openpilot.system.ui.lib.application import gui_app
 from openpilot.common.hardware import HARDWARE, PC
 from openpilot.common.hardware.usb import TYPEC_CC_ORIENTATION_PATH, get_usb_state, is_chestnut_usb_id, read_int
 from openpilot.selfdrive.modeld.helpers import chestnut_compiled
-from openpilot.selfdrive.ui.mac_accelerator_state import mac_accelerator_state
+from openpilot.selfdrive.ui.mac_accelerator_state import mac_accelerator_heartbeat_fresh, mac_accelerator_state
 
 from openpilot.selfdrive.ui.sunnypilot.ui_state import UIStateSP, DeviceSP
 
@@ -282,6 +282,10 @@ class UIState(UIStateSP):
     self.mac_accelerator_present = self.params.get_bool("MacAcceleratorPresent")
     self.mac_accelerator_ready = self.params.get_bool("MacAcceleratorReady")
     now = time.monotonic()
+    heartbeat = self.params.get('MacAcceleratorHeartbeat')
+    if self.mac_accelerator_present and not mac_accelerator_heartbeat_fresh(heartbeat, now):
+      self.mac_accelerator_active = self.mac_accelerator_ready = self.mac_accelerator_loading = False
+      self.mac_accelerator_model_error = True
     if read_int(TYPEC_CC_ORIENTATION_PATH) != 0:
       self.usb_disconnected_ts = None
       if not self.usb_connected:

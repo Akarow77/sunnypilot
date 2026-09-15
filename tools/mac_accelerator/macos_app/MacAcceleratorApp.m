@@ -9,6 +9,8 @@
 @property(nonatomic, strong) NSTextView *logView;
 @property(nonatomic, strong) NSButton *startButton;
 @property(nonatomic, strong) NSButton *stopButton;
+@property(nonatomic, strong) NSButton *localTestButton;
+@property(nonatomic, strong) NSMutableString *pendingServerOutput;
 @property(nonatomic, strong) NSTask *serverTask;
 @property(nonatomic, strong) NSPipe *outputPipe;
 @property(nonatomic) BOOL userRequestedStop;
@@ -18,10 +20,12 @@
 
 - (NSString *)inferredRepositoryPath {
   NSURL *location = NSBundle.mainBundle.bundleURL;
-  for (NSInteger index = 0; index < 4; index++) {
+  for (NSInteger index = 0; index < 8; index++) {
     location = location.URLByDeletingLastPathComponent;
+    NSString *script = [location.path stringByAppendingPathComponent:@"tools/mac_accelerator/run_coreml_server.sh"];
+    if ([NSFileManager.defaultManager fileExistsAtPath:script]) return location.path;
   }
-  return location.path;
+  return @"";
 }
 
 - (NSString *)keyPath {
@@ -101,6 +105,11 @@
   scroll.documentView = self.logView;
   [view addSubview:scroll];
 
+  self.localTestButton = [NSButton checkboxWithTitle:@"Mac-only test (localhost, no 3X)" target:nil action:nil];
+  self.localTestButton.frame = NSMakeRect(20, 325, 360, 22);
+  [view addSubview:self.localTestButton];
+  scroll.frame = NSMakeRect(20, 55, 740, 265);
+
   NSTextField *warning = [self label:@"Safety: this app does not publish vehicle-control outputs. Keep the local model active and test off-road first."
                                   frame:NSMakeRect(20, 18, 740, 24) size:12];
   warning.textColor = NSColor.systemOrangeColor;
@@ -111,9 +120,11 @@
 
 - (void)setStatus:(NSString *)status running:(BOOL)running {
   self.statusLabel.stringValue = [NSString stringWithFormat:@"%@  %@", running ? @"●" : @"○", status];
-  self.statusLabel.textColor = running ? NSColor.systemGreenColor : NSColor.labelColor;
+  BOOL ready = [status isEqualToString:@"Ready"] || [status isEqualToString:@"Client connected"];
+  self.statusLabel.textColor = ready ? NSColor.systemGreenColor : NSColor.labelColor;
   self.startButton.enabled = !running;
   self.stopButton.enabled = running;
+  self.localTestButton.enabled = !running;
 }
 
 - (void)appendLog:(NSString *)message {
@@ -124,16 +135,42 @@
     self.logView.string = [self.logView.string substringFromIndex:self.logView.string.length - 40000];
   }
   [self.logView scrollRangeToVisible:NSMakeRange(self.logView.string.length, 0)];
-  if ([message containsString:@"ready:"]) [self setStatus:@"Ready" running:YES];
-  if ([message containsString:@"verified client connected"]) [self setStatus:@"3X connected" running:YES];
+  if ([message hasPrefix:@"listening on "]) [self setStatus:@"Ready" running:YES];
+  if ([message hasPrefix:@"verified client connected:"]) [self setStatus:@"Client connected" running:YES];
+  if ([message hasPrefix:@"client disconnected:"]) [self setStatus:@"Ready" running:YES];
+}
+
+- (void)consumeServerOutput:(NSString *)text {
+  if (!text) return;
+  [self.pendingServerOutput appendString:text];
+  NSRange newline;
+  while ((newline = [self.pendingServerOutput rangeOfString:@"\n"]).location != NSNotFound) {
+    NSString *line = [self.pendingServerOutput substringToIndex:newline.location];
+    [self.pendingServerOutput deleteCharactersInRange:NSMakeRange(0, newline.location + 1)];
+    [self appendLog:line];
+  }
 }
 
 - (BOOL)ensureAuthenticationKey:(NSError **)error {
   NSString *keyPath = self.keyPath;
-  if ([NSFileManager.defaultManager fileExistsAtPath:keyPath]) return YES;
+  if ([NSFileManager.defaultManager fileExistsAtPath:keyPath]) {
+    NSData *key = [NSData dataWithContentsOfFile:keyPath options:0 error:error];
+    if (!key) return NO;
+    if (key.length < 32 || chmod(keyPath.fileSystemRepresentation, 0600) != 0) {
+      if (error) *error = [NSError errorWithDomain:@"MacAccelerator" code:2
+        userInfo:@{NSLocalizedDescriptionKey: @"Authentication key is invalid or cannot be secured"}];
+      return NO;
+    }
+    return YES;
+  }
   NSString *directory = keyPath.stringByDeletingLastPathComponent;
   if (![NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:YES
-                                                attributes:nil error:error]) return NO;
+                                                attributes:@{NSFilePosixPermissions: @0700} error:error]) return NO;
+  if (chmod(directory.fileSystemRepresentation, 0700) != 0) {
+    if (error) *error = [NSError errorWithDomain:@"MacAccelerator" code:3
+      userInfo:@{NSLocalizedDescriptionKey: @"Cannot secure authentication directory"}];
+    return NO;
+  }
   NSMutableData *key = [NSMutableData dataWithLength:32];
   if (SecRandomCopyBytes(kSecRandomDefault, key.length, key.mutableBytes) != errSecSuccess) {
     if (error) *error = [NSError errorWithDomain:@"MacAccelerator" code:1
@@ -141,7 +178,11 @@
     return NO;
   }
   if (![key writeToFile:keyPath options:NSDataWritingAtomic error:error]) return NO;
-  chmod(keyPath.fileSystemRepresentation, 0600);
+  if (chmod(keyPath.fileSystemRepresentation, 0600) != 0) {
+    if (error) *error = [NSError errorWithDomain:@"MacAccelerator" code:4
+      userInfo:@{NSLocalizedDescriptionKey: @"Cannot secure new authentication key"}];
+    return NO;
+  }
   [self appendLog:@"Created a private 32-byte authentication key"];
   return YES;
 }
@@ -190,16 +231,18 @@
   environment[@"PYTHONUNBUFFERED"] = @"1";
   environment[@"VECLIB_MAXIMUM_THREADS"] = @"1";
   environment[@"OPENBLAS_NUM_THREADS"] = @"1";
+  environment[@"MAC_ACCELERATOR_LOCAL_TEST"] = self.localTestButton.state == NSControlStateValueOn ? @"1" : @"0";
   task.environment = environment;
   NSPipe *pipe = NSPipe.pipe;
   task.standardOutput = pipe;
   task.standardError = pipe;
   __weak typeof(self) weakSelf = self;
+  self.pendingServerOutput = [NSMutableString string];
   pipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *handle) {
     NSData *data = handle.availableData;
     if (data.length == 0) return;
     NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf appendLog:[text stringByTrimmingCharactersInSet:NSCharacterSet.newlineCharacterSet]]; });
+    dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf consumeServerOutput:text]; });
   };
   task.terminationHandler = ^(NSTask *finished) {
     dispatch_async(dispatch_get_main_queue(), ^{

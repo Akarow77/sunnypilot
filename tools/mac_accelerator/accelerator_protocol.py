@@ -26,7 +26,7 @@ def canonical_json(value: dict[str, Any]) -> bytes:
 def read_auth_key(path: Path | None) -> bytes | None:
   if path is None:
     return None
-  key = path.read_bytes().strip()
+  key = path.read_bytes()
   if len(key) < 32:
     raise ValueError('accelerator authentication key must contain at least 32 bytes')
   return key
@@ -64,7 +64,7 @@ def server_handshake(conn: socket.socket, identity: dict, auth_key: bytes | None
     hello = json.loads(payload)
   except (UnicodeDecodeError, json.JSONDecodeError) as error:
     raise ProtocolError(f'invalid hello JSON: {error}') from error
-  if hello.get('client') != 'comma3x' or hello.get('protocol') != VERSION:
+  if not isinstance(hello, dict) or hello.get('client') != 'comma3x' or hello.get('protocol') != VERSION:
     raise ProtocolError('unsupported client hello')
   nonce = hello.get('nonce')
   if not isinstance(nonce, str) or len(nonce) != 64:

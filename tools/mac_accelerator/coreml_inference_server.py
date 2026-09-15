@@ -94,10 +94,11 @@ class CoreMLPolicySession:
     return output.astype(self.output_dtype, copy=False).tobytes()
 
 
-def make_identity(metadata: dict, model_sha256: str) -> dict:
+def make_identity(metadata: dict, model_sha256: str, frame_skip: int = 2) -> dict:
   return {
     'authentication_required': False,
     'backend': BACKEND,
+    'frame_skip': frame_skip,
     'compressions': [ZstdCodec.name],
     'device_type': DEVICE_TYPE,
     'input_shapes': {name: list(shape) for name, shape in metadata['input_shapes'].items()},
@@ -125,6 +126,7 @@ def serve_client(conn: socket.socket, peer, model: ct.models.MLModel, metadata: 
   last_frame = -1
   print(f'verified client connected: {peer}', flush=True)
   while True:
+    conn.settimeout(timeout)
     flags, session_id, frame_id, capture_ns, payload = recv_message(conn, REQUEST)
     received_ns = time.monotonic_ns()
     if session_id != active_session:
@@ -172,7 +174,8 @@ def main() -> None:
   parser.add_argument('--frame-skip', type=int, default=2)
   parser.add_argument('--slow-log-ms', type=float, default=40.0)
   args = parser.parse_args()
-  if args.startup_warmup < 1 or args.frame_skip < 1 or args.slow_log_ms <= 0:
+  if (args.startup_warmup < 1 or args.frame_skip < 1 or not math.isfinite(args.slow_log_ms) or args.slow_log_ms <= 0
+      or not math.isfinite(args.timeout) or args.timeout <= 0 or not 1 <= args.port <= 65535):
     parser.error('startup warmup, frame skip, and slow log threshold must be positive')
   for path in (args.model, args.metadata, args.onnx):
     if not path.exists():
@@ -181,7 +184,7 @@ def main() -> None:
   with args.metadata.open('rb') as metadata_file:
     metadata = pickle.load(metadata_file)
   model_sha256 = sha256_file(args.onnx)
-  identity = make_identity(metadata, model_sha256)
+  identity = make_identity(metadata, model_sha256, args.frame_skip)
   auth_key = read_auth_key(args.auth_key_file)
   qos_enabled = configure_user_interactive_qos()
   model = ct.models.MLModel(str(args.model), compute_units=ct.ComputeUnit.CPU_AND_NE)
@@ -209,7 +212,7 @@ def main() -> None:
         try:
           serve_client(conn, peer, model, metadata, output_name, args.frame_skip,
                        identity, auth_key, args.timeout, args.slow_log_ms)
-        except (EOFError, OSError, ProtocolError) as error:
+        except (EOFError, OSError, ProtocolError, RuntimeError, ValueError) as error:
           print(f'client disconnected: {error}', flush=True)
 
 

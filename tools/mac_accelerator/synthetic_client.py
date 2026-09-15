@@ -88,7 +88,6 @@ def main() -> None:
   except Exception:
     ui_state.failed()
     raise
-  ui_state.ready()
   print(f'accelerator={identity.device_type} backend={identity.backend} checkpoint={identity.model_checkpoint}')
   failed = False
   try:
@@ -100,6 +99,9 @@ def main() -> None:
       capture_ns = time.monotonic_ns()
       attempted += int(frame_id >= args.warmup_frames)
       result = client.infer(warped, policy, frame_id=frame_id, capture_ns=capture_ns, reset=frame_id == 0)
+      ui_state.heartbeat()
+      if client.fallback.state.value == 'active' and frame_id == args.qualification_frames - 1:
+        ui_state.active()
       if frame_id >= args.warmup_frames:
         if client.fallback.state.value != 'active':
           raise RuntimeError('accelerator did not pass warm-up qualification')

@@ -78,6 +78,7 @@ def serve_client(conn: socket.socket, peer, artifact: dict, identity: dict,
   last_frame = -1
   print(f"verified client connected: {peer}", flush=True)
   while True:
+    conn.settimeout(timeout)
     flags, session_id, frame_id, capture_ns, payload = recv_message(conn, REQUEST)
     received_ns = time.monotonic_ns()
     if session_id != active_session:

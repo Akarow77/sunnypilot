@@ -7,7 +7,7 @@ See the LICENSE.md file in the root directory for more details.
 """
 
 from collections.abc import Callable
-from functools import partial
+import atexit
 import os
 os.environ['GMMU'] = '0'
 import numpy as np
@@ -217,8 +217,8 @@ class ModelState(ModelStateBase):
 
   def run(self, bufs: dict[str, VisionBuf], transforms: dict[str, np.ndarray],
           inputs: dict[str, np.ndarray],
-          after_enqueue: Callable[[], None] | None = None,
-          after_warp: Callable[[Tensor], None] | None = None) -> dict[str, np.ndarray] | None:
+          after_enqueue: Callable[[], None] | None = None) -> dict[str, np.ndarray] | None:
+    self.shadow_warp = None
     if self.is_run_model:
       for key, buf in bufs.items():
         data = buf.data if hasattr(buf, 'data') else buf
@@ -249,8 +249,7 @@ class ModelState(ModelStateBase):
     else:
       assert self.warp is not None and self.run_policy is not None
       warped = self.warp(**{k: self.input_queues[k] for k in WARP_INPUTS}, frame=self.full_frames[self._road_key], big_frame=self.full_frames[self._wide_key])
-      if after_warp is not None:
-        after_warp(warped)
+      self.shadow_warp = warped
       raw_outputs = self.run_policy(**{k: self.input_queues[k] for k in POLICY_INPUTS if k in self.input_queues}, warped=warped)
 
     if after_enqueue is not None:
@@ -333,21 +332,6 @@ def main(demo=False):
     os.environ['HCQDEV_WAIT_TIMEOUT_MS'] = '3000'
 
   params = Params()
-  shadow = None
-  if params.get_bool('MacAcceleratorShadowEnabled'):
-    try:
-      import sys
-      from openpilot.common.basedir import BASEDIR
-      accelerator_path = os.path.join(BASEDIR, 'tools', 'mac_accelerator')
-      if accelerator_path not in sys.path:
-        sys.path.insert(0, accelerator_path)
-      from live_shadow import LiveShadowWorker
-      shadow = LiveShadowWorker.from_params(params)
-      if shadow is not None:
-        shadow.start()
-    except Exception:
-      cloudlog.exception('Mac accelerator shadow failed to initialize')
-      params.put_bool('MacAcceleratorModelError', True)
   params.put_bool("ChestnutLoading", CHESTNUT)
   params.remove("ChestnutActive")
 
@@ -401,9 +385,6 @@ def main(demo=False):
   small_model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, chestnut=False) if model is None or CHESTNUT else None
   if model is None:
     model = small_model
-  if shadow is not None and model.is_run_model:
-    shadow.fail('active model bundle combines warp and policy; live warp capture is unavailable')
-    shadow = None
   params.put_bool("ChestnutLoading", False)
   assert model is not None
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
@@ -444,6 +425,31 @@ def main(demo=False):
   DH = DesireHelper()
   meta_constants = load_meta_constants()
   RELC = RoadEdgeLaneChangeController()
+
+  shadow = None
+  if params.get_bool('MacAcceleratorShadowEnabled'):
+    try:
+      import sys
+      from openpilot.common.basedir import BASEDIR
+      accelerator_path = os.path.join(BASEDIR, 'tools', 'mac_accelerator')
+      if accelerator_path not in sys.path:
+        sys.path.insert(0, accelerator_path)
+      from shadow_ipc import ShadowPublisher
+      if model.is_run_model or model.chestnut or 'action_t' not in model.numpy_inputs:
+        raise ValueError('shadow requires a separated local warp/policy bundle with action_t')
+      shadow = ShadowPublisher({
+        'host': params.get('MacAcceleratorHost'),
+        'port': params.get('MacAcceleratorPort', return_default=True),
+        'deadline_ms': params.get('MacAcceleratorDeadlineMs', return_default=True),
+        'expected_model_sha256': params.get('MacAcceleratorExpectedModelSHA256'),
+      })
+      atexit.register(shadow.close)
+      shadow.start()
+    except Exception:
+      cloudlog.exception('Mac accelerator shadow initialization failed')
+      shadow = None
+      params.put_bool('MacAcceleratorPresent', True)
+      params.put_bool('MacAcceleratorModelError', True)
 
   while True:
     # Keep receiving frames until we are at least 1 frame ahead of previous extra frame
@@ -533,16 +539,12 @@ def main(demo=False):
     if 'action_t' in model.numpy_inputs:
       inputs['action_t'] = np.array([lat_action_t, long_action_t], dtype=np.float32)
 
+    model_started_ns = time.monotonic_ns()
     mt1 = time.perf_counter()
     try:
       send_chestnut = (chestnut_state is not None and
                        run_count % round(model.constants.MODEL_FREQ / SERVICE_LIST['chestnutState'].frequency) == 0)
-      after_warp = None
-      if shadow is not None:
-        after_warp = partial(shadow.enqueue, camera_frame_id=meta_main.frame_id,
-                             capture_ns=meta_main.timestamp_eof, v_ego=v_ego,
-                             numpy_inputs=model.numpy_inputs, desire_key=model.desire_key)
-      model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None, after_warp)
+      model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None)
     except Exception:
       if not params.get_bool("ChestnutActive"):
         raise
@@ -565,8 +567,6 @@ def main(demo=False):
       mdv2sp_send = messaging.new_message('modelDataV2SP')
 
       action = model.get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego)
-      if shadow is not None:
-        shadow.record_local_action(meta_main.frame_id, action.desiredCurvature)
       prev_action = action
       fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
@@ -591,6 +591,21 @@ def main(demo=False):
       pm.send('drivingModelData', drivingdata_send)
       pm.send('cameraOdometry', posenet_send)
       pm.send('modelDataV2SP', mdv2sp_send)
+      # Snapshot only AFTER every local output is published. The host readback
+      # remains synchronous; its effect on next-frame timing needs 3X validation.
+      if shadow is not None and not shadow.failed_reason and live_calib_seen and model.shadow_warp is not None:
+        try:
+          shadow.capture(
+            model.shadow_warp, camera_frame_id=meta_main.frame_id, extra_frame_id=meta_extra.frame_id,
+            capture_ns=meta_main.timestamp_eof, extra_capture_ns=meta_extra.timestamp_eof,
+            model_started_ns=model_started_ns, local_published_ns=time.monotonic_ns(),
+            calibrated=live_calib_seen, v_ego=v_ego, local_curvature=action.desiredCurvature,
+            policy=[*model.numpy_inputs[model.desire_key].reshape(-1).tolist(),
+                    *model.numpy_inputs['traffic_convention'].reshape(-1).tolist(),
+                    *model.numpy_inputs['action_t'].reshape(-1).tolist()],
+          )
+        except Exception as error:
+          shadow.fail(str(error))
     last_vipc_frame_id = meta_main.frame_id
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from coreml_inference_server import CoreMLPolicySession
+from benchmark_coreml import COMPUTE_UNITS
 from transport import POLICY_INPUTS, WARPED_SHAPE
 
 
@@ -51,6 +52,8 @@ def main() -> None:
   parser.add_argument('--torch-reference', type=Path, required=True)
   parser.add_argument('--metadata', type=Path, required=True)
   parser.add_argument('--samples', type=int, default=3)
+  parser.add_argument('--compute-unit', choices=COMPUTE_UNITS, default='cpu-and-ne',
+                      help='default matches the deployed Core ML worker')
   parser.add_argument('--warps', type=Path, help='optional .npy array shaped [frames,2,6,128,256]')
   parser.add_argument('--json-output', type=Path)
   args = parser.parse_args()
@@ -61,7 +64,7 @@ def main() -> None:
     metadata = pickle.load(metadata_file)
   expected_shape = tuple(metadata['output_shapes']['outputs'])
 
-  coreml_model = ct.models.MLModel(str(args.model), compute_units=ct.ComputeUnit.ALL)
+  coreml_model = ct.models.MLModel(str(args.model), compute_units=COMPUTE_UNITS[args.compute_unit])
   coreml_output_name = coreml_model.get_spec().description.output[0].name
   torch_model = torch.jit.load(args.torch_reference).eval().half()
   rng = np.random.default_rng(20260914)
@@ -95,6 +98,10 @@ def main() -> None:
     sample_reports.append(sample_report)
 
   report = {
+    'validationStatus': 'measurement-only; no numerical acceptance threshold established',
+    'computeUnit': args.compute_unit,
+    'inputSource': str(args.warps) if args.warps is not None else 'synthetic',
+    'reference': str(args.torch_reference),
     'max_abs': max(sample['max_abs'] for sample in sample_reports),
     'max_nrmse': max(sample['nrmse'] for sample in sample_reports),
     'field_maxima': {

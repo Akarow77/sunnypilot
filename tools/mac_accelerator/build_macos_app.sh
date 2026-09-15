@@ -9,7 +9,7 @@ CONTENTS="$APP/Contents"
 
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
 xcrun --sdk macosx clang -fobjc-arc -fmodules \
-  -fmodules-cache-path="$OUTPUT_DIR/ModuleCache" -O2 -mmacosx-version-min=13.0 \
+  -fmodules-cache-path="$OUTPUT_DIR/ModuleCache" -O2 -mmacosx-version-min=15.0 \
   "$SOURCE_DIR/MacAcceleratorApp.m" \
   -o "$CONTENTS/MacOS/SunnypilotMacAccelerator" \
   -framework Cocoa -framework Security

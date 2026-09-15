@@ -39,10 +39,6 @@ def video_frame_count(path: Path) -> int:
   return int(subprocess.check_output(command, text=True).strip())
 
 
-def route_key(route_dir: Path) -> str:
-  return route_dir.name.rsplit('--', 1)[0]
-
-
 def summarize(values: list[float]) -> dict[str, float]:
   return {
     'mean_ms': float(np.mean(values)),
@@ -144,7 +140,8 @@ def benchmark(route_dirs: list[Path], model_path: Path, metadata_path: Path,
   all_local_curvatures: list[float] = []
   all_big_lateral_actions: list[float] = []
   all_local_lateral_actions: list[float] = []
-  previous_key = None
+  previous_frame_id = None
+  context_frames = 0
   session = None
   comparison_started = False
   total_processed = 0
@@ -161,15 +158,17 @@ def benchmark(route_dirs: list[Path], model_path: Path, metadata_path: Path,
     camera = DEVICE_CAMERAS[(device_type, sensor)]
     narrow_transform = get_warp_matrix(calibration, camera.narrow_road.intrinsics, False).astype(np.float32)
     wide_transform = get_warp_matrix(calibration, camera.wide_road.intrinsics, True).astype(np.float32)
-    key = route_key(route_dir)
-    if key != previous_key:
+    # Segment names do not prove continuity or camera alignment. Reset at every
+    # segment until an explicit timestamp-aligned replay is implemented.
+    if session is None or route_reports:
       session = CoreMLPolicySession(model, metadata, output_name, frame_skip=2)
       zero_payload = bytes(WARPED_BYTES) + POLICY_INPUTS.pack(*([0.0] * 12))
       for _ in range(3):
         session.infer(zero_payload)
       session.reset()
       comparison_started = False
-      previous_key = key
+      previous_frame_id = None
+      context_frames = 0
     assert session is not None
     traffic = (0.0, 1.0) if is_rhd else (1.0, 0.0)
     lat_action_t = lateral_delay + FRAME_DELAY + ACTION_DELAY
@@ -177,6 +176,8 @@ def benchmark(route_dirs: list[Path], model_path: Path, metadata_path: Path,
     policy = POLICY_INPUTS.pack(*([0.0] * 8), *traffic, lat_action_t, long_action_t)
     available = min(video_frame_count(fcamera), video_frame_count(ecamera))
     count = available if frame_limit == 0 else min(available, frame_limit)
+    if len(encoded_frame_ids) < count:
+      raise RuntimeError('camera encode index is shorter than decoded replay; alignment is not established')
     route_warp_ms: list[float] = []
     route_inference_ms: list[float] = []
     route_compute_ms: list[float] = []
@@ -191,8 +192,15 @@ def benchmark(route_dirs: list[Path], model_path: Path, metadata_path: Path,
         copy_padded_nv12(narrow_decoder.read(), padded_narrow, width, height, stride, y_height, uv_height)
         copy_padded_nv12(wide_decoder.read(), padded_wide, width, height, stride, y_height, uv_height)
         frame_id = encoded_frame_ids[frame_index]
+        if previous_frame_id is not None:
+          if frame_id <= previous_frame_id:
+            raise RuntimeError('non-monotonic replay camera frame index')
+          if frame_id != previous_frame_id + 1:
+            session.reset()
+            context_frames = 0
         if not comparison_started and frame_id in model_actions:
           session.reset()
+          context_frames = 0
           comparison_started = True
         started_ns = time.monotonic_ns()
         warped, warp_ms = warp.run(padded_narrow, padded_wide, narrow_transform, wide_transform)
@@ -201,6 +209,8 @@ def benchmark(route_dirs: list[Path], model_path: Path, metadata_path: Path,
         completed_ns = time.monotonic_ns()
         inference_ms = (completed_ns - inference_started_ns) / 1e6
         compute_ms = (completed_ns - started_ns) / 1e6
+        context_frames += 1
+        previous_frame_id = frame_id
         values = np.frombuffer(output, dtype='<f2')
         if len(values) != output_floats or not np.all(np.isfinite(values)):
           raise RuntimeError(f'invalid model output at {route_dir.name} frame {frame_index}')
@@ -209,7 +219,7 @@ def benchmark(route_dirs: list[Path], model_path: Path, metadata_path: Path,
           reference = model_actions.get(frame_id)
           if reference is not None:
             v_ego, local_curvature, _, _ = reference
-            if v_ego >= 5.0:
+            if v_ego >= 5.0 and context_frames >= 66:
               speed_scale = max(1.0, v_ego) ** 2
               big_lateral_action = float(values[action_slice.start])
               route_big_curvatures.append(big_lateral_action / speed_scale)
@@ -226,6 +236,10 @@ def benchmark(route_dirs: list[Path], model_path: Path, metadata_path: Path,
     misses = sum(value > deadline_ms for value in route_compute_ms)
     report = {
       'route_dir': str(route_dir),
+      'accuracyQualified': False,
+      'comparisonLimitations': ['fixed segment calibration/delay', 'zero desire pulses',
+                               'decoded camera timestamp alignment not verified', 'raw Big versus processed local action'],
+      'requiredContiguousContextFrames': 66,
       'frames': count,
       'available_frames': available,
       'device_type': device_type,
