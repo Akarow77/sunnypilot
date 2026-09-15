@@ -138,6 +138,8 @@ def main() -> None:
     stage_summary += f'send={statistics.fmean(send_times):.2f} receive={statistics.fmean(receive_times):.2f} '
     stage_summary += f'validate={statistics.fmean(validate_times):.2f}'
     print(stage_summary)
+    period_ms = period * 1000
+    print(f'period_misses={sum(value > period_ms for value in latencies)}/{len(latencies)} period_ms={period_ms:.1f}')
   print(f'deadline_misses={attempted - len(latencies)}/{attempted} deadline_ms={args.deadline_ms:.1f}')
   fallback_message = f'chestnut_style_fallback={client.fallback.state.value} frame={client.fallback.failure_frame}'
   fallback_message += f' reason={client.fallback.failure_reason}'

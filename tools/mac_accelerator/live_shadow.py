@@ -44,7 +44,7 @@ class JsonLog:
 class ShadowSession:
   """Testable per-frame state machine: qualified contiguous context or failure."""
   def __init__(self, client, identity, ui, log, *, deadline_ms=55.0, max_capture_age_ms=150.0,
-               qualification_frames=20, transport_compression='zstd-1'):
+               qualification_frames=20, transport_compression=None):
     if not 0 < deadline_ms <= 500 or not math.isfinite(max_capture_age_ms) or max_capture_age_ms < deadline_ms:
       raise ValueError('invalid shadow timing limits')
     shapes = identity.input_shapes
@@ -197,7 +197,7 @@ def run(mailbox: FrameMailbox, config: dict, parent_pid: int):
         expected_hash = config['expected_model_sha256']
         if len(expected_hash) != 64 or any(c not in '0123456789abcdef' for c in expected_hash):
           raise ValueError('a pinned Big Model SHA-256 is required')
-        compression = config.get('compression', 'zstd-1')
+        compression = config.get('compression')
         client = AcceleratorClient(config['host'], config.get('port', 8066), auth_key=key,
                                    expected_model_sha256=expected_hash, expected_backend='COREML_ANE',
                                    expected_output_floats=18452, deadline_ms=config.get('deadline_ms', 55.0),

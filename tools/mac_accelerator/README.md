@@ -2,9 +2,11 @@
 
 This directory contains a bench-only prototype for using an Apple Silicon Mac as a
 sunnypilot inference worker. It targets the comma 3X and the standard 20 Hz driving
-model. It includes Metal and Core ML/ANE workers, authenticated and checksummed
-USB-NCM transport and lossless Zstd requests. Live Big Model shadow uses NumPy on
-the 3X; the framing layer itself has only standard-library dependencies.
+model. It includes Metal and Core ML/ANE workers plus authenticated and checksummed
+USB-NCM transport. Requests are always lossless; the live Big Model shadow sends
+uncompressed uint8 warps, while Zstd remains available for synthetic diagnostics.
+Live Big Model shadow uses NumPy on the 3X; the framing layer itself has only
+standard-library dependencies.
 
 Do not use this experiment to control a vehicle. Live camera/modeld integration is
 implemented only as a non-controlling shadow, and the sustained deadline requirement
@@ -119,6 +121,19 @@ mailbox feeds a separate process, so USB transfer and Mac inference overlap with
 local policy. The worker runs on 3X core 2 at FIFO priority 5; modeld remains priority
 54 on core 7, and controls/planning retain their higher dedicated priorities. The
 local TSFM model remains the sole publisher of control-related model messages.
+
+The live path deliberately uses uncompressed requests. On the connected 3X, a
+full-size high-entropy 393 KiB input measured 48.23 ms mean / 54.05 ms p95
+uncompressed, versus 51.05 ms mean / 56.30 ms p95 with Zstd. Real parked camera
+warps made Zstd preparation take 12--13 ms on core 2, so compression increased
+latency and CPU contention despite reducing bytes on the wire.
+
+Two parked live-camera Zstd probes never became eligible: the first recorded
+40/40 copy-to-output deadline misses (92.14 ms mean, 110.63 ms p95) and stopped
+when one QCOM readback reached 13.10 ms; the second recorded 17/17 misses
+(109.03 ms mean, 192.64 ms p95) and stopped at a 17.41 ms readback. These
+measurements are the reason the live default is uncompressed and the automatic
+run remains disabled until another parked qualification is explicitly enabled.
 
 The shadow process never publishes remote output. A malformed response, disconnect,
 or active copy-to-output deadline miss stops the shadow session. Initial cold
@@ -339,6 +354,8 @@ The Core ML/ANE conversion materially improves inference speed on the same Mac:
 | --- | ---: | ---: | ---: | ---: |
 | Mac only, CPU + Neural Engine / 5 min at 20 Hz | 25.69 ms | 27.18 ms | 39.53 ms | 0 / 6,000 |
 | 3X USB, Zstd synthetic / 400 frames | 38.68 ms | 41.50 ms | 51.53 ms | 0 / 400 |
+| 3X USB, full high-entropy input, uncompressed / 160 frames | 48.23 ms | 58.97 ms | 64.10 ms | not recorded |
+| 3X USB, full high-entropy input, Zstd / 160 frames | 51.05 ms | 63.52 ms | 71.88 ms | not recorded |
 | Warm Mac + 3X USB diagnostic | 46.88 ms | 53.51 ms | 53.77 ms | observed |
 | FP16 response + full validation / 200 frames | 40.77 ms | 44.29 ms | 44.48 ms | 0 / 200 |
 | Recorded route, Metal warp + ANE / 3,150 frames | 21.75 ms | 23.56 ms | 55.72 ms | 1 / 3,150 |
@@ -373,6 +390,8 @@ model measured 0.584% maximum overall normalized RMSE. Individual output heads r
 up to about 2.17%, so more route coverage is required before judging equivalence.
 
 Core ML/ANE can execute the Big Model itself at 20 Hz, but the fanless M2 Air plus
-compression, USB transport, scheduling, and 3X warp does not sustain a hard 50 ms
-capture-to-output deadline. The current result is suitable only for continued
-off-road shadow testing; it is not a vehicle-control accelerator.
+USB transport, scheduling, and 3X warp does not sustain a hard 50 ms
+capture-to-output deadline. A parked live-camera run also accumulated queue delay
+and failed its 55 ms qualification before any remote output became eligible. The
+current result is suitable only for continued off-road shadow testing; it is not a
+vehicle-control accelerator.

@@ -445,9 +445,11 @@ def main(demo=False):
         'port': params.get('MacAcceleratorPort', return_default=True),
         'deadline_ms': params.get('MacAcceleratorDeadlineMs', return_default=True),
         'expected_model_sha256': params.get('MacAcceleratorExpectedModelSHA256'),
-        # Use the same lossless transport path qualified by the 3X USB test.
-        # Remote results remain observational and never replace local output.
-        'compression': 'zstd-1',
+        # The live warp is already uint8 and Zstd on a 3X little core costs more
+        # than it saves on USB-NCM. Keep the authenticated/checksummed request
+        # lossless, but send it uncompressed. Remote results remain observational
+        # and never replace local output.
+        'compression': None,
       }, copy_budget_ms=10.0)
       atexit.register(shadow.close)
       shadow.start()
