@@ -16,12 +16,12 @@ try:
 except ImportError:
   np = None
 
-from accelerator_protocol import authenticate_payload, canonical_json, make_auth, verify_payload
+from accelerator_protocol import authenticate_payload_parts, canonical_json, make_auth, verify_payload
 from compression import ZstdCodec
 from fallback import AcceleratorState, FallbackLatch
 from transport import (DEVICE_TYPE, FLAG_RESET, FLAG_ZSTD_REQUEST, HELLO, HELLO_RESPONSE, POLICY_INPUTS,
                        MAX_PAYLOAD_BYTES, REQUEST, RESPONSE, TIMINGS, VERSION, WARPED_BYTES, ProtocolError,
-                       recv_message, send_message)
+                       recv_message, send_message, send_message_parts)
 
 @dataclass(frozen=True)
 class AcceleratorIdentity:
@@ -214,16 +214,16 @@ class AcceleratorClient:
       self.socket.settimeout(remaining)
 
     try:
-      request_payload = warped + policy
+      request_parts: tuple[bytes | memoryview, ...] = (memoryview(warped), memoryview(policy))
       if self.codec is not None:
-        request_payload = self.codec.compress(request_payload)
+        request_parts = (self.codec.compress(warped + policy),)
         flags |= FLAG_ZSTD_REQUEST
-      request = authenticate_payload(self.auth_key, REQUEST, flags, self.session_id, frame_id,
-                                     capture_ns, request_payload)
+      request_parts = authenticate_payload_parts(self.auth_key, REQUEST, flags, self.session_id,
+                                                 frame_id, capture_ns, request_parts)
       prepared_ns = time.monotonic_ns()
       stage = 'send'
       set_remaining_timeout()
-      send_message(self.socket, REQUEST, flags, self.session_id, frame_id, capture_ns, request)
+      send_message_parts(self.socket, REQUEST, flags, self.session_id, frame_id, capture_ns, request_parts)
       sent_ns = time.monotonic_ns()
       stage = 'receive'
       set_remaining_timeout()

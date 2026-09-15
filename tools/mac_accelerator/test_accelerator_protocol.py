@@ -10,7 +10,7 @@ from unittest.mock import Mock
 from pathlib import Path
 
 from accelerator_client import AcceleratorClient, AcceleratorIdentity
-from accelerator_protocol import (authenticate_payload, canonical_json, make_auth, read_auth_key,
+from accelerator_protocol import (authenticate_payload, authenticate_payload_parts, canonical_json, make_auth, read_auth_key,
                                   server_handshake, verify_payload)
 from fallback import AcceleratorState
 from transport import (DEVICE_TYPE, HELLO, HELLO_RESPONSE, POLICY_INPUTS, REQUEST,
@@ -52,6 +52,11 @@ class AcceleratorProtocolTest(unittest.TestCase):
     tampered[0] ^= 1
     with self.assertRaisesRegex(ProtocolError, 'authentication'):
       verify_payload(key, REQUEST, 1, 7, 9, 11, bytes(tampered))
+
+  def test_vectored_payload_authentication_matches_contiguous(self) -> None:
+    key = b'k' * 32
+    parts = authenticate_payload_parts(key, REQUEST, 1, 7, 9, 11, (b'pay', memoryview(b'load')))
+    self.assertEqual(b''.join(parts), authenticate_payload(key, REQUEST, 1, 7, 9, 11, b'payload'))
 
   def test_authenticated_handshake(self) -> None:
     client, server = socket.socketpair()

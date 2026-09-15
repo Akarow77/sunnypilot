@@ -1,4 +1,3 @@
-import ast
 from dataclasses import replace
 import fcntl
 from pathlib import Path
@@ -98,6 +97,21 @@ class ShadowStateTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, 'contract'):
       ShadowSession(self.client, replace(identity(), frame_skip=1), self.ui, self.log)
 
+  def test_post_warp_frame_does_not_claim_local_comparison(self):
+    sample = frame(1, self.now + 50_000_000)
+    sample.pop('local_published_ns')
+    sample.pop('local_curvature')
+    sample['capture_phase'] = 'post-warp'
+    sample['warp_ready_ns'] = sample['model_started_ns'] + 10_000_000
+    sample['copy_started_ns'] = sample['warp_ready_ns'] + 1_000_000
+    sample['queued_ns'] = sample['copy_started_ns'] + 1_000_000
+    with patch('live_shadow.time.monotonic_ns', side_effect=[sample['queued_ns'] + 1_000_000,
+                                                             sample['queued_ns'] + 30_000_000]):
+      row = self.session.process(sample, bytes(WARPED_BYTES))
+    self.assertEqual(row['capturePhase'], 'post-warp')
+    self.assertIsNone(row['localDesiredCurvature'])
+    self.assertFalse(row['comparable'])
+
 
 class MailboxTests(unittest.TestCase):
   def test_invalid_publish_preserves_previous_packet(self):
@@ -181,20 +195,20 @@ class MailboxTests(unittest.TestCase):
       with self.assertRaisesRegex(RuntimeError, 'producer failure: broken'):
         mailbox.receive(0)
 
-  def test_modeld_publishes_before_snapshot(self):
+  def test_modeld_starts_shadow_after_warp_before_local_policy(self):
     path = Path(__file__).resolve().parents[2] / 'openpilot/sunnypilot/modeld_v2/modeld.py'
-    tree = ast.parse(path.read_text())
-    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
-    publishes = [n.lineno for n in calls if isinstance(n.func.value, ast.Name) and n.func.value.id == 'pm' and n.func.attr == 'send']
-    captures = [n.lineno for n in calls if isinstance(n.func.value, ast.Name) and n.func.value.id == 'shadow' and n.func.attr == 'capture']
-    self.assertEqual(len(captures), 1)
-    self.assertGreater(captures[0], max(publishes))
+    source = path.read_text()
+    warp = source.index('warped = self.warp')
+    callback = source.index('after_warp(warped)', warp)
+    policy = source.index('raw_outputs = self.run_policy', callback)
+    self.assertLess(warp, callback)
+    self.assertLess(callback, policy)
 
   def test_first_device_readback_probe_is_parked_only(self):
     path = Path(__file__).resolve().parents[2] / 'openpilot/sunnypilot/modeld_v2/modeld.py'
     source = path.read_text()
     self.assertIn("parked_shadow_probe = v_ego < 0.5 and not sm['carControl'].latActive", source)
-    self.assertIn('and model.shadow_warp is not None and parked_shadow_probe', source)
+    self.assertIn('not calibrated or not should_probe', source)
 
   def test_next_parked_probe_disables_transport_compression(self):
     modeld = (Path(__file__).resolve().parents[2] / 'openpilot/sunnypilot/modeld_v2/modeld.py').read_text()

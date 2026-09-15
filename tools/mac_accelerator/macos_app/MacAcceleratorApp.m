@@ -13,6 +13,7 @@
 @property(nonatomic, strong) NSMutableString *pendingServerOutput;
 @property(nonatomic, strong) NSTask *serverTask;
 @property(nonatomic, strong) NSPipe *outputPipe;
+@property(nonatomic, strong) id performanceActivity;
 @property(nonatomic) BOOL userRequestedStop;
 @end
 
@@ -228,6 +229,7 @@
   NSTask *task = [[NSTask alloc] init];
   task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/caffeinate"];
   task.arguments = @[@"-dimsu", required[0]];
+  task.qualityOfService = NSQualityOfServiceUserInteractive;
   task.currentDirectoryURL = [NSURL fileURLWithPath:root];
   NSMutableDictionary *environment = NSProcessInfo.processInfo.environment.mutableCopy;
   environment[@"AUTH_KEY_FILE"] = self.keyPath;
@@ -254,11 +256,20 @@
       weakSelf.outputPipe.fileHandleForReading.readabilityHandler = nil;
       weakSelf.serverTask = nil;
       weakSelf.outputPipe = nil;
+      if (weakSelf.performanceActivity) {
+        [NSProcessInfo.processInfo endActivity:weakSelf.performanceActivity];
+        weakSelf.performanceActivity = nil;
+      }
       [weakSelf setStatus:(finished.terminationStatus == 0 || cleanStop ? @"Stopped" : @"Stopped with error") running:NO];
       [weakSelf appendLog:[NSString stringWithFormat:@"Server exited with status %d", finished.terminationStatus]];
     });
   };
+  self.performanceActivity = [NSProcessInfo.processInfo
+    beginActivityWithOptions:(NSActivityUserInitiatedAllowingIdleSystemSleep | NSActivityLatencyCritical)
+                      reason:@"Sunnypilot 20 Hz Core ML inference"];
   if (![task launchAndReturnError:&error]) {
+    [NSProcessInfo.processInfo endActivity:self.performanceActivity];
+    self.performanceActivity = nil;
     [self setStatus:@"Start failed" running:NO];
     [self appendLog:error.localizedDescription];
     return;

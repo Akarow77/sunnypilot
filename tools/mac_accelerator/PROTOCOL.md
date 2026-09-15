@@ -66,10 +66,11 @@ deadline. Once active, a bad identity, malformed length, checksum or HMAC error,
 stale response, non-finite output, disconnect, or deadline miss latches the
 client into the failed state until an explicit reset or ignition cycle.
 
-Network/compression/logging work runs in a separate, non-realtime process. Local
-model messages are published before the optional host snapshot. Readback is still
-synchronous: the 2 ms snapshot tripwire prevents subsequent copies, not the first
-overrun. No zero-interference claim is established. Current USB and Mac-only tests
+Network/compression/logging work runs in a separate process on core 2 at FIFO priority
+5, below modeld and the control/planning priorities. The optional host snapshot starts
+after the QCOM warp and before the local policy so remote work can overlap the local
+policy. Readback is still synchronous: the 8 ms snapshot tripwire prevents subsequent
+copies, not the first overrun. No zero-interference claim is established. Current USB and Mac-only tests
 do not establish a sustained hard deadline, so the implementation remains shadow-only.
 
 Receive timeouts use one absolute deadline across header, payload, and fragmented

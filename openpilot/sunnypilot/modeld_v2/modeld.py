@@ -217,7 +217,8 @@ class ModelState(ModelStateBase):
 
   def run(self, bufs: dict[str, VisionBuf], transforms: dict[str, np.ndarray],
           inputs: dict[str, np.ndarray],
-          after_enqueue: Callable[[], None] | None = None) -> dict[str, np.ndarray] | None:
+          after_enqueue: Callable[[], None] | None = None,
+          after_warp: Callable[[Tensor], None] | None = None) -> dict[str, np.ndarray] | None:
     self.shadow_warp = None
     if self.is_run_model:
       for key, buf in bufs.items():
@@ -250,6 +251,8 @@ class ModelState(ModelStateBase):
       assert self.warp is not None and self.run_policy is not None
       warped = self.warp(**{k: self.input_queues[k] for k in WARP_INPUTS}, frame=self.full_frames[self._road_key], big_frame=self.full_frames[self._wide_key])
       self.shadow_warp = warped
+      if after_warp is not None:
+        after_warp(warped)
       raw_outputs = self.run_policy(**{k: self.input_queues[k] for k in POLICY_INPUTS if k in self.input_queues}, warped=warped)
 
     if after_enqueue is not None:
@@ -445,7 +448,7 @@ def main(demo=False):
         # Real warped frames missed 20 Hz with zstd-1. Run the next parked
         # qualification uncompressed to isolate codec cost from USB + ANE.
         'compression': None,
-      }, copy_budget_ms=20.0)
+      }, copy_budget_ms=8.0)
       atexit.register(shadow.close)
       shadow.start()
     except Exception:
@@ -543,11 +546,41 @@ def main(demo=False):
       inputs['action_t'] = np.array([lat_action_t, long_action_t], dtype=np.float32)
 
     model_started_ns = time.monotonic_ns()
+    parked_shadow_probe = v_ego < 0.5 and not sm['carControl'].latActive
+
+    def capture_shadow_after_warp(warped: Tensor, *, shadow_worker=shadow, model_ref=model,
+                                  should_probe=parked_shadow_probe, calibrated=live_calib_seen,
+                                  camera_frame_id=meta_main.frame_id, extra_frame_id=meta_extra.frame_id,
+                                  capture_ns=meta_main.timestamp_eof, extra_capture_ns=meta_extra.timestamp_eof,
+                                  started_ns=model_started_ns, speed=v_ego) -> None:
+      if shadow_worker is None or shadow_worker.failed_reason or not calibrated or not should_probe:
+        return
+      warp_ready_ns = time.monotonic_ns()
+      try:
+        shadow_worker.capture(
+          warped, camera_frame_id=camera_frame_id, extra_frame_id=extra_frame_id,
+          capture_ns=capture_ns, extra_capture_ns=extra_capture_ns,
+          model_started_ns=started_ns, warp_ready_ns=warp_ready_ns,
+          capture_phase='post-warp', calibrated=calibrated, v_ego=speed,
+          policy=[*model_ref.numpy_inputs[model_ref.desire_key].reshape(-1).tolist(),
+                  *model_ref.numpy_inputs['traffic_convention'].reshape(-1).tolist(),
+                  *model_ref.numpy_inputs['action_t'].reshape(-1).tolist()],
+        )
+      except Exception as error:
+        # Shadow acceleration is observational: it must never interrupt the
+        # local model path, even if process polling or mailbox failure escapes.
+        try:
+          shadow_worker.fail(f'{type(error).__name__}: {error}')
+        except Exception:
+          pass
+
     mt1 = time.perf_counter()
     try:
       send_chestnut = (chestnut_state is not None and
                        run_count % round(model.constants.MODEL_FREQ / SERVICE_LIST['chestnutState'].frequency) == 0)
-      model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None)
+      model_output = model.run(bufs, transforms, inputs,
+                               after_enqueue=chestnut_state.send if send_chestnut else None,
+                               after_warp=capture_shadow_after_warp if shadow is not None else None)
     except Exception:
       if not params.get_bool("ChestnutActive"):
         raise
@@ -594,26 +627,6 @@ def main(demo=False):
       pm.send('drivingModelData', drivingdata_send)
       pm.send('cameraOdometry', posenet_send)
       pm.send('modelDataV2SP', mdv2sp_send)
-      # Snapshot only AFTER every local output is published. The host readback
-      # remains synchronous; its effect on next-frame timing needs 3X validation.
-      # The first real-device GPU readback measurement is parked-only. If the
-      # car moves or lateral control activates, the worker receives no further
-      # frames and fails closed on its 500 ms source-stall timeout.
-      parked_shadow_probe = v_ego < 0.5 and not sm['carControl'].latActive
-      if (shadow is not None and not shadow.failed_reason and live_calib_seen
-          and model.shadow_warp is not None and parked_shadow_probe):
-        try:
-          shadow.capture(
-            model.shadow_warp, camera_frame_id=meta_main.frame_id, extra_frame_id=meta_extra.frame_id,
-            capture_ns=meta_main.timestamp_eof, extra_capture_ns=meta_extra.timestamp_eof,
-            model_started_ns=model_started_ns, local_published_ns=time.monotonic_ns(),
-            calibrated=live_calib_seen, v_ego=v_ego, local_curvature=action.desiredCurvature,
-            policy=[*model.numpy_inputs[model.desire_key].reshape(-1).tolist(),
-                    *model.numpy_inputs['traffic_convention'].reshape(-1).tolist(),
-                    *model.numpy_inputs['action_t'].reshape(-1).tolist()],
-          )
-        except Exception as error:
-          shadow.fail(str(error))
     last_vipc_frame_id = meta_main.frame_id
 
 if __name__ == "__main__":

@@ -44,6 +44,8 @@ same `modeld` process. The Mac prototype is a networked process with additional 
 transport, scheduling, and clock-domain failure modes. It cannot be marked active
 merely because it follows the Chestnut UI/state naming.
 
-For now the Mac worker remains shadow-only. Live integration should run the small
-model as the published source, send the same warped frames to the Mac, compare both
-outputs, and exercise the fallback latch without changing vehicle actuation.
+For now the Mac worker remains shadow-only. Live integration runs the local model as
+the published source, sends the same warped frames to the Mac immediately after the
+QCOM warp, and exercises the fallback latch without changing vehicle actuation.
+Same-frame local curvature is intentionally not attached to this early timing packet;
+numerical comparison is performed by recorded-route replay instead.

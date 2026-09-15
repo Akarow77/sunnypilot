@@ -99,10 +99,11 @@ class FrameMailbox:
 
 
 class ShadowPublisher:
-  """Post-publication snapshot plus independent network/logging process.
+  """Post-warp snapshot plus independent network/logging process.
 
-  Host readback is synchronous and needs measurement on a real 3X. A slow
-  readback disables future snapshots; it cannot undo that first delay.
+  Host readback is synchronous, but the independent worker overlaps USB and
+  Mac inference with the local policy. A slow readback disables future
+  snapshots; it cannot undo that first delay.
   """
   def __init__(self, config: dict, *, copy_budget_ms: float = 2.0):
     self.config = config

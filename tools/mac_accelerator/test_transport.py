@@ -6,7 +6,7 @@ import time
 import unittest
 import zlib
 
-from transport import HEADER, MAGIC, REQUEST, VERSION, ProtocolError, recv_message, send_message
+from transport import HEADER, MAGIC, REQUEST, VERSION, ProtocolError, recv_message, send_message, send_message_parts
 
 
 class TransportTest(unittest.TestCase):
@@ -39,6 +39,13 @@ class TransportTest(unittest.TestCase):
     payload = b'warped-input'
     send_message(sender, REQUEST, 1, 2, 3, 4, payload)
     self.assertEqual(recv_message(receiver, REQUEST), (1, 2, 3, 4, payload))
+
+  def test_vectored_round_trip(self) -> None:
+    sender, receiver = socket.socketpair()
+    self.addCleanup(sender.close)
+    self.addCleanup(receiver.close)
+    send_message_parts(sender, REQUEST, 1, 2, 3, 4, (b'warped-', memoryview(b'input')))
+    self.assertEqual(recv_message(receiver, REQUEST), (1, 2, 3, 4, b'warped-input'))
 
   def test_checksum_rejected(self) -> None:
     sender, receiver = socket.socketpair()

@@ -113,11 +113,12 @@ Mac app running, configure the authenticated USB endpoint and persistent 3X key:
 tools/mac_accelerator/enable_live_shadow.sh
 ```
 
-On the next on-road transition, `modeld_tinygrad` takes a snapshot of its computed
-warp **after all local model messages are published**. A bounded, nonblocking mmap
-mailbox feeds a separate process, which drops inherited Linux realtime scheduling
-before importing inference, compression, networking, and logging code. The local
-TSFM model remains the sole publisher of control-related model messages.
+On the next on-road transition, `modeld_tinygrad` takes a snapshot immediately after
+the QCOM camera warp and before running the local policy. A bounded, nonblocking mmap
+mailbox feeds a separate process, so USB transfer and Mac inference overlap with the
+local policy. The worker runs on 3X core 2 at FIFO priority 5; modeld remains priority
+54 on core 7, and controls/planning retain their higher dedicated priorities. The
+local TSFM model remains the sole publisher of control-related model messages.
 
 The shadow process never publishes remote output. A malformed response, disconnect,
 or active copy-to-output deadline miss stops the shadow session. Initial cold
@@ -127,14 +128,14 @@ Missing camera frames reset recurrent queues and readiness; duplicate/backward,
 stale, uncalibrated, or unsynchronized inputs fail the session.
 
 **The GPU-to-host readback is still synchronous.** The initial real-device probe is
-restricted to a parked car with lateral control inactive and uses a 20 ms snapshot
+restricted to a parked car with lateral control inactive and uses an 8 ms snapshot
 budget so the actual QCOM readback cost can be measured. Moving above 0.5 m/s or
 activating lateral control stops frame delivery and the worker fails closed. The
 budget disables future snapshots after an overrun; it cannot prevent or undo the
-first slow copy. Do not treat this measurement mode as a driving configuration.
-Moving this work after publication and isolating the worker does not prove zero
-impact on the next local frame. This revised integration has not been tested or
-installed on the disconnected 3X. Real-device A/B timing remains required.
+first slow copy. Capturing before the local policy minimizes output age but no longer
+has the same-frame local curvature available for live comparison; recorded-route
+backend validation remains separate. Do not treat this measurement mode as a driving
+configuration. Real-device A/B timing remains required.
 
 The worker waits in loading state without a fixed deadline until the first calibrated
 frame arrives, connects only for that first frame, detects a subsequent 500 ms source
@@ -273,11 +274,17 @@ Zstd, an absolute client deadline, and one request in flight. Loading allows a
 separate cold-start timeout but requires consecutive in-deadline frames before the
 accelerator becomes ready. Any active failure is latched until reset.
 
-The live stage reuses the separated Tinygrad warp without running a second QCOM warp
-and measures copy-to-output plus camera-EOF-to-output timing. The local model remains
+The live stage reuses the separated Tinygrad warp without running a second QCOM warp,
+starts transfer before the local policy, and measures copy-to-output plus
+camera-EOF-to-output timing. The local model remains
 the only control source while the worker is late, warming up, disconnected, or
 invalid. Shared CPU, memory bandwidth, and synchronous readback effects still need
 real-device qualification.
+
+On macOS the persistent Core ML server uses CPU + Neural Engine, requests the highest
+public `user-interactive` QoS, verifies that QoS took effect, enables Core ML's
+`FastPrediction` specialization, and is launched under a latency-critical process
+activity. This is a scheduler hint, not a hard real-time guarantee.
 
 When the comma-side test is running, `MacAccelerator*` parameters map its state to
 the existing Chestnut icons: loading pulses, ready/active is green, and a latched

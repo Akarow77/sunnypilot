@@ -6,6 +6,7 @@ from __future__ import annotations
 import socket
 import struct
 import time
+from collections.abc import Iterable
 import zlib
 
 
@@ -51,14 +52,40 @@ def recv_exact(sock: socket.socket, size: int, deadline_ns: int | None = None) -
   return bytes(buffer)
 
 
+def _send_parts(sock: socket.socket, parts: list[memoryview]) -> None:
+  """Send several buffers without first joining the 393 KiB request."""
+  pending = [part for part in parts if len(part)]
+  while pending:
+    if hasattr(sock, 'sendmsg'):
+      sent = sock.sendmsg(pending)
+    else:
+      sent = sock.send(pending[0])
+    if sent <= 0:
+      raise EOFError('socket closed while sending')
+    while pending and sent >= len(pending[0]):
+      sent -= len(pending.pop(0))
+    if sent:
+      pending[0] = pending[0][sent:]
+
+
+def send_message_parts(sock: socket.socket, msg_type: int, flags: int, session_id: int,
+                       frame_id: int, capture_ns: int, payload_parts: Iterable[bytes | memoryview]) -> None:
+  parts = [memoryview(part).cast('B') for part in payload_parts]
+  payload_len = sum(map(len, parts))
+  if payload_len > MAX_PAYLOAD_BYTES:
+    raise ProtocolError(f"payload too large: {payload_len}")
+  checksum = 0
+  for part in parts:
+    checksum = zlib.crc32(part, checksum)
+  checksum &= 0xFFFFFFFF
+  header = HEADER.pack(MAGIC, VERSION, msg_type, flags, session_id, frame_id,
+                       capture_ns, payload_len, checksum)
+  _send_parts(sock, [memoryview(header), *parts])
+
+
 def send_message(sock: socket.socket, msg_type: int, flags: int, session_id: int,
                  frame_id: int, capture_ns: int, payload: bytes) -> None:
-  if len(payload) > MAX_PAYLOAD_BYTES:
-    raise ProtocolError(f"payload too large: {len(payload)}")
-  checksum = zlib.crc32(payload) & 0xFFFFFFFF
-  header = HEADER.pack(MAGIC, VERSION, msg_type, flags, session_id, frame_id,
-                       capture_ns, len(payload), checksum)
-  sock.sendall(header + payload)
+  send_message_parts(sock, msg_type, flags, session_id, frame_id, capture_ns, (payload,))
 
 
 def recv_message(sock: socket.socket, expected_type: int, *, deadline_ns: int | None = None) -> tuple[int, int, int, int, bytes]:

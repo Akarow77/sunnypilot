@@ -173,6 +173,8 @@ def main() -> None:
   parser.add_argument('--startup-warmup', type=int, default=3)
   parser.add_argument('--frame-skip', type=int, default=2)
   parser.add_argument('--slow-log-ms', type=float, default=40.0)
+  parser.add_argument('--specialization-strategy', choices=('default', 'fast-prediction'),
+                      default='fast-prediction')
   args = parser.parse_args()
   if (args.startup_warmup < 1 or args.frame_skip < 1 or not math.isfinite(args.slow_log_ms) or args.slow_log_ms <= 0
       or not math.isfinite(args.timeout) or args.timeout <= 0 or not 1 <= args.port <= 65535):
@@ -187,7 +189,10 @@ def main() -> None:
   identity = make_identity(metadata, model_sha256, args.frame_skip)
   auth_key = read_auth_key(args.auth_key_file)
   qos_enabled = configure_user_interactive_qos()
-  model = ct.models.MLModel(str(args.model), compute_units=ct.ComputeUnit.CPU_AND_NE)
+  hints = ({'specializationStrategy': ct.SpecializationStrategy.FastPrediction}
+           if args.specialization_strategy == 'fast-prediction' else None)
+  model = ct.models.MLModel(str(args.model), compute_units=ct.ComputeUnit.CPU_AND_NE,
+                           optimization_hints=hints)
   output_name = model.get_spec().description.output[0].name
   warmup = CoreMLPolicySession(model, metadata, output_name, args.frame_skip)
   for _ in range(args.startup_warmup):
@@ -197,7 +202,8 @@ def main() -> None:
   gc.disable()
   ready_message = f"ready: {DEVICE_TYPE} backend={BACKEND} checkpoint={identity['model_checkpoint']}"
   ready_message += f" outputs={identity['output_floats']} authenticated={auth_key is not None}"
-  print(f'{ready_message} qos={"user-interactive" if qos_enabled else "default"}', flush=True)
+  scheduling = 'user-interactive' if qos_enabled else 'default'
+  print(f'{ready_message} qos={scheduling} specialization={args.specialization_strategy} input=float32', flush=True)
 
   with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as listener:
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

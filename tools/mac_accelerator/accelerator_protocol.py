@@ -10,6 +10,7 @@ from pathlib import Path
 import socket
 import struct
 import time
+from collections.abc import Iterable
 from typing import Any
 
 from transport import HELLO, HELLO_RESPONSE, VERSION, ProtocolError, recv_message, send_message
@@ -43,6 +44,20 @@ def authenticate_payload(key: bytes | None, msg_type: int, flags: int, session_i
   metadata = AUTH_METADATA.pack(VERSION, msg_type, flags, session_id, frame_id, capture_ns)
   tag = hmac.new(key, b'SPMA-PAYLOAD-v2\0' + metadata + payload, hashlib.sha256).digest()
   return payload + tag
+
+
+def authenticate_payload_parts(key: bytes | None, msg_type: int, flags: int, session_id: int,
+                               frame_id: int, capture_ns: int,
+                               payload_parts: Iterable[bytes | memoryview]) -> tuple[bytes | memoryview, ...]:
+  """Authenticate an iovec request without concatenating its large image buffers."""
+  parts = tuple(payload_parts)
+  if key is None:
+    return parts
+  metadata = AUTH_METADATA.pack(VERSION, msg_type, flags, session_id, frame_id, capture_ns)
+  digest = hmac.new(key, b'SPMA-PAYLOAD-v2\0' + metadata, hashlib.sha256)
+  for part in parts:
+    digest.update(part)
+  return (*parts, digest.digest())
 
 
 def verify_payload(key: bytes | None, msg_type: int, flags: int, session_id: int,

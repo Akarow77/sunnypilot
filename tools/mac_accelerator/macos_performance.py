@@ -20,4 +20,9 @@ def configure_user_interactive_qos() -> bool:
   result = function(QOS_CLASS_USER_INTERACTIVE, 0)
   if result:
     raise OSError(result, 'pthread_set_qos_class_self_np failed')
+  current = library.qos_class_self
+  current.argtypes = []
+  current.restype = ctypes.c_uint
+  if current() != QOS_CLASS_USER_INTERACTIVE:
+    raise RuntimeError('macOS did not retain user-interactive QoS')
   return True

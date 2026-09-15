@@ -79,9 +79,18 @@ class ShadowSession:
       raise RuntimeError(f'stale/future input frame: age={age_ms:.2f}ms')
     if not frame['calibrated'] or abs(capture - frame['extra_capture_ns']) > 10_000_000:
       raise RuntimeError('uncalibrated or unsynchronized camera frame')
-    if not capture <= frame['model_started_ns'] <= frame['local_published_ns'] <= frame['copy_started_ns'] <= frame['queued_ns'] <= now:
+    phase = frame.get('capture_phase', 'post-publish')
+    if phase == 'post-warp':
+      timing_order = capture <= frame['model_started_ns'] <= frame['warp_ready_ns'] <= frame['copy_started_ns'] <= frame['queued_ns'] <= now
+    elif phase == 'post-publish':
+      timing_order = capture <= frame['model_started_ns'] <= frame['local_published_ns'] <= frame['copy_started_ns'] <= frame['queued_ns'] <= now
+    else:
+      raise RuntimeError(f'unknown capture phase: {phase}')
+    if not timing_order:
       raise RuntimeError('invalid frame timestamp order')
-    if not math.isfinite(frame['v_ego']) or frame['v_ego'] < 0 or not math.isfinite(frame['local_curvature']):
+    local_curvature = frame.get('local_curvature')
+    if (not math.isfinite(frame['v_ego']) or frame['v_ego'] < 0
+        or (local_curvature is not None and not math.isfinite(local_curvature))):
       raise RuntimeError('invalid local comparison values')
     frame_id = frame['camera_frame_id']
     reset = self.previous is None
@@ -116,20 +125,24 @@ class ShadowSession:
       self.ui.active()
       self.active = True
     big_curvature = float(np.frombuffer(result.output, dtype='<f4')[2062] / max(1.0, frame['v_ego']) ** 2)
-    comparable = qualified and not late and frame['v_ego'] >= 5.0
+    comparable = local_curvature is not None and qualified and not late and frame['v_ego'] >= 5.0
     entry = {
       'event': 'frame', 'cameraFrameId': frame_id, 'extraFrameId': frame['extra_frame_id'],
       'sequence': self.sequence, 'epoch': self.epoch, 'captureNs': capture,
       'vEgo': frame['v_ego'], 'copyToOutputMs': copy_to_output_ms, 'captureToOutputMs': capture_to_output_ms,
-      'localModelMs': (frame['local_published_ns'] - frame['model_started_ns']) / 1e6,
+      'capturePhase': phase,
+      'localModelMs': ((frame['local_published_ns'] - frame['model_started_ns']) / 1e6
+                       if 'local_published_ns' in frame else None),
+      'warpReadyMs': ((frame['warp_ready_ns'] - frame['model_started_ns']) / 1e6
+                      if 'warp_ready_ns' in frame else None),
       'readbackMs': frame['readback_ms'], 'snapshotMs': (frame['queued_ns'] - frame['copy_started_ns']) / 1e6,
       'queueWaitMs': (now - frame['queued_ns']) / 1e6,
       'roundTripMs': result.round_trip_ms, 'inferenceMs': result.inference_ms,
       'prepareMs': result.prepare_ms, 'sendMs': result.send_ms,
       'receiveMs': result.receive_ms, 'validateMs': result.validate_ms,
       'deadlineMiss': late, 'qualified': qualified, 'comparable': comparable,
-      'localDesiredCurvature': frame['local_curvature'], 'bigRawDesiredCurvature': big_curvature,
-      'curvatureDifference': big_curvature - frame['local_curvature'] if comparable else None,
+      'localDesiredCurvature': local_curvature, 'bigRawDesiredCurvature': big_curvature,
+      'curvatureDifference': big_curvature - local_curvature if comparable else None,
       'missingFrames': missing, 'producerDrops': frame.get('producer_busy_drops', 0),
     }
     self.log.write(entry)
