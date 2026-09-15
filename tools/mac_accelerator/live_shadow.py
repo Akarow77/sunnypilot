@@ -44,7 +44,7 @@ class JsonLog:
 class ShadowSession:
   """Testable per-frame state machine: qualified contiguous context or failure."""
   def __init__(self, client, identity, ui, log, *, deadline_ms=55.0, max_capture_age_ms=150.0,
-               qualification_frames=20):
+               qualification_frames=20, transport_compression='zstd-1'):
     if not 0 < deadline_ms <= 500 or not math.isfinite(max_capture_age_ms) or max_capture_age_ms < deadline_ms:
       raise ValueError('invalid shadow timing limits')
     shapes = identity.input_shapes
@@ -66,7 +66,8 @@ class ShadowSession:
     self.failed = False
     self.ui.loading()
     self.log.write({'event': 'session', 'identity': asdict(identity), 'requiredContextFrames': self.required,
-                    'deadlineMs': deadline_ms, 'maxCaptureAgeMs': max_capture_age_ms, 'controlSource': 'local'})
+                    'deadlineMs': deadline_ms, 'maxCaptureAgeMs': max_capture_age_ms,
+                    'transportCompression': transport_compression, 'controlSource': 'local'})
 
   def process(self, frame: dict, pixels: bytes):
     if self.failed:
@@ -124,6 +125,8 @@ class ShadowSession:
       'readbackMs': frame['readback_ms'], 'snapshotMs': (frame['queued_ns'] - frame['copy_started_ns']) / 1e6,
       'queueWaitMs': (now - frame['queued_ns']) / 1e6,
       'roundTripMs': result.round_trip_ms, 'inferenceMs': result.inference_ms,
+      'prepareMs': result.prepare_ms, 'sendMs': result.send_ms,
+      'receiveMs': result.receive_ms, 'validateMs': result.validate_ms,
       'deadlineMiss': late, 'qualified': qualified, 'comparable': comparable,
       'localDesiredCurvature': frame['local_curvature'], 'bigRawDesiredCurvature': big_curvature,
       'curvatureDifference': big_curvature - frame['local_curvature'] if comparable else None,
@@ -181,12 +184,14 @@ def run(mailbox: FrameMailbox, config: dict, parent_pid: int):
         expected_hash = config['expected_model_sha256']
         if len(expected_hash) != 64 or any(c not in '0123456789abcdef' for c in expected_hash):
           raise ValueError('a pinned Big Model SHA-256 is required')
+        compression = config.get('compression', 'zstd-1')
         client = AcceleratorClient(config['host'], config.get('port', 8066), auth_key=key,
                                    expected_model_sha256=expected_hash, expected_backend='COREML_ANE',
                                    expected_output_floats=18452, deadline_ms=config.get('deadline_ms', 55.0),
-                                   qualification_frames=66, qualification_timeout_ms=500, compression='zstd-1')
+                                   qualification_frames=66, qualification_timeout_ms=500, compression=compression)
         identity = client.connect(timeout=2)
-        session = ShadowSession(client, identity, ui, log, deadline_ms=config.get('deadline_ms', 55.0))
+        session = ShadowSession(client, identity, ui, log, deadline_ms=config.get('deadline_ms', 55.0),
+                                transport_compression=compression)
         if newer := mailbox.receive(last_sequence):
           last_sequence, current_frame, pixels = newer
       session.process(current_frame, pixels)

@@ -442,6 +442,9 @@ def main(demo=False):
         'port': params.get('MacAcceleratorPort', return_default=True),
         'deadline_ms': params.get('MacAcceleratorDeadlineMs', return_default=True),
         'expected_model_sha256': params.get('MacAcceleratorExpectedModelSHA256'),
+        # Real warped frames missed 20 Hz with zstd-1. Run the next parked
+        # qualification uncompressed to isolate codec cost from USB + ANE.
+        'compression': None,
       }, copy_budget_ms=20.0)
       atexit.register(shadow.close)
       shadow.start()
