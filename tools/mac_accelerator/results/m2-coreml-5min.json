@@ -1,0 +1,18 @@
+{
+  "hardware": "MacBook Air M2",
+  "source": "artifacts/coreml-qualification-5min.json",
+  "scope": "Mac-only inference; excludes 3X camera readback and USB transport",
+  "compute_unit": "cpu-and-ne",
+  "deadline_ms": 50.0,
+  "frequency_hz": 20.0,
+  "runs": 6000,
+  "mean_ms": 25.68730792744221,
+  "p95_ms": 26.670337868563365,
+  "p99_ms": 27.179806410858873,
+  "max_ms": 39.53362497850321,
+  "misses": 0,
+  "first_half_mean_ms": 25.658306120021734,
+  "second_half_mean_ms": 25.716309734862687,
+  "schedule_lateness_p99_ms": 5.06114583753515,
+  "schedule_lateness_max_ms": 6.92714678007178
+}

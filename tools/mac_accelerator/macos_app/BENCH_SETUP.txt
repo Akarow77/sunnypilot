@@ -1,0 +1,48 @@
+Sunnypilot Mac Accelerator 0.2.2 — bench-only prerelease
+
+This is an Apple Silicon launcher, not a standalone model installer or a driving
+accelerator. Live camera capture is disabled in this source revision. It does not
+publish vehicle-control outputs. Server Ready is not a driving qualification.
+
+Requirements
+- Apple Silicon Mac (M2 is the tested machine), macOS 15 or newer.
+- A matching sunnypilot checkout containing tools/mac_accelerator.
+- Python 3.12 environments .venv and .coreml-venv in that checkout.
+- The Big Model source ONNX, its metadata, and the locally converted Core ML package.
+- Git LFS and uv for preparation; Command Line Tools if building from source.
+
+Preparation in the checkout
+  uv sync --frozen --all-extras
+  git lfs install --local
+  git lfs pull --include=openpilot/selfdrive/modeld/models/big_driving_supercombo.onnx
+  tools/mac_accelerator/setup_coreml_env.sh
+  tools/mac_accelerator/compile_coreml.sh
+
+Conversion requires a full development checkout and can take significant time.
+The app checks these artifacts before starting:
+  .coreml-venv/bin/python
+  openpilot/selfdrive/modeld/models/big_driving_supercombo.onnx
+  openpilot/selfdrive/modeld/models/big_driving_supercombo_metadata.pkl
+  tools/mac_accelerator/artifacts/big_driving.mlpackage
+
+Choose the checkout in the app. Mac-only localhost mode is selected by default.
+Start launches the server only; run benchmark clients using the repository README.
+For the independent end-to-end Mac benchmark, leave the app server stopped and run:
+  .coreml-venv/bin/python tools/mac_accelerator/local_shadow_benchmark.py \
+    --frames 300 --output-dir tools/mac_accelerator/artifacts/local-test-001
+Choose a fresh output directory each time. Synthetic inputs do not test driving
+accuracy. Sustained timing qualification has not passed on the tested hardware.
+
+Optional USB mode is solely for synthetic bench diagnostics with a powered,
+off-road comma 3X. It requires ADB, a USB 3 cable, and the authenticated synthetic
+client described in the repository README. The app can configure USB-NCM when this
+mode is explicitly selected; it does not enable the removed live capture hook.
+
+Nothing private or heavyweight is bundled: no credentials, models, route logs,
+Python runtime, or personal repository path. Each installation creates a private
+authentication key in its own user's Application Support directory when started.
+Do not distribute that key or copy a prepared private checkout into the app.
+
+This build is ad-hoc signed and is not Apple-notarized. macOS may block a downloaded
+copy. Inspect the source and build locally if you do not trust the download; do not
+disable Gatekeeper globally. See the repository README for detailed limitations.

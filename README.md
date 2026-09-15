@@ -1,3 +1,15 @@
+## Mac M2 accelerator research preview
+
+This branch preserves the Apple Silicon accelerator experiment tested on a
+MacBook Air M2 and comma 3X. Big Model compute results are promising; end-to-end
+live timing did not qualify, and production live capture has been removed.
+
+[Progress, failure analysis, and roadmap](tools/mac_accelerator/PROJECT_STATUS.md)
+· [Mac setup](tools/mac_accelerator/README.md)
+· [Mac app research preview](https://github.com/Akarow77/sunnypilot/releases/tag/mac-accelerator-v0.2.2)
+
+**Bench research only. Do not install this branch for vehicle-control acceleration.**
+
 ![](https://user-images.githubusercontent.com/47793918/233812617-beab2e71-57b9-479e-8bff-c3931347ca40.png)
 
 ## 🌞 What is sunnypilot?

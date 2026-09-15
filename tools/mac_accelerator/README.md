@@ -3,15 +3,13 @@
 This directory contains a bench-only prototype for using an Apple Silicon Mac as a
 sunnypilot inference worker. It targets the comma 3X and the standard 20 Hz driving
 model. It includes Metal and Core ML/ANE workers plus authenticated and checksummed
-USB-NCM transport. Requests are always lossless; the live Big Model shadow sends
-uncompressed uint8 warps, while Zstd remains available for synthetic diagnostics.
-Live Big Model shadow uses NumPy on the 3X; the framing layer itself has only
-standard-library dependencies.
+USB-NCM transport. Requests are lossless, with optional Zstd for synthetic diagnostics.
+The framing layer itself has only standard-library dependencies.
 
-Do not use this experiment to control a vehicle. Live camera/modeld integration is
-implemented only as a non-controlling shadow, and the sustained deadline requirement
-has not passed. The client recognizes the Mac as a user-space accelerator, sends the
-same warped tensors used by the local model, and exercises a fail-closed shadow path.
+Do not use this experiment to control a vehicle. Live camera/modeld integration has
+been removed after synchronous readback overruns; the sustained deadline requirement
+has not passed. The standalone client recognizes the Mac as a user-space accelerator
+and exercises a non-controlling benchmark path.
 A Mac cannot enumerate
 as a native PCIe/USB GPU on the 3X; the authenticated service identity is the honest
 equivalent.
@@ -105,78 +103,61 @@ The setup is intentionally transient. The 3X `usb0` interface is raised through
 ADB and returns to its normal state after a reboot. The client files are copied
 only to `/tmp/mac_accelerator` on the 3X.
 
-## Run the live, non-controlling shadow
+## Live camera shadow is disabled
 
-This requires a sunnypilot Tinygrad model bundle with a separated warp and policy.
-The currently tested TSFM 20 Hz bundle has that layout. With the 3X off-road and the
-Mac app running, configure the authenticated USB endpoint and persistent 3X key:
+The production `modeld_tinygrad` capture hook has been removed. Its inference path
+matches the upstream branch again: camera warp goes directly to the local policy.
+Even a stale `MacAcceleratorShadowEnabled=1` cannot launch a worker or trigger a
+GPU readback in this revision. `enable_live_shadow.sh` exits with an explanation
+before accessing ADB, changing the USB link, or writing any device parameter.
+Re-enabling live capture requires a separately reviewed, isolated capture design.
 
-```bash
-tools/mac_accelerator/enable_live_shadow.sh
-```
+The removed hook called synchronous QCOM `.numpy()` before the local policy.
+A 10 ms copy budget was checked only after the delay had already occurred. The
+parked condition (speed below 0.5 m/s and lateral control inactive) did not isolate
+the local model loop, and the persistent enable flag re-armed each modeld start.
+The worker also requested FIFO scheduling; benchmark workers now require normal
+timesharing and stop before importing the worker if demotion fails.
 
-On the next on-road transition, `modeld_tinygrad` takes a snapshot immediately after
-the QCOM camera warp and before running the local policy. A bounded, nonblocking mmap
-mailbox feeds a separate process, so USB transfer and Mac inference overlap with the
-local policy. The worker runs on 3X core 2 at FIFO priority 5; modeld remains priority
-54 on core 7, and controls/planning retain their higher dedicated priorities. The
-local TSFM model remains the sole publisher of control-related model messages.
+The saved live-camera probes never qualified:
 
-The live path deliberately uses uncompressed requests. On the connected 3X, a
-full-size high-entropy 393 KiB input measured 48.23 ms mean / 54.05 ms p95
-uncompressed, versus 51.05 ms mean / 56.30 ms p95 with Zstd. Real parked camera
-warps made Zstd preparation take 12--13 ms on core 2, so compression increased
-latency and CPU contention despite reducing bytes on the wire.
+| Transport | Frames | Over 55 ms | Mean copy-to-output | Terminal readback |
+| --- | ---: | ---: | ---: | ---: |
+| Zstd probe 1 | 40 | 40 | 92.14 ms | 13.101 ms |
+| Zstd probe 2 | 17 | 17 | 109.03 ms | 17.414 ms |
+| Uncompressed | 37 | 33 | 67.46 ms | 10.003 ms |
 
-Two parked live-camera Zstd probes never became eligible: the first recorded
-40/40 copy-to-output deadline misses (92.14 ms mean, 110.63 ms p95) and stopped
-when one QCOM readback reached 13.10 ms; the second recorded 17/17 misses
-(109.03 ms mean, 192.64 ms p95) and stopped at a 17.41 ms readback. These
-measurements are the reason the live default is uncompressed and the automatic
-run remains disabled until another parked qualification is explicitly enabled.
+These measurements establish timing interference during capture, not the cause of
+a separate physical reboot. The reviewed route76 log records an off-road transition
+with ignition still true and `not_always_offroad=false`; it also contains startup
+communication errors that subsequently clear. Neither is evidence that Mac outputs
+controlled the vehicle. See [the stability review](REVIEW_2026-09-16.md) for scope
+and remaining reboot investigation.
 
-The shadow process never publishes remote output. A malformed response, disconnect,
-or active copy-to-output deadline miss stops the shadow session. Initial cold
-frames remain in loading state until at least 66 contiguous frames have populated
-the Big Model temporal context and 66 consecutive results meet both timing limits.
-Missing camera frames reset recurrent queues and readiness; duplicate/backward,
-stale, uncalibrated, or unsynchronized inputs fail the session.
+Standalone Mac-only benchmarks, authenticated transport, UI state readers, and
+existing log readers remain available. The worker never publishes remote output.
+Its 66-frame qualification, stale-input rejection, 500 ms source timeout, heartbeat,
+and bounded logs remain diagnostic checks, not a vehicle-control specification.
 
-**The GPU-to-host readback is still synchronous.** The initial real-device probe is
-restricted to a parked car with lateral control inactive and uses a 10 ms snapshot
-budget so the actual QCOM readback cost can be measured. Moving above 0.5 m/s or
-activating lateral control stops frame delivery and the worker fails closed. The
-budget disables future snapshots after an overrun; it cannot prevent or undo the
-first slow copy. Capturing before the local policy minimizes output age but no longer
-has the same-frame local curvature available for live comparison; recorded-route
-backend validation remains separate. Do not treat this measurement mode as a driving
-configuration. Real-device A/B timing remains required.
-
-The worker waits in loading state without a fixed deadline until the first calibrated
-frame arrives, connects only for that first frame, detects a subsequent 500 ms source
-stall, and emits a heartbeat at most four times per second. The UI rejects missing,
-future, or more-than-two-second-old heartbeats. Logs stop at 32 MiB per session;
-startup refuses a directory already at 256 MiB (existing logs are not deleted).
-These are diagnostic thresholds, not a vehicle-control safety specification.
-
-Per-frame timing and local-versus-Big curvature are written on the 3X under
-`/data/media/0/mac_accelerator_shadow/live-*.jsonl`. After a run, copy a log and run:
+Existing device logs remain at
+`/data/media/0/mac_accelerator_shadow/live-*.jsonl`. Copy a log and inspect it with:
 
 ```bash
 .venv/bin/python tools/mac_accelerator/summarize_live_shadow.py /path/to/live-log.jsonl
 ```
 
 `copyToOutputMs` includes snapshot, queue, compression, transfer, inference, and
-validation. `captureToOutputMs` additionally includes time since camera EOF; it is
-not the same as sensor exposure latency. Only qualified frames above 5 m/s enter
-the curvature summary. This compares raw Big Model curvature with the local
-postprocessed action: difference is not an accuracy score or proof of superiority.
+validation. `captureToOutputMs` additionally includes time since camera EOF.
+A curvature difference is not an accuracy score or proof of superiority.
 
-Disable the next run only while off-road:
+For devices still running an older revision, disable the persistent flag while
+off-road with the existing helper:
 
 ```bash
 tools/mac_accelerator/disable_live_shadow.sh
 ```
+
+Updating this checkout does not stop an already running process or deploy to a device.
 
 ## macOS app and dedicated qualification
 
@@ -353,7 +334,7 @@ The Core ML/ANE conversion materially improves inference speed on the same Mac:
 | Big Model test | Mean | p99 | Max | Missed 50 ms |
 | --- | ---: | ---: | ---: | ---: |
 | Mac only, CPU + Neural Engine / 5 min at 20 Hz | 25.69 ms | 27.18 ms | 39.53 ms | 0 / 6,000 |
-| 3X USB, Zstd synthetic / 400 frames | 38.68 ms | 41.50 ms | 51.53 ms | 0 / 400 |
+| 3X USB, Zstd synthetic / 400 frames | 38.68 ms | 41.50 ms | 51.53 ms | at least 1; exact count unverified |
 | 3X USB, full high-entropy input, uncompressed / 160 frames | 48.23 ms | 58.97 ms | 64.10 ms | not recorded |
 | 3X USB, full high-entropy input, Zstd / 160 frames | 51.05 ms | 63.52 ms | 71.88 ms | not recorded |
 | Warm Mac + 3X USB diagnostic | 46.88 ms | 53.51 ms | 53.77 ms | observed |

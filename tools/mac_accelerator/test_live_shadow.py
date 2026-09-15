@@ -1,7 +1,9 @@
 from dataclasses import replace
+import ast
 import fcntl
 from pathlib import Path
 import tempfile
+import subprocess
 import time
 import unittest
 from unittest.mock import Mock, patch
@@ -195,27 +197,32 @@ class MailboxTests(unittest.TestCase):
       with self.assertRaisesRegex(RuntimeError, 'producer failure: broken'):
         mailbox.receive(0)
 
-  def test_modeld_starts_shadow_after_warp_before_local_policy(self):
+  def test_modeld_has_no_accelerator_startup_or_capture_path(self):
     path = Path(__file__).resolve().parents[2] / 'openpilot/sunnypilot/modeld_v2/modeld.py'
     source = path.read_text()
-    warp = source.index('warped = self.warp')
-    callback = source.index('after_warp(warped)', warp)
-    policy = source.index('raw_outputs = self.run_policy', callback)
-    self.assertLess(warp, callback)
-    self.assertLess(callback, policy)
+    for removed in ('MacAccelerator', 'ShadowPublisher', 'shadow_ipc', 'shadow_warp', 'after_warp'):
+      self.assertNotIn(removed, source)
+    # Keep the local warp immediately followed by policy execution. Parse the
+    # source without importing QCOM/model artifacts on the test host.
+    tree = ast.parse(source)
+    model = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'ModelState')
+    run_model = next(node for node in model.body if isinstance(node, ast.FunctionDef) and node.name == 'run')
+    for node in ast.walk(run_model):
+      if not isinstance(node, ast.If):
+        continue
+      for first, second in zip(node.orelse, node.orelse[1:], strict=False):
+        if isinstance(first, ast.Assign) and ast.unparse(first.targets[0]) == 'warped':
+          self.assertIsInstance(second, ast.Assign)
+          self.assertEqual(ast.unparse(second.value.func), 'self.run_policy')
+          return
+    self.fail('local warp/policy path not found')
 
-  def test_first_device_readback_probe_is_parked_only(self):
-    path = Path(__file__).resolve().parents[2] / 'openpilot/sunnypilot/modeld_v2/modeld.py'
-    source = path.read_text()
-    self.assertIn("parked_shadow_probe = v_ego < 0.5 and not sm['carControl'].latActive", source)
-    self.assertIn('not calibrated or not should_probe', source)
-
-  def test_parked_probe_uses_qualified_uncompressed_transport(self):
-    modeld = (Path(__file__).resolve().parents[2] / 'openpilot/sunnypilot/modeld_v2/modeld.py').read_text()
-    worker = (Path(__file__).resolve().parent / 'live_shadow.py').read_text()
-    self.assertIn("'compression': None", modeld)
-    self.assertIn("compression = config.get('compression')", worker)
-    self.assertIn('compression=compression', worker)
+  def test_enable_helper_refuses_even_without_device_tools(self):
+    script = Path(__file__).resolve().parent / 'enable_live_shadow.sh'
+    result = subprocess.run(['/bin/bash', str(script)], env={'PATH': '/nonexistent'}, capture_output=True, text=True)
+    self.assertEqual(result.returncode, 1)
+    self.assertIn('No device settings were changed', result.stderr)
+    self.assertNotIn('command not found', result.stderr)
 
 
 class WorkerLifecycleTests(unittest.TestCase):

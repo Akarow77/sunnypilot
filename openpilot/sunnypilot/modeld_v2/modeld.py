@@ -7,7 +7,6 @@ See the LICENSE.md file in the root directory for more details.
 """
 
 from collections.abc import Callable
-import atexit
 import os
 os.environ['GMMU'] = '0'
 import numpy as np
@@ -217,9 +216,7 @@ class ModelState(ModelStateBase):
 
   def run(self, bufs: dict[str, VisionBuf], transforms: dict[str, np.ndarray],
           inputs: dict[str, np.ndarray],
-          after_enqueue: Callable[[], None] | None = None,
-          after_warp: Callable[[Tensor], None] | None = None) -> dict[str, np.ndarray] | None:
-    self.shadow_warp = None
+          after_enqueue: Callable[[], None] | None = None) -> dict[str, np.ndarray] | None:
     if self.is_run_model:
       for key, buf in bufs.items():
         data = buf.data if hasattr(buf, 'data') else buf
@@ -250,9 +247,6 @@ class ModelState(ModelStateBase):
     else:
       assert self.warp is not None and self.run_policy is not None
       warped = self.warp(**{k: self.input_queues[k] for k in WARP_INPUTS}, frame=self.full_frames[self._road_key], big_frame=self.full_frames[self._wide_key])
-      self.shadow_warp = warped
-      if after_warp is not None:
-        after_warp(warped)
       raw_outputs = self.run_policy(**{k: self.input_queues[k] for k in POLICY_INPUTS if k in self.input_queues}, warped=warped)
 
     if after_enqueue is not None:
@@ -429,36 +423,6 @@ def main(demo=False):
   meta_constants = load_meta_constants()
   RELC = RoadEdgeLaneChangeController()
 
-  shadow = None
-  if params.get_bool('MacAcceleratorShadowEnabled'):
-    try:
-      import sys
-      from openpilot.common.basedir import BASEDIR
-      accelerator_path = os.path.join(BASEDIR, 'tools', 'mac_accelerator')
-      if accelerator_path not in sys.path:
-        sys.path.insert(0, accelerator_path)
-      from shadow_ipc import ShadowPublisher
-      if model.is_run_model or model.chestnut or 'action_t' not in model.numpy_inputs:
-        raise ValueError('shadow requires a separated local warp/policy bundle with action_t')
-      shadow = ShadowPublisher({
-        'host': params.get('MacAcceleratorHost'),
-        'port': params.get('MacAcceleratorPort', return_default=True),
-        'deadline_ms': params.get('MacAcceleratorDeadlineMs', return_default=True),
-        'expected_model_sha256': params.get('MacAcceleratorExpectedModelSHA256'),
-        # The live warp is already uint8 and Zstd on a 3X little core costs more
-        # than it saves on USB-NCM. Keep the authenticated/checksummed request
-        # lossless, but send it uncompressed. Remote results remain observational
-        # and never replace local output.
-        'compression': None,
-      }, copy_budget_ms=10.0)
-      atexit.register(shadow.close)
-      shadow.start()
-    except Exception:
-      cloudlog.exception('Mac accelerator shadow initialization failed')
-      shadow = None
-      params.put_bool('MacAcceleratorPresent', True)
-      params.put_bool('MacAcceleratorModelError', True)
-
   while True:
     # Keep receiving frames until we are at least 1 frame ahead of previous extra frame
     while meta_main.timestamp_sof < meta_extra.timestamp_sof + 25000000:
@@ -547,42 +511,11 @@ def main(demo=False):
     if 'action_t' in model.numpy_inputs:
       inputs['action_t'] = np.array([lat_action_t, long_action_t], dtype=np.float32)
 
-    model_started_ns = time.monotonic_ns()
-    parked_shadow_probe = v_ego < 0.5 and not sm['carControl'].latActive
-
-    def capture_shadow_after_warp(warped: Tensor, *, shadow_worker=shadow, model_ref=model,
-                                  should_probe=parked_shadow_probe, calibrated=live_calib_seen,
-                                  camera_frame_id=meta_main.frame_id, extra_frame_id=meta_extra.frame_id,
-                                  capture_ns=meta_main.timestamp_eof, extra_capture_ns=meta_extra.timestamp_eof,
-                                  started_ns=model_started_ns, speed=v_ego) -> None:
-      if shadow_worker is None or shadow_worker.failed_reason or not calibrated or not should_probe:
-        return
-      warp_ready_ns = time.monotonic_ns()
-      try:
-        shadow_worker.capture(
-          warped, camera_frame_id=camera_frame_id, extra_frame_id=extra_frame_id,
-          capture_ns=capture_ns, extra_capture_ns=extra_capture_ns,
-          model_started_ns=started_ns, warp_ready_ns=warp_ready_ns,
-          capture_phase='post-warp', calibrated=calibrated, v_ego=speed,
-          policy=[*model_ref.numpy_inputs[model_ref.desire_key].reshape(-1).tolist(),
-                  *model_ref.numpy_inputs['traffic_convention'].reshape(-1).tolist(),
-                  *model_ref.numpy_inputs['action_t'].reshape(-1).tolist()],
-        )
-      except Exception as error:
-        # Shadow acceleration is observational: it must never interrupt the
-        # local model path, even if process polling or mailbox failure escapes.
-        try:
-          shadow_worker.fail(f'{type(error).__name__}: {error}')
-        except Exception:
-          pass
-
     mt1 = time.perf_counter()
     try:
       send_chestnut = (chestnut_state is not None and
                        run_count % round(model.constants.MODEL_FREQ / SERVICE_LIST['chestnutState'].frequency) == 0)
-      model_output = model.run(bufs, transforms, inputs,
-                               after_enqueue=chestnut_state.send if send_chestnut else None,
-                               after_warp=capture_shadow_after_warp if shadow is not None else None)
+      model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None)
     except Exception:
       if not params.get_bool("ChestnutActive"):
         raise

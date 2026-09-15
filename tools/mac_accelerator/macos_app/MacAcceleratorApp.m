@@ -69,7 +69,7 @@
                                                        NSWindowStyleMaskMiniaturizable |
                                                        NSWindowStyleMaskResizable)
                                               backing:NSBackingStoreBuffered defer:NO];
-  self.window.title = @"Sunnypilot Mac Accelerator";
+  self.window.title = @"Sunnypilot Mac Accelerator — Bench-only 0.2.2";
   self.window.minSize = NSMakeSize(700, 440);
   [self.window center];
   NSView *view = self.window.contentView;
@@ -78,7 +78,7 @@
                               frame:NSMakeRect(20, 455, 500, 30) size:22];
   title.font = [NSFont boldSystemFontOfSize:22];
   [view addSubview:title];
-  [view addSubview:[self label:@"Core ML + Apple Neural Engine worker for authenticated comma 3X shadow testing"
+  [view addSubview:[self label:@"Core ML + Apple Neural Engine benchmark launcher · Live camera capture disabled"
                               frame:NSMakeRect(20, 430, 730, 22) size:13]];
 
   NSString *saved = [NSUserDefaults.standardUserDefaults stringForKey:@"repositoryPath"];
@@ -108,16 +108,18 @@
   self.logView = [[NSTextView alloc] initWithFrame:scroll.bounds];
   self.logView.editable = NO;
   self.logView.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
-  self.logView.string = @"Connect the powered-off-road 3X, then press Start.";
+  self.logView.string = @"Bench-only prerelease. Choose a prepared checkout, then Start for a localhost server.\nNo models or Python environment are bundled. README includes setup requirements.\nUSB mode is for synthetic off-road diagnostics only; live camera capture is disabled.";
   scroll.documentView = self.logView;
   [view addSubview:scroll];
 
   self.localTestButton = [NSButton checkboxWithTitle:@"Mac-only test (localhost, no 3X)" target:nil action:nil];
+  self.localTestButton.state = NSControlStateValueOn;
+  self.localTestButton.toolTip = @"Default: localhost only. Uncheck solely for synthetic USB bench diagnostics with an off-road 3X.";
   self.localTestButton.frame = NSMakeRect(20, 325, 360, 22);
   [view addSubview:self.localTestButton];
   scroll.frame = NSMakeRect(20, 55, 740, 265);
 
-  NSTextField *warning = [self label:@"Safety: this app does not publish vehicle-control outputs. Keep the local model active and test off-road first."
+  NSTextField *warning = [self label:@"Bench-only: live capture disabled. Server status is not driving readiness; no vehicle-control output."
                                   frame:NSMakeRect(20, 18, 740, 24) size:12];
   warning.textColor = NSColor.systemOrangeColor;
   [view addSubview:warning];
@@ -162,6 +164,14 @@
 
 - (BOOL)ensureAuthenticationKey:(NSError **)error {
   NSString *keyPath = self.keyPath;
+  NSString *directory = keyPath.stringByDeletingLastPathComponent;
+  if (![NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:YES
+                                                attributes:@{NSFilePosixPermissions: @0700} error:error]) return NO;
+  if (chmod(directory.fileSystemRepresentation, 0700) != 0) {
+    if (error) *error = [NSError errorWithDomain:@"MacAccelerator" code:3
+      userInfo:@{NSLocalizedDescriptionKey: @"Cannot secure authentication directory"}];
+    return NO;
+  }
   if ([NSFileManager.defaultManager fileExistsAtPath:keyPath]) {
     NSData *key = [NSData dataWithContentsOfFile:keyPath options:0 error:error];
     if (!key) return NO;
@@ -171,14 +181,6 @@
       return NO;
     }
     return YES;
-  }
-  NSString *directory = keyPath.stringByDeletingLastPathComponent;
-  if (![NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:YES
-                                                attributes:@{NSFilePosixPermissions: @0700} error:error]) return NO;
-  if (chmod(directory.fileSystemRepresentation, 0700) != 0) {
-    if (error) *error = [NSError errorWithDomain:@"MacAccelerator" code:3
-      userInfo:@{NSLocalizedDescriptionKey: @"Cannot secure authentication directory"}];
-    return NO;
   }
   NSMutableData *key = [NSMutableData dataWithLength:32];
   if (SecRandomCopyBytes(kSecRandomDefault, key.length, key.mutableBytes) != errSecSuccess) {
@@ -217,6 +219,8 @@
     [root stringByAppendingPathComponent:@".coreml-venv/bin/python"],
     [root stringByAppendingPathComponent:@"tools/mac_accelerator/artifacts/big_driving.mlpackage"],
     [root stringByAppendingPathComponent:@"tools/mac_accelerator/usb_ncm_supervisor.py"],
+    [root stringByAppendingPathComponent:@"openpilot/selfdrive/modeld/models/big_driving_supercombo.onnx"],
+    [root stringByAppendingPathComponent:@"openpilot/selfdrive/modeld/models/big_driving_supercombo_metadata.pkl"],
   ];
   for (NSString *path in required) {
     if (![NSFileManager.defaultManager fileExistsAtPath:path]) {
@@ -306,6 +310,10 @@
 - (void)openReadme:(id)sender {
   NSString *path = [self.repositoryField.stringValue.stringByStandardizingPath
                     stringByAppendingPathComponent:@"tools/mac_accelerator/README.md"];
+  if (![NSFileManager.defaultManager fileExistsAtPath:path]) {
+    path = [NSBundle.mainBundle pathForResource:@"BENCH_SETUP" ofType:@"txt"];
+  }
+  if (!path) return;
   [NSWorkspace.sharedWorkspace openURL:[NSURL fileURLWithPath:path]];
 }
 
