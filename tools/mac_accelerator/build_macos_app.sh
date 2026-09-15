@@ -27,6 +27,7 @@ sips -z 512 512 "$ICON_SOURCE" --out "$ICONSET/icon_256x256@2x.png" >/dev/null
 sips -z 512 512 "$ICON_SOURCE" --out "$ICONSET/icon_512x512.png" >/dev/null
 sips -z 1024 1024 "$ICON_SOURCE" --out "$ICONSET/icon_512x512@2x.png" >/dev/null
 /usr/bin/python3 "$SOURCE_DIR/build_icns.py" "$ICONSET" "$CONTENTS/Resources/AppIcon.icns"
+cp "$ICON_SOURCE" "$CONTENTS/Resources/AppIcon.png"
 cp "$SOURCE_DIR/Info.plist" "$CONTENTS/Info.plist"
 codesign --force --sign - "$APP"
 printf 'Built %s\n' "$APP"

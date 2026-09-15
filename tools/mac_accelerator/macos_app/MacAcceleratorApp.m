@@ -56,6 +56,12 @@
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
+  NSString *iconPath = [NSBundle.mainBundle pathForResource:@"AppIcon" ofType:@"png"];
+  NSImage *icon = iconPath ? [[NSImage alloc] initWithContentsOfFile:iconPath] : nil;
+  if (icon) {
+    NSApplication.sharedApplication.applicationIconImage = icon;
+  }
+
   NSRect frame = NSMakeRect(0, 0, 780, 500);
   self.window = [[NSWindow alloc] initWithContentRect:frame
                                             styleMask:(NSWindowStyleMaskTitled |
