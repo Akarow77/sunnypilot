@@ -10,6 +10,8 @@
   <string>dev.sunnypilot.mac-accelerator</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleName</key>
   <string>Sunnypilot Mac Accelerator</string>
   <key>CFBundlePackageType</key>

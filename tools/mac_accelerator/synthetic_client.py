@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 from pathlib import Path
 import random
 import statistics
@@ -56,7 +57,11 @@ def main() -> None:
     parser.error('synthetic random prefix must fit inside the warped payload')
   if args.realtime:
     from openpilot.common.realtime import config_realtime_process
-    config_realtime_process(7, 54)
+    available_cores = sorted(os.sched_getaffinity(0))
+    realtime_core = 7 if 7 in available_cores else available_cores[-1]
+    if realtime_core != 7:
+      print(f'core 7 is offline/unavailable; using core {realtime_core} for the off-road smoke test')
+    config_realtime_process(realtime_core, 54)
 
   policy = POLICY_INPUTS.pack(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.1, 0.1)
   random_prefix = random.Random(1).randbytes(args.synthetic_random_prefix_bytes)

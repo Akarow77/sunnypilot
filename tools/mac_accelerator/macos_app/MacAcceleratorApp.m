@@ -232,6 +232,8 @@
   task.qualityOfService = NSQualityOfServiceUserInteractive;
   task.currentDirectoryURL = [NSURL fileURLWithPath:root];
   NSMutableDictionary *environment = NSProcessInfo.processInfo.environment.mutableCopy;
+  NSString *existingPath = environment[@"PATH"] ?: @"/usr/bin:/bin:/usr/sbin:/sbin";
+  environment[@"PATH"] = [NSString stringWithFormat:@"/opt/homebrew/bin:/usr/local/bin:%@", existingPath];
   environment[@"AUTH_KEY_FILE"] = self.keyPath;
   environment[@"PYTHONUNBUFFERED"] = @"1";
   environment[@"VECLIB_MAXIMUM_THREADS"] = @"1";

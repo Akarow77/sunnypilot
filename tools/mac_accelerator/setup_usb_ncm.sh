@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ADB="${ADB:-adb}"
+if [[ -n "${ADB:-}" ]]; then
+  :
+elif command -v adb >/dev/null 2>&1; then
+  ADB="$(command -v adb)"
+elif [[ -x /opt/homebrew/bin/adb ]]; then
+  ADB=/opt/homebrew/bin/adb
+elif [[ -x /usr/local/bin/adb ]]; then
+  ADB=/usr/local/bin/adb
+else
+  ADB=adb
+fi
 USB_DEVICE_IFACE="${USB_DEVICE_IFACE:-usb0}"
 
 if ! "$ADB" get-state >/dev/null 2>&1; then
