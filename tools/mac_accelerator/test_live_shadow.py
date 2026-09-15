@@ -210,10 +210,10 @@ class MailboxTests(unittest.TestCase):
     self.assertIn("parked_shadow_probe = v_ego < 0.5 and not sm['carControl'].latActive", source)
     self.assertIn('not calibrated or not should_probe', source)
 
-  def test_next_parked_probe_disables_transport_compression(self):
+  def test_parked_probe_uses_qualified_lossless_transport(self):
     modeld = (Path(__file__).resolve().parents[2] / 'openpilot/sunnypilot/modeld_v2/modeld.py').read_text()
     worker = (Path(__file__).resolve().parent / 'live_shadow.py').read_text()
-    self.assertIn("'compression': None", modeld)
+    self.assertIn("'compression': 'zstd-1'", modeld)
     self.assertIn("compression = config.get('compression', 'zstd-1')", worker)
     self.assertIn('compression=compression', worker)
 

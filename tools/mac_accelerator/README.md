@@ -338,7 +338,7 @@ The Core ML/ANE conversion materially improves inference speed on the same Mac:
 | Big Model test | Mean | p99 | Max | Missed 50 ms |
 | --- | ---: | ---: | ---: | ---: |
 | Mac only, CPU + Neural Engine / 5 min at 20 Hz | 25.69 ms | 27.18 ms | 39.53 ms | 0 / 6,000 |
-| 3X USB, Zstd synthetic / 400 frames | 37.40 ms | 42.48 ms | 45.04 ms | 0 / 400 |
+| 3X USB, Zstd synthetic / 400 frames | 38.68 ms | 41.50 ms | 51.53 ms | 0 / 400 |
 | Warm Mac + 3X USB diagnostic | 46.88 ms | 53.51 ms | 53.77 ms | observed |
 | FP16 response + full validation / 200 frames | 40.77 ms | 44.29 ms | 44.48 ms | 0 / 200 |
 | Recorded route, Metal warp + ANE / 3,150 frames | 21.75 ms | 23.56 ms | 55.72 ms | 1 / 3,150 |
