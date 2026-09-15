@@ -138,6 +138,8 @@
   if ([message hasPrefix:@"listening on "]) [self setStatus:@"Ready" running:YES];
   if ([message hasPrefix:@"verified client connected:"]) [self setStatus:@"Client connected" running:YES];
   if ([message hasPrefix:@"client disconnected:"]) [self setStatus:@"Ready" running:YES];
+  if ([message hasPrefix:@"waiting for USB NCM"]) [self setStatus:@"Waiting for USB" running:YES];
+  if ([message hasPrefix:@"USB link changed;"]) [self setStatus:@"Reconnecting USB" running:YES];
 }
 
 - (void)consumeServerOutput:(NSString *)text {
@@ -207,6 +209,7 @@
     [root stringByAppendingPathComponent:@"tools/mac_accelerator/run_coreml_server.sh"],
     [root stringByAppendingPathComponent:@".coreml-venv/bin/python"],
     [root stringByAppendingPathComponent:@"tools/mac_accelerator/artifacts/big_driving.mlpackage"],
+    [root stringByAppendingPathComponent:@"tools/mac_accelerator/usb_ncm_supervisor.py"],
   ];
   for (NSString *path in required) {
     if (![NSFileManager.defaultManager fileExistsAtPath:path]) {

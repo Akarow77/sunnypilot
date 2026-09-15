@@ -176,6 +176,11 @@ directory, keeps the Mac awake, limits auxiliary math-library threads, and start
 the Core ML/ANE worker. It shows server and authenticated 3X connection status but
 does not publish vehicle-control outputs.
 
+The launcher supervises the scoped USB-NCM endpoint. If a 3X reboot or cable
+reconnection changes the macOS interface index, it raises `usb0`, rediscovers both
+link-local addresses, and restarts the server on the new scope. An unchanged-link
+model/server failure remains stopped instead of entering a restart loop.
+
 The app requires macOS 15 or newer for the converted model. Select **Mac-only test
 (localhost, no 3X)** before Start to avoid ADB/USB setup. Server Ready / Client
 connected are service states, not driving readiness or a latency qualification.
