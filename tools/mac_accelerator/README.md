@@ -132,7 +132,8 @@ Moving this work after publication and isolating the worker does not prove zero
 impact on the next local frame. This revised integration has not been tested or
 installed on the disconnected 3X. Real-device A/B timing remains required.
 
-The worker connects only when the first frame arrives, detects a 500 ms source
+The worker waits in loading state without a fixed deadline until the first calibrated
+frame arrives, connects only for that first frame, detects a subsequent 500 ms source
 stall, and emits a heartbeat at most four times per second. The UI rejects missing,
 future, or more-than-two-second-old heartbeats. Logs stop at 32 MiB per session;
 startup refuses a directory already at 256 MiB (existing logs are not deleted).

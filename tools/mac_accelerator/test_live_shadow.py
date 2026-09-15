@@ -180,16 +180,18 @@ class MailboxTests(unittest.TestCase):
 
 
 class WorkerLifecycleTests(unittest.TestCase):
-  def test_no_first_frame_times_out_without_connecting(self):
+  def test_no_first_frame_waits_without_connecting_until_parent_exits(self):
     with tempfile.TemporaryDirectory() as directory, patch('live_shadow.make_ui_state') as make_ui, \
-         patch('live_shadow.os.getppid', return_value=1), patch('live_shadow.time.monotonic', side_effect=[0, 16]), \
+         patch('live_shadow.os.getppid', side_effect=[1, 2]), patch('live_shadow.time.monotonic', return_value=0), \
+         patch('live_shadow.time.sleep'), \
          patch('live_shadow.AcceleratorClient') as client:
       mailbox = Mock()
       mailbox.receive.return_value = None
-      self.assertEqual(run(mailbox, {'log_dir': directory}, 1), 1)
+      self.assertEqual(run(mailbox, {'log_dir': directory}, 1), 0)
       client.assert_not_called()
-      make_ui.return_value.failed.assert_called_once()
-      self.assertIn('no first camera', next(Path(directory).glob('live-*.jsonl')).read_text())
+      make_ui.return_value.failed.assert_not_called()
+      make_ui.return_value.disconnected.assert_called_once()
+      self.assertEqual(next(Path(directory).glob('live-*.jsonl')).read_text(), '')
 
   def test_stalled_source_latches_and_closes_client(self):
     with tempfile.TemporaryDirectory() as directory, patch('live_shadow.make_ui_state'), \

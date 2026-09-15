@@ -153,7 +153,7 @@ def run(mailbox: FrameMailbox, config: dict, parent_pid: int):
   ui = make_ui_state(config.get('publish_ui', True))
   log = client = session = None
   last_sequence = 0
-  started = last_frame_time = time.monotonic()
+  last_frame_time = time.monotonic()
   current_frame = None
   try:
     ui.loading()
@@ -169,8 +169,9 @@ def run(mailbox: FrameMailbox, config: dict, parent_pid: int):
         ui.heartbeat()
         if session is not None and time.monotonic() - last_frame_time > 0.5:
           raise TimeoutError('no camera frames for 500ms')
-        if session is None and time.monotonic() - started > 15:
-          raise TimeoutError('no first camera frame within 15s')
+        # Calibration and camera-state publication can legitimately take longer
+        # than a fixed startup window. Stay loading without connecting until the
+        # first eligible frame; heartbeat expiry still detects worker death.
         time.sleep(0.002)
         continue
       last_sequence, current_frame, pixels = packet
