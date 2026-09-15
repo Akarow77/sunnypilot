@@ -442,7 +442,7 @@ def main(demo=False):
         'port': params.get('MacAcceleratorPort', return_default=True),
         'deadline_ms': params.get('MacAcceleratorDeadlineMs', return_default=True),
         'expected_model_sha256': params.get('MacAcceleratorExpectedModelSHA256'),
-      })
+      }, copy_budget_ms=20.0)
       atexit.register(shadow.close)
       shadow.start()
     except Exception:
@@ -593,7 +593,12 @@ def main(demo=False):
       pm.send('modelDataV2SP', mdv2sp_send)
       # Snapshot only AFTER every local output is published. The host readback
       # remains synchronous; its effect on next-frame timing needs 3X validation.
-      if shadow is not None and not shadow.failed_reason and live_calib_seen and model.shadow_warp is not None:
+      # The first real-device GPU readback measurement is parked-only. If the
+      # car moves or lateral control activates, the worker receives no further
+      # frames and fails closed on its 500 ms source-stall timeout.
+      parked_shadow_probe = v_ego < 0.5 and not sm['carControl'].latActive
+      if (shadow is not None and not shadow.failed_reason and live_calib_seen
+          and model.shadow_warp is not None and parked_shadow_probe):
         try:
           shadow.capture(
             model.shadow_warp, camera_frame_id=meta_main.frame_id, extra_frame_id=meta_extra.frame_id,

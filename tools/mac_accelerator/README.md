@@ -126,8 +126,12 @@ the Big Model temporal context and 66 consecutive results meet both timing limit
 Missing camera frames reset recurrent queues and readiness; duplicate/backward,
 stale, uncalibrated, or unsynchronized inputs fail the session.
 
-**The GPU-to-host readback is still synchronous.** A 2 ms snapshot budget disables
-future snapshots after an overrun; it cannot prevent or undo the first slow copy.
+**The GPU-to-host readback is still synchronous.** The initial real-device probe is
+restricted to a parked car with lateral control inactive and uses a 20 ms snapshot
+budget so the actual QCOM readback cost can be measured. Moving above 0.5 m/s or
+activating lateral control stops frame delivery and the worker fails closed. The
+budget disables future snapshots after an overrun; it cannot prevent or undo the
+first slow copy. Do not treat this measurement mode as a driving configuration.
 Moving this work after publication and isolating the worker does not prove zero
 impact on the next local frame. This revised integration has not been tested or
 installed on the disconnected 3X. Real-device A/B timing remains required.

@@ -18,6 +18,7 @@ from transport import WARPED_BYTES, WARPED_SHAPE
 HEADER = struct.Struct('<QQII')
 META_SIZE = 4096
 SIZE = HEADER.size + META_SIZE + WARPED_BYTES
+ERROR_PIXEL_SIZE = 0
 
 
 class FrameMailbox:
@@ -54,6 +55,24 @@ class FrameMailbox:
     finally:
       fcntl.flock(self.fd, fcntl.LOCK_UN)
 
+  def publish_error(self, reason: str) -> bool:
+    """Best-effort producer failure handoff without Params or filesystem I/O."""
+    try:
+      fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+      return False
+    try:
+      meta = json.dumps({'producer_error': str(reason)[:1024]}, allow_nan=False).encode()
+      if len(meta) > META_SIZE:
+        return False
+      self.memory[HEADER.size:HEADER.size + len(meta)] = meta
+      self.sequence += 1
+      self.memory[:HEADER.size] = HEADER.pack(
+        self.sequence, time.monotonic_ns(), len(meta), ERROR_PIXEL_SIZE)
+      return True
+    finally:
+      fcntl.flock(self.fd, fcntl.LOCK_UN)
+
   def receive(self, after: int) -> tuple[int, dict, bytes] | None:
     try:
       fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -63,9 +82,11 @@ class FrameMailbox:
       sequence, queued_ns, meta_size, pixel_size = HEADER.unpack_from(self.memory)
       if sequence <= after:
         return None
-      if not 0 < meta_size <= META_SIZE or pixel_size != WARPED_BYTES:
+      if not 0 < meta_size <= META_SIZE or pixel_size not in (ERROR_PIXEL_SIZE, WARPED_BYTES):
         raise ValueError('invalid shadow mailbox header')
       metadata = json.loads(self.memory[HEADER.size:HEADER.size + meta_size])
+      if pixel_size == ERROR_PIXEL_SIZE:
+        raise RuntimeError(f"producer failure: {metadata.get('producer_error', 'unknown')}")
       metadata['queued_ns'] = queued_ns
       pixels = self.memory[HEADER.size + META_SIZE:]
       return sequence, metadata, pixels
@@ -104,7 +125,10 @@ class ShadowPublisher:
     )
 
   def fail(self, reason: str) -> None:
-    self.failed_reason = self.failed_reason or reason
+    if self.failed_reason is not None:
+      return
+    self.failed_reason = reason
+    self.mailbox.publish_error(reason)
     # No logging, parameter writes or network I/O in the modeld path.
 
   def capture(self, tensor, **metadata) -> bool:

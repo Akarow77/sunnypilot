@@ -165,9 +165,21 @@ class MailboxTests(unittest.TestCase):
     publisher.process.poll.return_value = None
     tensor = Mock()
     tensor.numpy.return_value = np.zeros(WARPED_SHAPE, dtype=np.uint8)
-    with patch('shadow_ipc.time.monotonic_ns', side_effect=[0, 2_000_000]):
+    with patch('shadow_ipc.time.monotonic_ns', side_effect=[0, 2_000_000, 2_100_000]):
       self.assertFalse(publisher.capture(tensor))
     self.assertIn('budget', publisher.failed_reason)
+    consumer = FrameMailbox(publisher.path)
+    self.addCleanup(consumer.close)
+    with self.assertRaisesRegex(RuntimeError, 'readback exceeded copy budget'):
+      consumer.receive(0)
+
+  def test_mailbox_producer_error_is_bounded_and_terminal(self):
+    with tempfile.TemporaryDirectory() as directory:
+      mailbox = FrameMailbox(Path(directory) / 'frames', create=True)
+      self.addCleanup(mailbox.close)
+      self.assertTrue(mailbox.publish_error('broken'))
+      with self.assertRaisesRegex(RuntimeError, 'producer failure: broken'):
+        mailbox.receive(0)
 
   def test_modeld_publishes_before_snapshot(self):
     path = Path(__file__).resolve().parents[2] / 'openpilot/sunnypilot/modeld_v2/modeld.py'
@@ -177,6 +189,12 @@ class MailboxTests(unittest.TestCase):
     captures = [n.lineno for n in calls if isinstance(n.func.value, ast.Name) and n.func.value.id == 'shadow' and n.func.attr == 'capture']
     self.assertEqual(len(captures), 1)
     self.assertGreater(captures[0], max(publishes))
+
+  def test_first_device_readback_probe_is_parked_only(self):
+    path = Path(__file__).resolve().parents[2] / 'openpilot/sunnypilot/modeld_v2/modeld.py'
+    source = path.read_text()
+    self.assertIn("parked_shadow_probe = v_ego < 0.5 and not sm['carControl'].latActive", source)
+    self.assertIn('and model.shadow_warp is not None and parked_shadow_probe', source)
 
 
 class WorkerLifecycleTests(unittest.TestCase):
