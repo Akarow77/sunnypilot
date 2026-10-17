@@ -119,6 +119,36 @@ def test_fallback_resets_stock_numpy_views_without_adapter():
   assert not model.prev_desire.any()
 
 
+def test_fallback_resets_adapter_and_legacy_gpu_queues():
+  queues = {name: Mock() for name in ('img_q', 'big_img_q', 'feat_q', 'desire_q', 'tfm', 'packed_npy_inputs')}
+  adapter = SimpleNamespace(reset_warmup_buffers=Mock(), input_queues=queues)
+  model = SimpleNamespace(adapter=adapter, prev_desire=np.ones(8, np.float32))
+  reset_local_model(model)
+  adapter.reset_warmup_buffers.assert_called_once_with()
+  for name, tensor in queues.items():
+    if name.endswith('_q'):
+      tensor.assign.assert_called_once_with(0)
+      tensor.assign.return_value.realize.assert_called_once_with()
+    else:
+      tensor.assign.assert_not_called()
+  assert not model.prev_desire.any()
+
+
+def test_fallback_resets_stock_native_state_pairs_and_packed_input():
+  queues = {name: Mock() for name in ('features_buffer', 'desire', 'new_img')}
+  model = SimpleNamespace(input_queues=queues, state_pairs={'features_buffer': 'next_features_buffer'},
+                          packed_input=np.ones(128, np.uint8), npy={'desire': np.ones(8, np.float32)},
+                          prev_desire=np.ones(8, np.float32))
+  reset_local_model(model)
+  queues['features_buffer'].assign.assert_called_once_with(0)
+  queues['features_buffer'].assign.return_value.realize.assert_called_once_with()
+  queues['desire'].assign.assert_not_called()
+  queues['new_img'].assign.assert_not_called()
+  assert not model.packed_input.any()
+  assert not model.npy['desire'].any()
+  assert not model.prev_desire.any()
+
+
 @pytest.mark.parametrize('transform', [np.eye(2), np.full((3, 3), np.nan)])
 def test_bad_transform_rejected_before_mapping(transform):
   model = LanModel.__new__(LanModel)
@@ -156,4 +186,3 @@ def test_rejects_short_camera_buffer_before_gpu_mapping():
   with pytest.raises(ValueError, match='smaller'):
     model._frame(np.zeros(8, np.uint8))
   model._Tensor.from_blob.assert_not_called()
-

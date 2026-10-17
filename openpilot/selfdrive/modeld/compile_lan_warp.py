@@ -1,6 +1,6 @@
 """Compile the LAN model's native two-camera 512x256 NV12 warp.
 
-This uses the compiler shipped with this branch, independently of the selected
+This uses the tinygrad compiler shipped with this branch, independently of the selected
 local model's resolution and recurrent queues. No full-frame concatenation is
 needed: camera buffers remain separate device inputs.
 """
@@ -9,9 +9,8 @@ import pickle
 
 import numpy as np
 from tinygrad import Device, Tensor
-from tinygrad.engine.jit import TinyJit
-
-from openpilot.selfdrive.modeld.compile_modeld import NV12Frame, make_frame_prepare, _parse_size
+from examples.openpilot.compile_warp import NV12Frame, make_frame_prepare, parse_size
+from examples.openpilot.helpers import allocate_inputs, compile_jit, dump_pickle
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 
 
@@ -29,19 +28,26 @@ def make_lan_warp(nv12):
 
 def compile_lan_warp(nv12):
   run = make_lan_warp(nv12)
-  jit = TinyJit(run, prune=True)
   specs = {'frame': ((nv12.size,), np.dtype(np.uint8).str, Device.DEFAULT),
            'big_frame': ((nv12.size,), np.dtype(np.uint8).str, Device.DEFAULT),
            'M_inv': ((2, 3, 3), np.dtype(np.float32).str, 'NPY')}
+
+  def make_inputs(seed):
+    rng = np.random.default_rng(seed)
+    def initialize(views):
+      for name in ('frame', 'big_frame'):
+        views[name][:] = rng.integers(0, 256, nv12.size, dtype=np.uint8)
+      views['M_inv'][:] = np.repeat(np.eye(3, dtype=np.float32)[None], 2, axis=0)
+      views['M_inv'][:, :2, 2] = rng.uniform(-20, 20, (2, 2))
+    return (), allocate_inputs(specs, initialize)
+
+  jit = compile_jit(run, make_inputs, 1)
   rng = np.random.default_rng(42)
   frames = [rng.integers(0, 256, nv12.size, dtype=np.uint8) for _ in range(2)]
   transforms = np.repeat(np.eye(3, dtype=np.float32)[None], 2, axis=0)
   transform_tensor = Tensor(transforms, device='NPY').realize()
   inputs = {'frame': Tensor(frames[0], device=Device.DEFAULT).realize(),
             'big_frame': Tensor(frames[1], device=Device.DEFAULT).realize(), 'M_inv': transform_tensor}
-
-  for _ in range(3):  # eager execution, capture, and replay
-    np.testing.assert_array_equal(jit(**inputs).numpy(), run(**inputs).numpy())
 
   # Validate the serialized artifact with the same NPY allocation updated in
   # place, exactly as modeld does. Check calibration and frame changes separately
@@ -67,11 +73,11 @@ def compile_lan_warp(nv12):
 
 if __name__ == '__main__':
   parser = argparse.ArgumentParser()
-  parser.add_argument('--camera-resolution', type=_parse_size, required=True)
+  parser.add_argument('--camera-resolution', type=parse_size, required=True)
   parser.add_argument('--output', required=True)
   args = parser.parse_args()
   cam_w, cam_h = args.camera_resolution
   nv12 = NV12Frame(cam_w, cam_h, *get_nv12_info(cam_w, cam_h))
   artifact = compile_lan_warp(nv12)
   with open(args.output, 'wb') as f:
-    pickle.dump(artifact, f, protocol=pickle.HIGHEST_PROTOCOL)
+    dump_pickle(artifact, f)

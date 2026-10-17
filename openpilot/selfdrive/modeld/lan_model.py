@@ -90,11 +90,19 @@ class LanModel:
 
 def reset_local_model(model):
   """Discard history accumulated before remote inference, including legacy GPU queues."""
-  # This branch keeps recurrent state directly on ModelState (not an adapter).
-  for value in getattr(model, 'numpy_inputs', getattr(model, 'npy', {})).values():
-    value[:] = 0
-  for name, tensor in model.input_queues.items():
-    if name.endswith('_q'):
+  adapter = getattr(model, 'adapter', None)
+  state = adapter if adapter is not None else model
+  if adapter is not None:
+    adapter.reset_warmup_buffers()
+  else:
+    if hasattr(model, 'packed_input'):
+      model.packed_input[:] = 0
+    for value in getattr(model, 'numpy_inputs', getattr(model, 'npy', {})).values():
+      value[:] = 0
+  # Native adapters reset state_pairs themselves. Legacy adapters only clear
+  # host inputs; their recurrent GPU queues also need to be explicitly zeroed.
+  state_names = getattr(model, 'state_pairs', {}) if adapter is None else {}
+  for name, tensor in state.input_queues.items():
+    if name.endswith('_q') or name in state_names:
       tensor.assign(0).realize()
   model.prev_desire[:] = 0
-

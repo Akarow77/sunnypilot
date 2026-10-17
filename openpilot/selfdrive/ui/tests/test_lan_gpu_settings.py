@@ -19,6 +19,9 @@ def constructor_signature(relative, class_name):
   parameters = [inspect.Parameter(arg.arg, inspect.Parameter.POSITIONAL_OR_KEYWORD,
                                   default=inspect.Parameter.empty if i < required else None)
                 for i, arg in enumerate(init.args.args) if i]
+  parameters.extend(inspect.Parameter(arg.arg, inspect.Parameter.KEYWORD_ONLY,
+                                     default=inspect.Parameter.empty if default is None else None)
+                    for arg, default in zip(init.args.kwonlyargs, init.args.kw_defaults, strict=True))
   return inspect.Signature(parameters)
 
 
@@ -30,6 +33,38 @@ def test_mici_constructor_keywords_match_current_widgets():
   for node in ast.walk(tree):
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in signatures:
       signatures[node.func.id].bind(*[None for _ in node.args], **{kw.arg: None for kw in node.keywords})
+
+
+def test_mici_hud_preserves_sp_engagement_fade_and_lan_icons():
+  """The upstream MADS engagement fade must survive merging LAN HUD support."""
+  class Hud:
+    def __init__(self):
+      self._chestnut_fade_time = 0
+
+    def _update_state(self):
+      pass
+
+  state = SimpleNamespace(engaged=False)
+  textures = []
+  def texture(*args):
+    textures.append(args[0])
+    return args[0]
+  namespace = {'HudRenderer': Hud, 'ui_state': state, 'gui_app': SimpleNamespace(texture=texture),
+               'BlindSpotIndicators': lambda: SimpleNamespace(update=lambda: None),
+               'rl': SimpleNamespace(Rectangle=object, get_time=lambda: 12.5)}
+  path = UI_ROOT / 'sunnypilot/mici/onroad/hud_renderer.py'
+  tree = ast.parse(path.read_text())
+  classes = ast.Module(body=[node for node in tree.body if isinstance(node, ast.ClassDef)], type_ignores=[])
+  exec(compile(classes, str(path), 'exec'), namespace)
+  hud = namespace['HudRendererSP']()
+  assert hud._sp_engaged is False
+  assert textures == ['icons_mici/lan_gpu.png', 'icons_mici/lan_gpu_green.png', 'icons_mici/lan_gpu_orange.png']
+  state.engaged = True
+  hud._update_state()
+  assert hud._sp_engaged is True and hud._chestnut_fade_time == 12.5
+  state.engaged = False
+  hud._update_state()
+  assert hud._sp_engaged is False and hud._chestnut_fade_time == 0
 
 
 @pytest.fixture
@@ -124,18 +159,18 @@ def panels():
     action.set_enabled(kwargs.get('enabled', True))
     return SimpleNamespace(action_item=action, callback=kwargs.get('callback'))
 
-    namespace = {
-      'ui_state': state, 'BigButton': Button, 'GreyBigButton': Button, 'BigParamControl': ParamControl,
-      'BigInputDialog': InputDialog, 'BigDialog': lambda *args: args, 'NavScroller': Widget, 'Widget': Widget,
-      'gui_app': SimpleNamespace(push_widget=dialogs.append),
-      'threading': SimpleNamespace(Thread=Thread),
-      'usb_network': SimpleNamespace(parse_address=parse_address,
+  namespace = {
+    'ui_state': state, 'BigButton': Button, 'GreyBigButton': Button, 'BigParamControl': ParamControl,
+    'BigInputDialog': InputDialog, 'BigDialog': lambda *args: args, 'NavScroller': Widget, 'Widget': Widget,
+    'gui_app': SimpleNamespace(push_widget=dialogs.append),
+    'threading': SimpleNamespace(Thread=Thread),
+    'usb_network': SimpleNamespace(parse_address=parse_address,
       configured_address=lambda: ipaddress.IPv4Interface(values.get('UsbNetworkAddress', '10.47.0.1/24')),
       up=lambda: network_calls.append(('up', dict(values))), down=lambda: network_calls.append(('down', dict(values)))),
-      'tr': lambda value: value, 'toggle_item_sp': item, 'button_item_sp': item,
-      'Scroller': lambda items, **kwargs: SimpleNamespace(items=items),
-      'DialogResult': SimpleNamespace(CONFIRM='confirm'), 'InputDialogSP': InputDialogSP, 'alert_dialog': lambda value: value,
-    }
+    'tr': lambda value: value, 'toggle_item_sp': item, 'button_item_sp': item,
+    'Scroller': lambda items, **kwargs: SimpleNamespace(items=items),
+    'DialogResult': SimpleNamespace(CONFIRM='confirm'), 'InputDialogSP': InputDialogSP, 'alert_dialog': lambda value: value,
+  }
   for path in ('mici/layouts/settings/langpu.py', 'sunnypilot/layouts/settings/langpu.py'):
     tree = ast.parse((UI_ROOT / path).read_text())
     classes = ast.Module(body=[node for node in tree.body if isinstance(node, ast.ClassDef)], type_ignores=[])
