@@ -1,4 +1,5 @@
 import ipaddress
+from types import SimpleNamespace
 
 from openpilot.system.hardware import usb_network
 
@@ -15,6 +16,7 @@ def test_peer_from_leases(tmp_path, monkeypatch):
   leases = tmp_path / "dnsmasq-eth0.leases"
   leases.write_text("100 aa:bb 10.47.0.20 mac *\n200 cc:dd 10.47.0.30 mac *\n300 ee:ff 192.168.43.5 phone *\n")
   monkeypatch.setattr(usb_network, "configured_address", lambda: ipaddress.IPv4Interface("10.47.0.1/24"))
+  monkeypatch.setattr(usb_network, "DNSMASQ_LEASES", str(leases))
   monkeypatch.setattr(usb_network.glob, "glob", lambda _: [str(leases)])
   assert usb_network.peer_address() == "10.47.0.30"  # newest on our subnet, not the hotspot's
 
@@ -45,3 +47,31 @@ def test_network_configuration_does_not_run_on_mac(monkeypatch):
   monkeypatch.setattr(usb_network, '_down', forbidden)
   assert usb_network.up() is False
   usb_network.down()
+
+
+def test_activate_only_available_managed_usb_ethernet():
+  from jeepney.low_level import HeaderFields
+  devices = {
+    '/eth0': (1, 'eth0', True, 70),  # existing DHCP profile is still connecting
+    '/wifi': (2, 'wlan0', True, 100),
+    '/gadget': (1, 'usb0', True, 100),
+    '/unmanaged': (1, 'enx123', False, 10),
+    '/unplugged': (1, 'eth1', True, 20),
+  }
+  activated = []
+
+  class Connection:
+    def send_and_get_reply(self, message):
+      member = message.header.fields[HeaderFields.member]
+      if member == 'GetDevices':
+        return SimpleNamespace(body=(list(devices),))
+      if member == 'GetAll':
+        kind, interface, managed, state = devices[message.header.fields[HeaderFields.path]]
+        return SimpleNamespace(body=({'DeviceType': ('u', kind), 'Interface': ('s', interface),
+                                     'Managed': ('b', managed), 'State': ('u', state)},))
+      assert member == 'ActivateConnection'
+      activated.append(message.body)
+      return SimpleNamespace(body=('/active',))
+
+  usb_network._activate_connection(Connection(), '/profile')
+  assert activated == [('/profile', '/eth0', '/')]

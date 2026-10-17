@@ -128,7 +128,8 @@ def _nm_connection(conn, address: ipaddress.IPv4Interface | None) -> str | None:
     ipv4 = current.get('ipv4', {})
     data = ipv4.get('address-data', ('', []))[1]
     if 'interface-name' not in current['connection'] and data and ipv4.get('method', ('', ''))[1] == method and \
-       data[0]['address'][1] == str(address.ip) and data[0]['prefix'][1] == address.network.prefixlen:
+       data[0]['address'][1] == str(address.ip) and data[0]['prefix'][1] == address.network.prefixlen and \
+       current['connection'].get('autoconnect-priority', ('i', 0))[1] == 1000:
       return path
     conn.send_and_get_reply(new_method_call(addr, 'Delete'))  # subnet changed in settings, or an old shared/gadget one
   if address is None:
@@ -139,6 +140,7 @@ def _nm_connection(conn, address: ipaddress.IPv4Interface | None) -> str | None:
       'uuid': ('s', str(uuid.uuid4())),
       'id': ('s', CONNECTION_ID),
       'autoconnect': ('b', True),
+      'autoconnect-priority': ('i', 1000),
     },
     'ipv4': {
       'method': ('s', method),
@@ -148,6 +150,22 @@ def _nm_connection(conn, address: ipaddress.IPv4Interface | None) -> str | None:
     'ipv6': {'method': ('s', 'ignore')},
   }
   return conn.send_and_get_reply(new_method_call(settings, 'AddConnection', 'a{sa{sv}}', (connection,))).body[0]
+
+
+def _activate_connection(conn, path: str) -> None:
+  """An existing DHCP profile may already own the adapter; adding a profile is not enough."""
+  from jeepney import DBusAddress, new_method_call
+  from openpilot.system.ui.lib.networkmanager import NM, NM_PATH, NM_IFACE, NM_DEVICE_IFACE, NM_PROPERTIES_IFACE
+
+  manager = DBusAddress(NM_PATH, bus_name=NM, interface=NM_IFACE)
+  for device in conn.send_and_get_reply(new_method_call(manager, 'GetDevices')).body[0]:
+    props = DBusAddress(device, bus_name=NM, interface=NM_PROPERTIES_IFACE)
+    state = conn.send_and_get_reply(new_method_call(props, 'GetAll', 's', (NM_DEVICE_IFACE,))).body[0]
+    if state.get('DeviceType', ('u', 0))[1] != 1 or not state.get('Interface', ('s', ''))[1].startswith(('eth', 'enx')):
+      continue
+    if not state.get('Managed', ('b', False))[1] or state.get('State', ('u', 0))[1] < 30:
+      continue
+    conn.send_and_get_reply(new_method_call(manager, 'ActivateConnection', 'ooo', (path, device, '/')))
 
 
 def up() -> bool:
@@ -166,8 +184,10 @@ def _up() -> bool:
     _stop_dnsmasq()
     _remove_nat()
     with open_dbus_connection(bus="SYSTEM") as conn:
-      if _nm_connection(conn, address) is None:
+      path = _nm_connection(conn, address)
+      if path is None:
         return False
+      _activate_connection(conn, path)
     subprocess.run(["sudo", *dnsmasq_args(address, gateway)], check=True, capture_output=True)  # forks into the background
     if gateway:
       _add_nat(address)
