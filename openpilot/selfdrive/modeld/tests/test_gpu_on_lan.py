@@ -29,6 +29,16 @@ def test_request_layout():
   assert np.frombuffer(body[header_len + 12:], dtype=np.float32).tolist() == [0.25, 0.5]
 
 
+def test_request_is_owned_snapshot_of_noncontiguous_and_readonly_views():
+  backing = np.arange(24, dtype=np.uint8).reshape(4, 6)
+  image = backing[:, ::2]
+  image.flags.writeable = False
+  expected = image.tobytes()
+  body, header_len = encode_infer_request(0, 1, True, {'img': image})
+  backing[:] = 0
+  assert body[header_len:] == expected
+
+
 def test_decode_response():
   outputs = np.array([1., 2., 3.], dtype=np.float32)
   header = json.dumps({"model_name": "driving_policy", "parameters": {"sequence_warm": True},

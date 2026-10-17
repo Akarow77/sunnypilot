@@ -116,7 +116,9 @@ def encode_infer_request(seq: int, sequence_id: int, start: bool, tensors: dict[
     "outputs": [{"name": "outputs", "parameters": {"binary_data": True}}],
   }
   header_bytes = json.dumps(header, separators=(',', ':')).encode()
-  return header_bytes + b''.join(np.ascontiguousarray(v).tobytes() for v in tensors.values()), len(header_bytes)
+  # A single owned body snapshot: no per-tensor .tobytes(), payload join and
+  # header concatenation copies. HTTP still owns stable bytes during the request.
+  return b''.join([header_bytes, *(memoryview(np.ascontiguousarray(v)).cast('B') for v in tensors.values())]), len(header_bytes)
 
 
 def decode_infer_response(body: bytes, header_len: int) -> tuple[dict, np.ndarray]:
@@ -206,15 +208,15 @@ class GpuOnLan:
       raise ValueError("camera warp does not match remote model")
     tensors = {
       "new_img": new_img,
-      "desire": desire.astype(np.float32),
-      "traffic_convention": traffic_convention.astype(np.float32),
-      "action_t": action_t.astype(np.float32),
+      "desire": desire.astype(np.float32, copy=False),
+      "traffic_convention": traffic_convention.astype(np.float32, copy=False),
+      "action_t": action_t.astype(np.float32, copy=False),
     }
     # a model bundle may lay out the same inputs differently, e.g. desire (1, 8) vs (8,)
     for name, shape in self._input_shapes.items():
       if name in tensors:
         tensors[name] = tensors[name].reshape(shape)
-        if not np.all(np.isfinite(tensors[name])):
+        if tensors[name].dtype.kind == 'f' and not np.all(np.isfinite(tensors[name])):
           raise ValueError("model input not finite")
     seq = self._seq
     body, header_len = encode_infer_request(self._seq, self._sequence_id, self._seq == 0, tensors)

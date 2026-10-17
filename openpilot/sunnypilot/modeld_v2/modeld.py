@@ -34,7 +34,12 @@ from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value
 from openpilot.selfdrive.modeld.gpu_on_lan import connect_gpu_on_lan
-from openpilot.selfdrive.modeld.modeld import ChestnutGpuState
+from openpilot.selfdrive.modeld.modeld import (ChestnutGpuState, get_action_from_model as native_action,
+                                             LAT_SMOOTH_SECONDS as NATIVE_LAT_SMOOTH, LONG_SMOOTH_SECONDS as NATIVE_LONG_SMOOTH)
+from openpilot.selfdrive.modeld.lan_model import LanModel, reset_local_model
+from openpilot.selfdrive.modeld.fill_model_msg import (fill_model_msg as native_fill_model_msg,
+                                                      fill_driving_model_data as native_fill_driving_data,
+                                                      fill_pose_msg as native_fill_pose_msg, PublishState as NativePublishState)
 
 from openpilot.sunnypilot.modeld_v2.fill_model_msg import fill_model_msg, fill_pose_msg, PublishState, get_curvature_from_output
 from openpilot.sunnypilot.modeld_v2.parse_model_outputs import Parser
@@ -159,8 +164,7 @@ class ModelState(ModelStateBase):
 
   def run(self, bufs: dict[str, VisionBuf], transforms: dict[str, np.ndarray],
           inputs: dict[str, np.ndarray],
-          after_enqueue: Callable[[], None] | None = None,
-          remote: Callable[[], tuple[np.ndarray, dict[str, slice]]] | None = None) -> dict[str, np.ndarray] | None:
+          after_enqueue: Callable[[], None] | None = None) -> dict[str, np.ndarray] | None:
     self.adapter.copy_frames(bufs)
 
     desire_key = self.desire_key
@@ -181,47 +185,42 @@ class ModelState(ModelStateBase):
       self.numpy_inputs['tfm'][:, :] = transforms[self._road_key].reshape(3, 3)
       self.numpy_inputs['big_tfm'][:, :] = transforms[self._wide_key].reshape(3, 3)
 
-    if remote is not None:
-      # the big model on a computer on the network drives instead of this one (lan gpu); native models only
-      raw, slices = self.adapter.run(remote)
-      outputs = self.parser.parse_outputs({k: raw[np.newaxis, v] for k, v in slices.items()})
+    raw_outputs = self.adapter.run()
+
+    if after_enqueue is not None:
+      after_enqueue()
+
+    if self._combined_model_type == 'supercombo':
+      model_output = raw_outputs.numpy().flatten()
+      if self.chestnut and not np.all(np.isfinite(model_output)):
+        raise RuntimeError("model output not finite")
+      sliced = {k: model_output[np.newaxis, v] for k, v in self.vision_output_slices.items()}
+      outputs = self.parser.parse_outputs(sliced)
+      if 'prev_feat' in self.numpy_inputs and 'hidden_state' in self.vision_output_slices:
+        (self.numpy_inputs['prev_feat'].flat if self.adapter.is_native else self.numpy_inputs['prev_feat'])[:] = \
+          model_output[self.vision_output_slices['hidden_state']]
     else:
-      raw_outputs = self.adapter.run()
+      vision_output = raw_outputs[0].numpy().flatten()
+      vision_sliced = {k: vision_output[np.newaxis, v] for k, v in self.vision_output_slices.items()}
+      outputs = self.parser.parse_vision_outputs(vision_sliced)
 
-      if after_enqueue is not None:
-        after_enqueue()
+      if 'prev_feat' in self.numpy_inputs and 'hidden_state' in self.vision_output_slices:
+        (self.numpy_inputs['prev_feat'].flat if self.adapter.is_native else self.numpy_inputs['prev_feat'])[:] = \
+          vision_output[self.vision_output_slices['hidden_state']]
 
-      if self._combined_model_type == 'supercombo':
-        model_output = raw_outputs.numpy().flatten()
-        if self.chestnut and not np.all(np.isfinite(model_output)):
-          raise RuntimeError("model output not finite")
-        sliced = {k: model_output[np.newaxis, v] for k, v in self.vision_output_slices.items()}
-        outputs = self.parser.parse_outputs(sliced)
-        if 'prev_feat' in self.numpy_inputs and 'hidden_state' in self.vision_output_slices:
-          (self.numpy_inputs['prev_feat'].flat if self.adapter.is_native else self.numpy_inputs['prev_feat'])[:] = \
-            model_output[self.vision_output_slices['hidden_state']]
-      else:
-        vision_output = raw_outputs[0].numpy().flatten()
-        vision_sliced = {k: vision_output[np.newaxis, v] for k, v in self.vision_output_slices.items()}
-        outputs = self.parser.parse_vision_outputs(vision_sliced)
+      for i, policy_slices in enumerate(self._policy_slices_list):
+        policy_output = raw_outputs[i + 1].numpy().flatten()
+        policy_sliced = {k: policy_output[np.newaxis, v] for k, v in policy_slices.items()}
+        parsed = self.parser.parse_policy_outputs(policy_sliced)
+        if 'off' in self._policy_keys[i] and self._has_on_policy:
+          for key in ('plan', 'planplus', 'action'):
+            if any(key in self._policy_slices_list[j] for j, k in enumerate(self._policy_keys) if 'on' in k.lower()):
+              parsed.pop(key, None)
 
-        if 'prev_feat' in self.numpy_inputs and 'hidden_state' in self.vision_output_slices:
-          (self.numpy_inputs['prev_feat'].flat if self.adapter.is_native else self.numpy_inputs['prev_feat'])[:] = \
-            vision_output[self.vision_output_slices['hidden_state']]
+        outputs.update(parsed)
 
-        for i, policy_slices in enumerate(self._policy_slices_list):
-          policy_output = raw_outputs[i + 1].numpy().flatten()
-          policy_sliced = {k: policy_output[np.newaxis, v] for k, v in policy_slices.items()}
-          parsed = self.parser.parse_policy_outputs(policy_sliced)
-          if 'off' in self._policy_keys[i] and self._has_on_policy:
-            for key in ('plan', 'planplus', 'action'):
-              if any(key in self._policy_slices_list[j] for j, k in enumerate(self._policy_keys) if 'on' in k.lower()):
-                parsed.pop(key, None)
-
-          outputs.update(parsed)
-
-        if 'planplus' in outputs and 'plan' in outputs:
-          outputs['plan'] = outputs['plan'] + outputs['planplus']
+      if 'planplus' in outputs and 'plan' in outputs:
+        outputs['plan'] = outputs['plan'] + outputs['planplus']
 
     if 'desired_curvature' in outputs and 'prev_desired_curv' in self.numpy_inputs:
       buf = self.numpy_inputs['prev_desired_curv']
@@ -331,14 +330,23 @@ def main(demo=False):
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState", "carControl", "lateralDelay"])
 
   publish_state = PublishState()
+  lan_publish_state = NativePublishState()
   chestnut_state = ChestnutGpuState(pm, model.chestnut) if CHESTNUT else None
   gpu_on_lan = None
+  lan_model = None
   if LAN:
-    # loads like the chestnut: Big Model Loading until the server answers, the on-device model if it doesn't
-    if model.adapter.is_native and model._combined_model_type == 'supercombo':
+    # Warm the fallback while loading, not for the first time after a network failure.
+    model.warmup()
+    reset_local_model(model)
+    # The selected local model (including legacy SC) is only a fallback. Never
+    # feed native remote tensors through its preprocessing, parser or history.
+    try:
+      lan_model = LanModel(vipc_client_main.width, vipc_client_main.height)
       gpu_on_lan = connect_gpu_on_lan(params.get("GpuOnLanHost") or "usb", BIG_MODEL_TIMEOUT)
-    else:
-      cloudlog.warning("gpu on lan: requires a native supercombo model; using the local model")
+    except Exception:
+      cloudlog.exception("gpu on lan initialization failed; using the selected local model")
+    if gpu_on_lan is None:
+      lan_model = None
     params.put_bool("GpuOnLanActive", gpu_on_lan is not None)
     if gpu_on_lan is not None and gpu_on_lan.model_name:
       params.put("GpuOnLanModel", gpu_on_lan.model_name)
@@ -366,7 +374,6 @@ def main(demo=False):
   cloudlog.info("modeld got CarParams: %s", CP.brand)
 
   # TODO Move smooth seconds to action function
-  long_delay = CP.longitudinalActuatorDelay + model.LONG_SMOOTH_SECONDS
   prev_action = log.ModelDataV2.Action()
 
   DH = DesireHelper()
@@ -415,7 +422,8 @@ def main(demo=False):
       model.lat_delay = get_lat_delay(params, sm["lateralDelay"].lateralDelay)
       model.PLANPLUS_CONTROL = params.get("PlanplusControl", return_default=True)
       camera_offset_helper.set_offset(params.get("CameraOffset", return_default=True))
-    lat_delay = model.lat_delay + model.LAT_SMOOTH_SECONDS
+    lat_delay = model.lat_delay + (NATIVE_LAT_SMOOTH if gpu_on_lan is not None else model.LAT_SMOOTH_SECONDS)
+    long_delay = CP.longitudinalActuatorDelay + (NATIVE_LONG_SMOOTH if gpu_on_lan is not None else model.LONG_SMOOTH_SECONDS)
     if sm.updated["extrinsicsCalibration"] and sm.seen['narrowRoadCameraState'] and sm.seen['deviceState']:
       device_from_calib_euler = np.array(sm["extrinsicsCalibration"].rpyCalib, dtype=np.float32)
       dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['narrowRoadCameraState'].sensor))]
@@ -428,8 +436,9 @@ def main(demo=False):
     traffic_convention = np.zeros(2)
     traffic_convention[int(is_rhd)] = 1
 
-    vec_desire = np.zeros(model.constants.DESIRE_LEN, dtype=np.float32)
-    if desire >= 0 and desire < model.constants.DESIRE_LEN:
+    desire_len = 8 if gpu_on_lan is not None else model.constants.DESIRE_LEN
+    vec_desire = np.zeros(desire_len, dtype=np.float32)
+    if desire >= 0 and desire < desire_len:
       vec_desire[desire] = 1
 
     # tracked dropped frames
@@ -465,14 +474,14 @@ def main(demo=False):
     try:
       send_chestnut = (chestnut_state is not None and
                        run_count % round(model.constants.MODEL_FREQ / SERVICE_LIST['chestnutGpuState'].frequency) == 0)
-      gpu_on_lan_remote = None
       if gpu_on_lan is not None:
-        action_t = np.array([lat_action_t, long_action_t], dtype=np.float32)  # the server model takes it, the local one may not
-        gpu_on_lan_remote = lambda m=model, g=gpu_on_lan, tc=traffic_convention, at=action_t: (g.infer(  # noqa: E731
-          m.adapter.input_queues['new_img'].numpy(), m.numpy_inputs[m.desire_key], m.numpy_inputs.get('traffic_convention', tc),
-          m.numpy_inputs.get('action_t', at)), g.output_slices)
-      model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None, gpu_on_lan_remote)
-      big_on_lan = gpu_on_lan_remote is not None
+        assert lan_model is not None
+        model_output = lan_model.run(gpu_on_lan, buf_main, buf_extra, model_transform_main, model_transform_extra,
+                                    vec_desire, traffic_convention, np.array([lat_action_t, long_action_t], dtype=np.float32))
+        big_on_lan = True
+      else:
+        model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None)
+        big_on_lan = False
     except Exception:
       big_on_lan = False
       if gpu_on_lan is not None:
@@ -481,8 +490,9 @@ def main(demo=False):
         params.put_bool("GpuOnLanActive", False)
         gpu_on_lan.close()
         gpu_on_lan = None
-        model.adapter.reset_warmup_buffers()
-        model.prev_desire[:] = 0
+        lan_model = None
+        reset_local_model(model)
+        publish_state = PublishState()
         run_count = 0
         model_output = None
       else:
@@ -505,11 +515,17 @@ def main(demo=False):
       posenet_send = messaging.new_message('cameraOdometry')
       mdv2sp_send = messaging.new_message('modelDataV2SP')
 
-      action = model.get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego)
+      action_fn = native_action if big_on_lan else model.get_action_from_model
+      action = action_fn(model_output, prev_action, lat_action_t, long_action_t, v_ego)
       prev_action = action
-      fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
-                     publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
-                     frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen, meta_constants)
+      if big_on_lan:
+        native_fill_model_msg(modelv2_send, model_output, action,
+                              lan_publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
+                              frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen)
+      else:
+        fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
+                       publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
+                       frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen, meta_constants)
       modelv2_send.modelV2.big = model.chestnut or big_on_lan
 
       desire_state = modelv2_send.modelV2.meta.desireState
@@ -525,7 +541,10 @@ def main(demo=False):
       drivingdata_send.drivingModelData.meta.laneChangeState = DH.lane_change_state
       drivingdata_send.drivingModelData.meta.laneChangeDirection = DH.lane_change_direction
 
-      fill_pose_msg(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, live_calib_seen)
+      if big_on_lan:
+        native_fill_driving_data(drivingdata_send, modelv2_send)
+      pose_fn = native_fill_pose_msg if big_on_lan else fill_pose_msg
+      pose_fn(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, live_calib_seen)
       pm.send('modelV2', modelv2_send)
       pm.send('drivingModelData', drivingdata_send)
       pm.send('cameraOdometry', posenet_send)
