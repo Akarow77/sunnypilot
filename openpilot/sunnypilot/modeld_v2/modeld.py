@@ -36,7 +36,13 @@ from openpilot.system import sentry
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value
-from openpilot.selfdrive.modeld.modeld import ChestnutState
+from openpilot.selfdrive.modeld.gpu_on_lan import connect_gpu_on_lan
+from openpilot.selfdrive.modeld.modeld import (ChestnutState, get_action_from_model as native_action,
+                                             LAT_SMOOTH_SECONDS as NATIVE_LAT_SMOOTH, LONG_SMOOTH_SECONDS as NATIVE_LONG_SMOOTH)
+from openpilot.selfdrive.modeld.lan_model import LanModel, reset_local_model
+from openpilot.selfdrive.modeld.fill_model_msg import (fill_model_msg as native_fill_model_msg,
+                                                      fill_driving_model_data as native_fill_driving_data,
+                                                      fill_pose_msg as native_fill_pose_msg, PublishState as NativePublishState)
 
 from openpilot.selfdrive.modeld.compile_modeld import (
   MODELD_INPUTS,
@@ -331,6 +337,10 @@ def main(demo=False):
   params = Params()
   params.put_bool("ChestnutLoading", CHESTNUT)
   params.remove("ChestnutActive")
+  LAN = not CHESTNUT and params.get_bool("GpuOnLanEnabled")
+  params.put_bool("GpuOnLanLoading", LAN)
+  params.remove("GpuOnLanActive")
+  params.remove("GpuOnLanModel")
 
   # visionipc clients
   while True:
@@ -392,7 +402,26 @@ def main(demo=False):
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState", "carControl", "lateralDelay"])
 
   publish_state = PublishState()
+  lan_publish_state = NativePublishState()
   chestnut_state = ChestnutState(pm, model.chestnut) if CHESTNUT else None
+  gpu_on_lan = None
+  lan_model = None
+  if LAN:
+    # Warm the fallback while loading, not after the first network failure.
+    model.warmup()
+    reset_local_model(model)
+    # Local SC/split models retain their own preprocessing, parser and history.
+    try:
+      lan_model = LanModel(vipc_client_main.width, vipc_client_main.height)
+      gpu_on_lan = connect_gpu_on_lan(params.get("GpuOnLanHost") or "usb", BIG_MODEL_TIMEOUT)
+    except Exception:
+      cloudlog.exception("gpu on lan initialization failed; using the selected local model")
+    if gpu_on_lan is None:
+      lan_model = None
+    params.put_bool("GpuOnLanActive", gpu_on_lan is not None)
+    if gpu_on_lan is not None and gpu_on_lan.model_name:
+      params.put("GpuOnLanModel", gpu_on_lan.model_name)
+    params.put_bool("GpuOnLanLoading", False)
 
   # setup filter to track dropped frames
   frame_dropped_filter = FirstOrderFilter(0., 10., 1. / model.constants.MODEL_FREQ)
@@ -416,7 +445,6 @@ def main(demo=False):
   cloudlog.info("modeld got CarParams: %s", CP.brand)
 
   # TODO Move smooth seconds to action function
-  long_delay = CP.longitudinalActuatorDelay + model.LONG_SMOOTH_SECONDS
   prev_action = log.ModelDataV2.Action()
 
   DH = DesireHelper()
@@ -465,7 +493,8 @@ def main(demo=False):
       model.lat_delay = get_lat_delay(params, sm["lateralDelay"].lateralDelay)
       model.PLANPLUS_CONTROL = params.get("PlanplusControl", return_default=True)
       camera_offset_helper.set_offset(params.get("CameraOffset", return_default=True))
-    lat_delay = model.lat_delay + model.LAT_SMOOTH_SECONDS
+    lat_delay = model.lat_delay + (NATIVE_LAT_SMOOTH if gpu_on_lan is not None else model.LAT_SMOOTH_SECONDS)
+    long_delay = CP.longitudinalActuatorDelay + (NATIVE_LONG_SMOOTH if gpu_on_lan is not None else model.LONG_SMOOTH_SECONDS)
     if sm.updated["extrinsicsCalibration"] and sm.seen['narrowRoadCameraState'] and sm.seen['deviceState']:
       device_from_calib_euler = np.array(sm["extrinsicsCalibration"].rpyCalib, dtype=np.float32)
       dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['narrowRoadCameraState'].sensor))]
@@ -478,8 +507,9 @@ def main(demo=False):
     traffic_convention = np.zeros(2)
     traffic_convention[int(is_rhd)] = 1
 
-    vec_desire = np.zeros(model.constants.DESIRE_LEN, dtype=np.float32)
-    if desire >= 0 and desire < model.constants.DESIRE_LEN:
+    desire_len = 8 if gpu_on_lan is not None else model.constants.DESIRE_LEN
+    vec_desire = np.zeros(desire_len, dtype=np.float32)
+    if desire >= 0 and desire < desire_len:
       vec_desire[desire] = 1
 
     # tracked dropped frames
@@ -515,19 +545,39 @@ def main(demo=False):
     try:
       send_chestnut = (chestnut_state is not None and
                        run_count % round(model.constants.MODEL_FREQ / SERVICE_LIST['chestnutState'].frequency) == 0)
-      model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None)
+      if gpu_on_lan is not None:
+        assert lan_model is not None
+        model_output = lan_model.run(gpu_on_lan, buf_main, buf_extra, model_transform_main, model_transform_extra,
+                                    vec_desire, traffic_convention, np.array([lat_action_t, long_action_t], dtype=np.float32))
+        big_on_lan = True
+      else:
+        model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None)
+        big_on_lan = False
     except Exception:
-      if not params.get_bool("ChestnutActive"):
-        raise
-      cloudlog.exception("chestnut failed, falling back to small")
-      params.put_bool("ChestnutModelError", True)
-      params.put_bool("ChestnutActive", False)
-      assert small_model is not None
-      model = small_model
-      if chestnut_state is not None:
-        chestnut_state.big = False
-      run_count = 0
-      model_output = None
+      big_on_lan = False
+      if gpu_on_lan is not None:
+        # Local fallback remains active for the rest of this modeld lifecycle.
+        cloudlog.exception("gpu on lan failed, fall back to small")
+        params.put_bool("GpuOnLanActive", False)
+        gpu_on_lan.close()
+        gpu_on_lan = None
+        lan_model = None
+        reset_local_model(model)
+        publish_state = PublishState()
+        run_count = 0
+        model_output = None
+      else:
+        if not params.get_bool("ChestnutActive"):
+          raise
+        cloudlog.exception("chestnut failed, falling back to small")
+        params.put_bool("ChestnutModelError", True)
+        params.put_bool("ChestnutActive", False)
+        assert small_model is not None
+        model = small_model
+        if chestnut_state is not None:
+          chestnut_state.big = False
+        run_count = 0
+        model_output = None
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1
 
@@ -537,12 +587,18 @@ def main(demo=False):
       posenet_send = messaging.new_message('cameraOdometry')
       mdv2sp_send = messaging.new_message('modelDataV2SP')
 
-      action = model.get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego)
+      action_fn = native_action if big_on_lan else model.get_action_from_model
+      action = action_fn(model_output, prev_action, lat_action_t, long_action_t, v_ego)
       prev_action = action
-      fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
-                     publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
-                     frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen, meta_constants)
-      modelv2_send.modelV2.big = model.chestnut
+      if big_on_lan:
+        native_fill_model_msg(modelv2_send, model_output, action,
+                              lan_publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
+                              frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen)
+      else:
+        fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
+                       publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
+                       frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen, meta_constants)
+      modelv2_send.modelV2.big = model.chestnut or big_on_lan
 
       desire_state = modelv2_send.modelV2.meta.desireState
       l_lane_change_prob = desire_state[log.Desire.laneChangeLeft]
@@ -557,7 +613,10 @@ def main(demo=False):
       drivingdata_send.drivingModelData.meta.laneChangeState = DH.lane_change_state
       drivingdata_send.drivingModelData.meta.laneChangeDirection = DH.lane_change_direction
 
-      fill_pose_msg(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, live_calib_seen)
+      if big_on_lan:
+        native_fill_driving_data(drivingdata_send, modelv2_send)
+      pose_fn = native_fill_pose_msg if big_on_lan else fill_pose_msg
+      pose_fn(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, live_calib_seen)
       pm.send('modelV2', modelv2_send)
       pm.send('drivingModelData', drivingdata_send)
       pm.send('cameraOdometry', posenet_send)

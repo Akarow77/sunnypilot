@@ -33,6 +33,7 @@ from openpilot.sunnypilot.selfdrive.car.cruise_helpers import CruiseHelper
 from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.controller import IntelligentCruiseButtonManagement
 from openpilot.sunnypilot.selfdrive.selfdrived.button_state_tracker import ButtonStateTracker
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
+from openpilot.common.lan_gpu import model_lagging
 
 REPLAY = "REPLAY" in os.environ
 SIMULATION = "SIMULATION" in os.environ
@@ -85,6 +86,7 @@ class SelfdriveD(CruiseHelper):
     self.big_model_loading = False
     self.big_model_active = False
     self.big_model_failed = False
+    self.lan_gpu_driving = False
     self.big_model_ready_t = 0.
 
     # Setup sockets
@@ -195,7 +197,7 @@ class SelfdriveD(CruiseHelper):
       self.events.add(EventName.joystickDebug)
       self.startup_event = None
 
-    loading = self.params.get_bool("ChestnutLoading")
+    loading = self.params.get_bool("ChestnutLoading") or self.params.get_bool("GpuOnLanLoading")
     if self.big_model_loading and not loading:
       self.big_model_ready_t = time.monotonic()
       self.events_sp.add(custom.OnroadEventSP.EventName.bigModelReady)
@@ -205,6 +207,11 @@ class SelfdriveD(CruiseHelper):
 
     big_active = self.params.get("ChestnutActive")
     chestnut_present = self.sm['deviceState'].chestnutPresent
+    lan_gpu = big_active is None and not chestnut_present
+    if lan_gpu:
+      big_active = self.params.get("GpuOnLanActive")
+      chestnut_present = big_active is not None
+    self.lan_gpu_driving = lan_gpu and big_active is True
     model_unavailable = big_active is True and self.sm.seen['modelV2'] and not self.sm.alive['modelV2']
     big_failed = big_active is False or model_unavailable or (self.big_model_active and not chestnut_present)
     if big_failed and not self.big_model_failed:
@@ -505,7 +512,7 @@ class SelfdriveD(CruiseHelper):
 
     # TODO: fix simulator
     if not SIMULATION or REPLAY:
-      if self.sm['modelV2'].frameDropPerc > 1:
+      if model_lagging(self.sm['modelV2'].frameDropPerc, self.lan_gpu_driving):
         self.events.add(EventName.modeldLagging)
 
     # mute canBusMissing event if in Park, as it sometimes may trigger a false alarm with MADS in Paused state

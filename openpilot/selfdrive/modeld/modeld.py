@@ -34,6 +34,8 @@ from openpilot.common.file_chunker import open_file_chunked
 from openpilot.common.hardware.usb import CHESTNUT_USB_IDS
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 from openpilot.selfdrive.modeld.helpers import chestnut_present, chestnut_compiled, chestnut_ready, modeld_pkl_path, load_oob
+from openpilot.selfdrive.modeld.gpu_on_lan import connect_gpu_on_lan
+from openpilot.selfdrive.modeld.lan_model import LanModel, reset_local_model
 
 from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
@@ -261,6 +263,10 @@ def main(demo=False):
     params.put_bool("ChestnutActive", False)
   else:
     params.remove("ChestnutActive")
+  LAN = not CHESTNUT and params.get_bool("GpuOnLanEnabled")
+  params.put_bool("GpuOnLanLoading", LAN)
+  params.remove("GpuOnLanActive")
+  params.remove("GpuOnLanModel")
 
   config_realtime_process(7, 54)
 
@@ -325,6 +331,23 @@ def main(demo=False):
   publish_state = PublishState()
   params = Params()
   chestnut_state = ChestnutState(pm, model.chestnut) if CHESTNUT else None
+  gpu_on_lan = None
+  lan_model = None
+  if LAN:
+    # Compile/warm the selected local fallback before accepting remote frames.
+    model.warmup()
+    reset_local_model(model)
+    try:
+      lan_model = LanModel(vipc_client_main.width, vipc_client_main.height)
+      gpu_on_lan = connect_gpu_on_lan(params.get("GpuOnLanHost") or "usb", BIG_MODEL_TIMEOUT)
+    except Exception:
+      cloudlog.exception("gpu on lan initialization failed; using the selected local model")
+    if gpu_on_lan is None:
+      lan_model = None
+    params.put_bool("GpuOnLanActive", gpu_on_lan is not None)
+    if gpu_on_lan is not None and gpu_on_lan.model_name:
+      params.put("GpuOnLanModel", gpu_on_lan.model_name)
+    params.put_bool("GpuOnLanLoading", False)
 
   # setup filter to track dropped frames
   frame_dropped_filter = FirstOrderFilter(0., 10., 1. / ModelConstants.MODEL_RUN_FREQ)
@@ -436,20 +459,40 @@ def main(demo=False):
     try:
       send_chestnut = (chestnut_state is not None and
                        run_count % round(ModelConstants.MODEL_RUN_FREQ / SERVICE_LIST['chestnutState'].frequency) == 0)
-      model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None)
+      if gpu_on_lan is not None:
+        assert lan_model is not None
+        model_output = lan_model.run(gpu_on_lan, buf_main, buf_extra, model_transform_main, model_transform_extra,
+                                    vec_desire, traffic_convention, inputs['action_t'])
+        big_on_lan = True
+      else:
+        model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None)
+        big_on_lan = False
     except Exception:
-      if not params.get_bool("ChestnutActive"):
-        raise
-      # fallback to small model
-      cloudlog.exception("big model failed, fall back to small")
-      params.put_bool("ChestnutModelError", True)
-      params.put_bool("ChestnutActive", False)
-      assert small_model is not None
-      model = small_model
-      if chestnut_state is not None:
-        chestnut_state.big = False
-      run_count = 0
-      model_output = None
+      big_on_lan = False
+      if gpu_on_lan is not None:
+        # Do not reconnect within this modeld lifecycle after a failed frame.
+        cloudlog.exception("gpu on lan failed, fall back to small")
+        params.put_bool("GpuOnLanActive", False)
+        gpu_on_lan.close()
+        gpu_on_lan = None
+        lan_model = None
+        reset_local_model(model)
+        publish_state = PublishState()
+        run_count = 0
+        model_output = None
+      else:
+        if not params.get_bool("ChestnutActive"):
+          raise
+        # Preserve the existing Chestnut fallback path.
+        cloudlog.exception("big model failed, fall back to small")
+        params.put_bool("ChestnutModelError", True)
+        params.put_bool("ChestnutActive", False)
+        assert small_model is not None
+        model = small_model
+        if chestnut_state is not None:
+          chestnut_state.big = False
+        run_count = 0
+        model_output = None
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1
 
@@ -462,7 +505,7 @@ def main(demo=False):
       fill_model_msg(modelv2_send, model_output, action,
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
                      frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, extrinsics_calibration_seen)
-      modelv2_send.modelV2.big = model.chestnut
+      modelv2_send.modelV2.big = model.chestnut or big_on_lan
 
       desire_state = modelv2_send.modelV2.meta.desireState
       l_lane_change_prob = desire_state[log.Desire.laneChangeLeft]
