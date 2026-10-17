@@ -40,7 +40,9 @@ class LatControlTorque(LatControl):
     self.torque_params = CP.lateralTuning.torque.as_builder()
     self.torque_from_lateral_accel = CI.torque_from_lateral_accel()
     self.lateral_accel_from_torque = CI.lateral_accel_from_torque()
-    self.pid = PIDController([INTERP_SPEEDS, KP_INTERP], KI, KD, rate=1/self.dt)
+    self.high_speed_kp = CP_SP.torqueV0KpHighSpeed if CP_SP.torqueV0KpHighSpeed > 0.0 else KP
+    kp_interp = [*KP_INTERP[:-1], self.high_speed_kp]
+    self.pid = PIDController([INTERP_SPEEDS, kp_interp], KI, KD, rate=1/self.dt)
     self.update_limits()
     self.steering_angle_deadzone_deg = self.torque_params.steeringAngleDeadzoneDeg
     self.lat_accel_request_buffer_len = int(LAT_ACCEL_REQUEST_BUFFER_SECONDS / self.dt)

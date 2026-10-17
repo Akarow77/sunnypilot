@@ -18,6 +18,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.locationd.helpers import Pose
 from openpilot.common.mock.generators import generate_deviceMotion
 from openpilot.sunnypilot.selfdrive.car import interfaces as sunnypilot_interfaces
+from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_ext_base import LAT_ACCEL_FRICTION_FACTOR
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.common.test import OpenpilotTestCase
 
@@ -97,6 +98,12 @@ class TestLatControlTorqueExt(OpenpilotTestCase):
     controller, VM, _ = _make_controller(enhanced=True, nnlc=False)
     output_torque, _, pid_log = _run_update(controller, VM)
     assert pid_log.active
+
+  def test_zero_lookahead_keeps_configured_friction_response(self):
+    controller, VM, _ = _make_controller(enhanced=True, nnlc=False)
+    _run_update(controller, VM)
+    assert controller.extension.lookahead_lateral_jerk == 0.0
+    assert controller.extension.lat_accel_friction_factor == LAT_ACCEL_FRICTION_FACTOR
 
   def test_update_neither(self):
     controller, VM, _ = _make_controller(enhanced=False, nnlc=False)

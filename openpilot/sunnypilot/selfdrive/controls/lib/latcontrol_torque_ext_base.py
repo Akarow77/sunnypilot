@@ -16,6 +16,7 @@ LATERAL_LAG_MOD = 0.0  # seconds, modifies how far in the future we look ahead f
 
 KP = 1.0
 KI = 0.3
+LAT_ACCEL_FRICTION_FACTOR = 0.7
 
 
 def get_predicted_lateral_jerk(lat_accels, t_diffs):
@@ -91,7 +92,7 @@ class LatControlTorqueExtBase:
     # Scaling the lateral acceleration "friction response" could be helpful for some.
     # Increase for a stronger response, decrease for a weaker response.
     self.lat_jerk_friction_factor = 0.4
-    self.lat_accel_friction_factor = 0.7  # in [0, 3], in 0.05 increments. 3 is arbitrary safety limit
+    self.lat_accel_friction_factor = LAT_ACCEL_FRICTION_FACTOR
 
     # precompute time differences between ModelConstants.T_IDXS
     self.t_diffs = np.diff(ModelConstants.T_IDXS)
@@ -128,8 +129,9 @@ class LatControlTorqueExtBase:
                               self.model_v2.acceleration.y) - desired_lateral_accel) / self.desired_lat_jerk_time
       self.lookahead_lateral_jerk = get_lookahead_value(predicted_lateral_jerk[LAT_PLAN_MIN_IDX:friction_upper_idx], desired_lateral_jerk)
       if self.lookahead_lateral_jerk == 0.0:
+        # The lookahead filter rejected the jerk component. Keep the configured
+        # attenuation for the remaining acceleration-error friction response.
         self.actual_lateral_jerk = 0.0
-        self.lat_accel_friction_factor = 1.0
       self.lateral_jerk_setpoint = self.lat_jerk_friction_factor * self.lookahead_lateral_jerk
       self.lateral_jerk_measurement = self.lat_jerk_friction_factor * self.actual_lateral_jerk
 

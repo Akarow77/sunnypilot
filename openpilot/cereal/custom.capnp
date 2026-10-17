@@ -366,6 +366,7 @@ struct CarParamsSP @0x80ae746ee2596b11 {
   pcmCruiseSpeed @3 :Bool;
   intelligentCruiseButtonManagementAvailable @4 :Bool;
   enableGasInterceptor @5 :Bool;
+  torqueV0KpHighSpeed @6 :Float32;  # 0 uses the controller default
 
   neuralNetworkLateralControl @2 :NeuralNetworkLateralControl;
 
