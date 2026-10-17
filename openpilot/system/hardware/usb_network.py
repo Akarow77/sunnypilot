@@ -111,6 +111,11 @@ def _stop_dnsmasq() -> None:
 
 # NetworkManager over D-Bus (polkit-authorized, like the hotspot)
 
+def _nm_call(conn, message):
+  from jeepney.wrappers import unwrap_msg
+  return unwrap_msg(conn.send_and_get_reply(message))
+
+
 def _nm_connection(conn, address: ipaddress.IPv4Interface | None) -> str | None:
   """Finds our connection; with an address, (re)creates it so it matches."""
   from jeepney import DBusAddress, new_method_call
@@ -118,9 +123,9 @@ def _nm_connection(conn, address: ipaddress.IPv4Interface | None) -> str | None:
 
   settings = DBusAddress(NM_SETTINGS_PATH, bus_name=NM, interface=NM_SETTINGS_IFACE)
   method = 'manual'  # DHCP and NAT are ours (dnsmasq_args, nat_rules), not NetworkManager's shared mode
-  for path in conn.send_and_get_reply(new_method_call(settings, 'ListConnections')).body[0]:
+  for path in _nm_call(conn, new_method_call(settings, 'ListConnections'))[0]:
     addr = DBusAddress(path, bus_name=NM, interface=NM_CONNECTION_IFACE)
-    current = conn.send_and_get_reply(new_method_call(addr, 'GetSettings')).body[0]
+    current = _nm_call(conn, new_method_call(addr, 'GetSettings'))[0]
     if current['connection']['id'][1] != CONNECTION_ID:
       continue
     if address is None:
@@ -129,9 +134,9 @@ def _nm_connection(conn, address: ipaddress.IPv4Interface | None) -> str | None:
     data = ipv4.get('address-data', ('', []))[1]
     if 'interface-name' not in current['connection'] and data and ipv4.get('method', ('', ''))[1] == method and \
        data[0]['address'][1] == str(address.ip) and data[0]['prefix'][1] == address.network.prefixlen and \
-       current['connection'].get('autoconnect-priority', ('i', 0))[1] == 1000:
+       current['connection'].get('autoconnect-priority', ('i', 0))[1] == 999:
       return path
-    conn.send_and_get_reply(new_method_call(addr, 'Delete'))  # subnet changed in settings, or an old shared/gadget one
+    _nm_call(conn, new_method_call(addr, 'Delete'))  # subnet changed in settings, or an old shared/gadget one
   if address is None:
     return None
   connection = {
@@ -140,7 +145,7 @@ def _nm_connection(conn, address: ipaddress.IPv4Interface | None) -> str | None:
       'uuid': ('s', str(uuid.uuid4())),
       'id': ('s', CONNECTION_ID),
       'autoconnect': ('b', True),
-      'autoconnect-priority': ('i', 1000),
+      'autoconnect-priority': ('i', 999),
     },
     'ipv4': {
       'method': ('s', method),
@@ -149,7 +154,7 @@ def _nm_connection(conn, address: ipaddress.IPv4Interface | None) -> str | None:
     },
     'ipv6': {'method': ('s', 'ignore')},
   }
-  return conn.send_and_get_reply(new_method_call(settings, 'AddConnection', 'a{sa{sv}}', (connection,))).body[0]
+  return _nm_call(conn, new_method_call(settings, 'AddConnection', 'a{sa{sv}}', (connection,)))[0]
 
 
 def _activate_connection(conn, path: str) -> None:
@@ -158,14 +163,14 @@ def _activate_connection(conn, path: str) -> None:
   from openpilot.system.ui.lib.networkmanager import NM, NM_PATH, NM_IFACE, NM_DEVICE_IFACE, NM_PROPERTIES_IFACE
 
   manager = DBusAddress(NM_PATH, bus_name=NM, interface=NM_IFACE)
-  for device in conn.send_and_get_reply(new_method_call(manager, 'GetDevices')).body[0]:
+  for device in _nm_call(conn, new_method_call(manager, 'GetDevices'))[0]:
     props = DBusAddress(device, bus_name=NM, interface=NM_PROPERTIES_IFACE)
-    state = conn.send_and_get_reply(new_method_call(props, 'GetAll', 's', (NM_DEVICE_IFACE,))).body[0]
+    state = _nm_call(conn, new_method_call(props, 'GetAll', 's', (NM_DEVICE_IFACE,)))[0]
     if state.get('DeviceType', ('u', 0))[1] != 1 or not state.get('Interface', ('s', ''))[1].startswith(('eth', 'enx')):
       continue
     if not state.get('Managed', ('b', False))[1] or state.get('State', ('u', 0))[1] < 30:
       continue
-    conn.send_and_get_reply(new_method_call(manager, 'ActivateConnection', 'ooo', (path, device, '/')))
+    _nm_call(conn, new_method_call(manager, 'ActivateConnection', 'ooo', (path, device, '/')))
 
 
 def up() -> bool:
@@ -213,7 +218,7 @@ def _down() -> None:
     _remove_nat()
     with open_dbus_connection(bus="SYSTEM") as conn:
       if (path := _nm_connection(conn, None)) is not None:
-        conn.send_and_get_reply(new_method_call(DBusAddress(path, bus_name=NM, interface=NM_CONNECTION_IFACE), 'Delete'))
+        _nm_call(conn, new_method_call(DBusAddress(path, bus_name=NM, interface=NM_CONNECTION_IFACE), 'Delete'))
   except Exception:
     cloudlog.exception("usb network: teardown failed")
 

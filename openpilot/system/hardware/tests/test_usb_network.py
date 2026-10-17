@@ -1,6 +1,8 @@
 import ipaddress
 from types import SimpleNamespace
 
+import pytest
+
 from openpilot.system.hardware import usb_network
 
 
@@ -50,7 +52,9 @@ def test_network_configuration_does_not_run_on_mac(monkeypatch):
 
 
 def test_activate_only_available_managed_usb_ethernet():
-  from jeepney.low_level import HeaderFields
+  from jeepney.low_level import HeaderFields, MessageType
+  def reply(body):
+    return SimpleNamespace(header=SimpleNamespace(message_type=MessageType.method_return), body=body)
   devices = {
     '/eth0': (1, 'eth0', True, 70),  # existing DHCP profile is still connecting
     '/wifi': (2, 'wlan0', True, 100),
@@ -64,14 +68,42 @@ def test_activate_only_available_managed_usb_ethernet():
     def send_and_get_reply(self, message):
       member = message.header.fields[HeaderFields.member]
       if member == 'GetDevices':
-        return SimpleNamespace(body=(list(devices),))
+        return reply((list(devices),))
       if member == 'GetAll':
         kind, interface, managed, state = devices[message.header.fields[HeaderFields.path]]
-        return SimpleNamespace(body=({'DeviceType': ('u', kind), 'Interface': ('s', interface),
+        return reply(({'DeviceType': ('u', kind), 'Interface': ('s', interface),
                                      'Managed': ('b', managed), 'State': ('u', state)},))
       assert member == 'ActivateConnection'
       activated.append(message.body)
-      return SimpleNamespace(body=('/active',))
+      message.serialise(serial=1)
+      return reply(('/active',))
 
   usb_network._activate_connection(Connection(), '/profile')
   assert activated == [('/profile', '/eth0', '/')]
+
+
+def test_profile_priority_is_in_networkmanager_range():
+  from jeepney.low_level import HeaderFields, MessageType
+  class Connection:
+    def send_and_get_reply(self, message):
+      member = message.header.fields[HeaderFields.member]
+      if member == 'ListConnections':
+        body = ([],)
+      else:
+        assert member == 'AddConnection'
+        priority = message.body[0]['connection']['autoconnect-priority']
+        assert priority[0] == 'i' and 0 < priority[1] <= 999
+        message.serialise(serial=1)
+        body = ('/profile',)
+      return SimpleNamespace(header=SimpleNamespace(message_type=MessageType.method_return), body=body)
+  assert usb_network._nm_connection(Connection(), ipaddress.IPv4Interface('10.47.0.1/24')) == '/profile'
+
+
+def test_dbus_error_is_not_treated_as_a_connection_path():
+  from jeepney.low_level import MessageType, HeaderFields
+  from jeepney.wrappers import DBusErrorResponse
+  response = SimpleNamespace(header=SimpleNamespace(message_type=MessageType.error,
+                             fields={HeaderFields.error_name: 'org.freedesktop.NetworkManager.Error'}), body=('rejected',))
+  conn = SimpleNamespace(send_and_get_reply=lambda _: response)
+  with pytest.raises(DBusErrorResponse):
+    usb_network._nm_connection(conn, ipaddress.IPv4Interface('10.47.0.1/24'))
