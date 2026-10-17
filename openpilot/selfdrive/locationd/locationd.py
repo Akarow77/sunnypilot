@@ -12,6 +12,7 @@ from openpilot.common.transformations.orientation import rot_from_euler
 from openpilot.common.realtime import config_realtime_process
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
+from openpilot.common.lan_gpu import is_lan_pose_drop
 from openpilot.selfdrive.locationd.helpers import rotate_std
 from openpilot.selfdrive.locationd.models.pose_kf import PoseKalman, States
 from openpilot.selfdrive.locationd.models.constants import ObservationKind, GENERATED_DIR
@@ -329,7 +330,8 @@ def main():
 
     if sm.updated["cameraOdometry"]:
       critical_service_inputs_valid = all(observation_input_invalid[s] < input_invalid_threshold[s] for s in critical_services)
-      inputs_valid = sm.all_valid() and critical_service_inputs_valid
+      pose_dropped = is_lan_pose_drop(sm['cameraOdometry'], sm.valid['cameraOdometry'], params.get_bool("GpuOnLanActive"))
+      inputs_valid = sm.all_valid([s for s in sm.services if not (pose_dropped and s == 'cameraOdometry')]) and critical_service_inputs_valid
       sensors_valid = sensor_all_checks(acc_msgs, gyro_msgs, sensor_valid, sensor_recv_time, sensor_alive, SIMULATION)
 
       msg = estimator.get_msg(sensors_valid, inputs_valid, filter_initialized)

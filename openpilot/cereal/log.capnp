@@ -2375,6 +2375,7 @@ struct CameraOdometry {
   wideFromDeviceEulerStd @7 :List(Float32);
   roadTransformTrans @8 :List(Float32);
   roadTransformTransStd @9 :List(Float32);
+  frameDropped @10 :Bool; # Invalid only because camera frames were skipped, with calibration already seen.
 }
 
 struct Sentinel {

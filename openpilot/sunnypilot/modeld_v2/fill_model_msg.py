@@ -204,6 +204,7 @@ def fill_pose_msg(msg: capnp._DynamicStructBuilder, net_output_data: dict[str, n
                   vipc_frame_id: int, vipc_dropped_frames: int, timestamp_eof: int, live_calib_seen: bool) -> None:
   msg.valid = live_calib_seen & (vipc_dropped_frames < 1)
   cameraOdometry = msg.cameraOdometry
+  cameraOdometry.frameDropped = bool(live_calib_seen and vipc_dropped_frames >= 1)
 
   cameraOdometry.frameId = vipc_frame_id
   cameraOdometry.timestampEof = timestamp_eof
