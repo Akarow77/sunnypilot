@@ -5,6 +5,7 @@ This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
 import math
+
 import pyray as rl
 
 from openpilot.selfdrive.ui.mici.onroad.hud_renderer import HudRenderer, SET_SPEED_PERSISTENCE
@@ -18,10 +19,10 @@ class HudRendererSP(HudRenderer):
   def __init__(self):
     super().__init__()
     self.blind_spot_indicators = BlindSpotIndicators()
+    self._txt_lan_gpu: rl.Texture = gui_app.texture('icons_mici/lan_gpu.png', 60, 44)
+    self._txt_lan_gpu_green: rl.Texture = gui_app.texture('icons_mici/lan_gpu_green.png', 60, 44)
+    self._txt_lan_gpu_orange: rl.Texture = gui_app.texture('icons_mici/lan_gpu_orange.png', 75, 44)
     self._sp_engaged: bool = False
-    self._txt_lan_gpu = gui_app.texture('icons_mici/lan_gpu.png', 60, 44)
-    self._txt_lan_gpu_green = gui_app.texture('icons_mici/lan_gpu_green.png', 60, 44)
-    self._txt_lan_gpu_orange = gui_app.texture('icons_mici/lan_gpu_orange.png', 75, 44)
 
   def _update_state(self) -> None:
     super()._update_state()
@@ -36,17 +37,15 @@ class HudRendererSP(HudRenderer):
     super()._render(rect)
     self.blind_spot_indicators.render(rect)
 
-  def _has_blind_spot_detected(self) -> bool:
-
-    return self.blind_spot_indicators.detected
-
   def _draw_model_source(self, rect: rl.Rectangle) -> None:
+    """The chestnut's GPU icon, with LAN on it, when the big model runs on a computer on the network."""
     state = ui_state.lan_gpu_state
     if state == LanGpuState.DISABLED:
       super()._draw_model_source(rect)
       return
     if ui_state.sm.recv_frame['selfdriveState'] < ui_state.started_frame:
       return
+
     loading = state == LanGpuState.CONNECTING
     if loading:
       icon = self._txt_lan_gpu
@@ -57,12 +56,20 @@ class HudRendererSP(HudRenderer):
       icon, opacity = self._txt_lan_gpu_green, 1.0
     else:
       return
+
+    # same placement and fade as the chestnut icon
     if icon is not self._chestnut_icon:
       self._chestnut_fade_time = rl.get_time()
       self._chestnut_icon = icon
-    alpha = self._chestnut_alpha_filter.update(loading or rl.get_time() - self._chestnut_fade_time < SET_SPEED_PERSISTENCE)
+    visible = loading or rl.get_time() - self._chestnut_fade_time < SET_SPEED_PERSISTENCE
+    alpha = self._chestnut_alpha_filter.update(visible)
     if alpha < 1e-2:
       return
+
     pos = rl.Vector2(rect.x + rect.width - 10 - icon.width,
                      rect.y + rect.height - 14 - (self._txt_wheel.height + icon.height) / 2)
     rl.draw_texture_ex(icon, pos, 0.0, 1.0, rl.Color(255, 255, 255, int(255 * opacity * alpha)))
+
+  def _has_blind_spot_detected(self) -> bool:
+
+    return self.blind_spot_indicators.detected

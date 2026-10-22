@@ -7,8 +7,10 @@ See the LICENSE.md file in the root directory for more details.
 """
 
 from collections.abc import Callable
+import gc
 import os
 os.environ['GMMU'] = '0'
+from tinygrad.device import Device
 import numpy as np
 import threading
 import time
@@ -16,7 +18,7 @@ from setproctitle import setproctitle
 
 import openpilot.cereal.messaging as messaging
 from openpilot.common.hardware import COMMA_HARDWARE
-from openpilot.selfdrive.modeld.helpers import chestnut_present
+from openpilot.selfdrive.modeld.helpers import chestnut_present, wait_for_chestnut
 from openpilot.cereal import log
 from opendbc.car.structs import car
 from openpilot.cereal.services import SERVICE_LIST
@@ -24,22 +26,18 @@ from openpilot.cereal.messaging import PubMaster, SubMaster
 from openpilot.cereal.visionipc import VisionStreamType
 from msgq.visionipc import VisionIpcClient, VisionBuf
 from opendbc.car.car_helpers import get_demo_car_params
-from openpilot.common.file_chunker import open_file_chunked
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.params import Params
+from openpilot.common.hardware.usb import cable_connected
+from openpilot.system.hardware import usb_network
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import config_realtime_process, DT_MDL
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value
-from openpilot.selfdrive.modeld.gpu_on_lan import connect_gpu_on_lan
-from openpilot.selfdrive.modeld.modeld import (ChestnutGpuState, get_action_from_model as native_action,
-                                             LAT_SMOOTH_SECONDS as NATIVE_LAT_SMOOTH, LONG_SMOOTH_SECONDS as NATIVE_LONG_SMOOTH)
-from openpilot.selfdrive.modeld.lan_model import LanModel, reset_local_model
-from openpilot.selfdrive.modeld.fill_model_msg import (fill_model_msg as native_fill_model_msg,
-                                                      fill_driving_model_data as native_fill_driving_data,
-                                                      fill_pose_msg as native_fill_pose_msg, PublishState as NativePublishState)
+from openpilot.selfdrive.modeld.gpu_on_lan import GpuOnLan
+from openpilot.selfdrive.modeld.modeld import ChestnutGpuState
 
 from openpilot.sunnypilot.modeld_v2.fill_model_msg import fill_model_msg, fill_pose_msg, PublishState, get_curvature_from_output
 from openpilot.sunnypilot.modeld_v2.parse_model_outputs import Parser
@@ -48,7 +46,8 @@ from openpilot.sunnypilot.modeld_v2.meta_helper import load_meta_constants
 from openpilot.sunnypilot.modeld_v2.camera_offset_helper import CameraOffsetHelper
 from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
-from openpilot.sunnypilot.modeld_v2.helpers import load_oob
+from openpilot.sunnypilot.modeld_v2.helpers import load_model
+from openpilot.sunnypilot.modeld_v2.frame_fusion import fused_with_warp
 from openpilot.sunnypilot.modeld_v2.model_adapters import get_model_adapter
 from openpilot.sunnypilot.models.helpers import get_active_bundle
 from openpilot.sunnypilot.selfdrive.controls.lib.relc import RoadEdgeLaneChangeController
@@ -58,8 +57,7 @@ BIG_MODEL_TIMEOUT = 60
 
 
 def _pkl_exists(path):
-  from openpilot.common.file_chunker import get_manifest_path
-  return os.path.exists(path) or os.path.exists(get_manifest_path(path))
+  return os.path.exists(path)
 
 
 def _find_driving_pkl(bundle):
@@ -114,7 +112,7 @@ class ModelState(ModelStateBase):
 
   def _init_combined(self, pkl_path, cam_w, cam_h, bundle):
     cloudlog.warning(f"loading combined pkl: {pkl_path}")
-    jits = load_oob(open_file_chunked(pkl_path))
+    jits = load_model(pkl_path, extend=fused_with_warp(cam_w, cam_h, self.chestnut))
 
     metadata = jits['metadata']
     self.WARP_DEV = metadata.get('warp_dev', 'QCOM') if COMMA_HARDWARE else 'CPU'
@@ -164,7 +162,8 @@ class ModelState(ModelStateBase):
 
   def run(self, bufs: dict[str, VisionBuf], transforms: dict[str, np.ndarray],
           inputs: dict[str, np.ndarray],
-          after_enqueue: Callable[[], None] | None = None) -> dict[str, np.ndarray] | None:
+          after_enqueue: Callable[[], None] | None = None,
+          remote: Callable[[], tuple[np.ndarray, dict[str, slice]]] | None = None) -> dict[str, np.ndarray] | None:
     self.adapter.copy_frames(bufs)
 
     desire_key = self.desire_key
@@ -185,42 +184,49 @@ class ModelState(ModelStateBase):
       self.numpy_inputs['tfm'][:, :] = transforms[self._road_key].reshape(3, 3)
       self.numpy_inputs['big_tfm'][:, :] = transforms[self._wide_key].reshape(3, 3)
 
-    raw_outputs = self.adapter.run()
-
-    if after_enqueue is not None:
-      after_enqueue()
-
-    if self._combined_model_type == 'supercombo':
-      model_output = raw_outputs.numpy().flatten()
-      if self.chestnut and not np.all(np.isfinite(model_output)):
-        raise RuntimeError("model output not finite")
-      sliced = {k: model_output[np.newaxis, v] for k, v in self.vision_output_slices.items()}
-      outputs = self.parser.parse_outputs(sliced)
-      if 'prev_feat' in self.numpy_inputs and 'hidden_state' in self.vision_output_slices:
-        (self.numpy_inputs['prev_feat'].flat if self.adapter.is_native else self.numpy_inputs['prev_feat'])[:] = \
-          model_output[self.vision_output_slices['hidden_state']]
+    if remote is not None:
+      # the big model on a computer on the network drives instead of this one (lan gpu); native models only
+      raw, slices = self.adapter.run(remote)
+      outputs = self.parser.parse_outputs({k: raw[np.newaxis, v] for k, v in slices.items()})
     else:
-      vision_output = raw_outputs[0].numpy().flatten()
-      vision_sliced = {k: vision_output[np.newaxis, v] for k, v in self.vision_output_slices.items()}
-      outputs = self.parser.parse_vision_outputs(vision_sliced)
+      raw_outputs = self.adapter.run()
+      if self.chestnut and (err := Device[self.DEV].error_state.host.view(fmt='q')[0]):
+        raise RuntimeError(f"chestnut failed with {err}")
 
-      if 'prev_feat' in self.numpy_inputs and 'hidden_state' in self.vision_output_slices:
-        (self.numpy_inputs['prev_feat'].flat if self.adapter.is_native else self.numpy_inputs['prev_feat'])[:] = \
-          vision_output[self.vision_output_slices['hidden_state']]
+      if after_enqueue is not None:
+        after_enqueue()
 
-      for i, policy_slices in enumerate(self._policy_slices_list):
-        policy_output = raw_outputs[i + 1].numpy().flatten()
-        policy_sliced = {k: policy_output[np.newaxis, v] for k, v in policy_slices.items()}
-        parsed = self.parser.parse_policy_outputs(policy_sliced)
-        if 'off' in self._policy_keys[i] and self._has_on_policy:
-          for key in ('plan', 'planplus', 'action'):
-            if any(key in self._policy_slices_list[j] for j, k in enumerate(self._policy_keys) if 'on' in k.lower()):
-              parsed.pop(key, None)
+      if self._combined_model_type == 'supercombo':
+        model_output = raw_outputs.numpy().flatten()
+        if self.chestnut and not np.all(np.isfinite(model_output)):
+          raise RuntimeError("model output not finite")
+        sliced = {k: model_output[np.newaxis, v] for k, v in self.vision_output_slices.items()}
+        outputs = self.parser.parse_outputs(sliced)
+        if 'prev_feat' in self.numpy_inputs and 'hidden_state' in self.vision_output_slices:
+          (self.numpy_inputs['prev_feat'].flat if self.adapter.is_native else self.numpy_inputs['prev_feat'])[:] = \
+            model_output[self.vision_output_slices['hidden_state']]
+      else:
+        vision_output = raw_outputs[0].numpy().flatten()
+        vision_sliced = {k: vision_output[np.newaxis, v] for k, v in self.vision_output_slices.items()}
+        outputs = self.parser.parse_vision_outputs(vision_sliced)
 
-        outputs.update(parsed)
+        if 'prev_feat' in self.numpy_inputs and 'hidden_state' in self.vision_output_slices:
+          (self.numpy_inputs['prev_feat'].flat if self.adapter.is_native else self.numpy_inputs['prev_feat'])[:] = \
+            vision_output[self.vision_output_slices['hidden_state']]
 
-      if 'planplus' in outputs and 'plan' in outputs:
-        outputs['plan'] = outputs['plan'] + outputs['planplus']
+        for i, policy_slices in enumerate(self._policy_slices_list):
+          policy_output = raw_outputs[i + 1].numpy().flatten()
+          policy_sliced = {k: policy_output[np.newaxis, v] for k, v in policy_slices.items()}
+          parsed = self.parser.parse_policy_outputs(policy_sliced)
+          if 'off' in self._policy_keys[i] and self._has_on_policy:
+            for key in ('plan', 'planplus', 'action'):
+              if any(key in self._policy_slices_list[j] for j, k in enumerate(self._policy_keys) if 'on' in k.lower()):
+                parsed.pop(key, None)
+
+          outputs.update(parsed)
+
+        if 'planplus' in outputs and 'plan' in outputs:
+          outputs['plan'] = outputs['plan'] + outputs['planplus']
 
     if 'desired_curvature' in outputs and 'prev_desired_curv' in self.numpy_inputs:
       buf = self.numpy_inputs['prev_desired_curv']
@@ -260,19 +266,21 @@ def main(demo=False):
 
   cloudlog.bind(daemon=PROCESS_NAME)
   setproctitle(PROCESS_NAME)
-  config_realtime_process(7, 54)
 
-  CHESTNUT = chestnut_present()
+  CHESTNUT = _find_driving_pkl(get_active_bundle(chestnut=True)) is not None and \
+    (chestnut_present() or (cable_connected() and not usb_network.adapter_present()))  # lan gpu's adapter takes the port too
   if CHESTNUT:
-    os.environ['HCQDEV_WAIT_TIMEOUT_MS'] = '3000'
+    from tinygrad.runtime.ops_amd import AMDDevice
+    AMDDevice.wait_timeout_ms = 3000
 
   params = Params()
   params.put_bool("ChestnutLoading", CHESTNUT)
   params.remove("ChestnutActive")
-  LAN = not CHESTNUT and params.get_bool("GpuOnLanEnabled")
+  LAN = not CHESTNUT and params.get_bool("GpuOnLanEnabled")  # the big model on a computer on the network
   params.put_bool("GpuOnLanLoading", LAN)
   params.remove("GpuOnLanActive")
-  params.remove("GpuOnLanModel")
+
+  gc.disable()
 
   # visionipc clients
   while True:
@@ -306,6 +314,7 @@ def main(demo=False):
     def load_big():
       nonlocal big_model
       try:
+        wait_for_chestnut()
         m = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, chestnut=True)
         m.warmup()
         big_model = m
@@ -315,7 +324,13 @@ def main(demo=False):
     loader.start()
     loader.join(BIG_MODEL_TIMEOUT)
     model = big_model
-    params.put_bool("ChestnutActive", model is not None)
+    if model is None and not params.get_bool("ChestnutRetry"):
+      # a crank can cut the chestnut power during the load, retry once with an onroad cycle
+      cloudlog.error("big model load failed, cycling onroad to retry")
+      params.put_bool("ChestnutRetry", True)
+      params.put_bool("OnroadCycleRequested", True)
+    else:
+      params.put_bool("ChestnutActive", model is not None)
 
   small_model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, chestnut=False) if model is None or CHESTNUT else None
   if model is None:
@@ -324,28 +339,30 @@ def main(demo=False):
   assert model is not None
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
 
+  config_realtime_process(7, 54)
+
   # messaging
   pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"] + (["chestnutGpuState"] if CHESTNUT else [])
   pm = PubMaster(pub_socks)
-  sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState", "carControl", "lateralDelay"])
+  sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState",
+                  "carControl", "controlsState", "lateralDelay"])
 
   publish_state = PublishState()
-  lan_publish_state = NativePublishState()
   chestnut_state = ChestnutGpuState(pm, model.chestnut) if CHESTNUT else None
   gpu_on_lan = None
-  lan_model = None
   if LAN:
-    # Warm the fallback while loading, not after the first network failure.
-    model.warmup()
-    reset_local_model(model)
-    # Local SC/split models retain their own preprocessing, parser and history.
-    try:
-      lan_model = LanModel(vipc_client_main.width, vipc_client_main.height)
-      gpu_on_lan = connect_gpu_on_lan(params.get("GpuOnLanHost") or "usb", BIG_MODEL_TIMEOUT)
-    except Exception:
-      cloudlog.exception("gpu on lan initialization failed; using the selected local model")
-    if gpu_on_lan is None:
-      lan_model = None
+    # loads like the chestnut: Big Model Loading until the server answers, the on-device model if it doesn't
+    if model.adapter.is_native:
+      gpu_on_lan = GpuOnLan(params.get("GpuOnLanHost") or "usb")  # default: laptop on the USB Ethernet link
+      try:
+        model.adapter.warp()  # load the standalone warp now, not on the first frame
+      except Exception:
+        cloudlog.exception("gpu on lan: warp failed to load")
+        gpu_on_lan = None
+      if gpu_on_lan is not None and not gpu_on_lan.connect(BIG_MODEL_TIMEOUT):
+        gpu_on_lan = None
+    else:
+      cloudlog.warning("gpu on lan: a legacy model warps inside its policy, there's no new_img to send")
     params.put_bool("GpuOnLanActive", gpu_on_lan is not None)
     if gpu_on_lan is not None and gpu_on_lan.model_name:
       params.put("GpuOnLanModel", gpu_on_lan.model_name)
@@ -373,6 +390,7 @@ def main(demo=False):
   cloudlog.info("modeld got CarParams: %s", CP.brand)
 
   # TODO Move smooth seconds to action function
+  long_delay = CP.longitudinalActuatorDelay + model.LONG_SMOOTH_SECONDS
   prev_action = log.ModelDataV2.Action()
 
   DH = DesireHelper()
@@ -421,8 +439,7 @@ def main(demo=False):
       model.lat_delay = get_lat_delay(params, sm["lateralDelay"].lateralDelay)
       model.PLANPLUS_CONTROL = params.get("PlanplusControl", return_default=True)
       camera_offset_helper.set_offset(params.get("CameraOffset", return_default=True))
-    lat_delay = model.lat_delay + (NATIVE_LAT_SMOOTH if gpu_on_lan is not None else model.LAT_SMOOTH_SECONDS)
-    long_delay = CP.longitudinalActuatorDelay + (NATIVE_LONG_SMOOTH if gpu_on_lan is not None else model.LONG_SMOOTH_SECONDS)
+    lat_delay = model.lat_delay + model.LAT_SMOOTH_SECONDS
     if sm.updated["extrinsicsCalibration"] and sm.seen['narrowRoadCameraState'] and sm.seen['deviceState']:
       device_from_calib_euler = np.array(sm["extrinsicsCalibration"].rpyCalib, dtype=np.float32)
       dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['narrowRoadCameraState'].sensor))]
@@ -435,9 +452,8 @@ def main(demo=False):
     traffic_convention = np.zeros(2)
     traffic_convention[int(is_rhd)] = 1
 
-    desire_len = 8 if gpu_on_lan is not None else model.constants.DESIRE_LEN
-    vec_desire = np.zeros(desire_len, dtype=np.float32)
-    if desire >= 0 and desire < desire_len:
+    vec_desire = np.zeros(model.constants.DESIRE_LEN, dtype=np.float32)
+    if desire >= 0 and desire < model.constants.DESIRE_LEN:
       vec_desire[desire] = 1
 
     # tracked dropped frames
@@ -473,31 +489,26 @@ def main(demo=False):
     try:
       send_chestnut = (chestnut_state is not None and
                        run_count % round(model.constants.MODEL_FREQ / SERVICE_LIST['chestnutGpuState'].frequency) == 0)
+      gpu_on_lan_remote = None
       if gpu_on_lan is not None:
-        assert lan_model is not None
-        model_output = lan_model.run(gpu_on_lan, buf_main, buf_extra, model_transform_main, model_transform_extra,
-                                    vec_desire, traffic_convention, np.array([lat_action_t, long_action_t], dtype=np.float32))
-        big_on_lan = True
-      else:
-        model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None)
-        big_on_lan = False
+        action_t = np.array([lat_action_t, long_action_t], dtype=np.float32)  # the server model takes it, the local one may not
+        gpu_on_lan_remote = lambda m=model, g=gpu_on_lan, tc=traffic_convention, at=action_t: (g.infer(  # noqa: E731
+          m.adapter.warp().numpy(), m.numpy_inputs[m.desire_key], m.numpy_inputs.get('traffic_convention', tc),
+          m.numpy_inputs.get('action_t', at)), g.output_slices)
+      model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None, gpu_on_lan_remote)
+      big_on_lan = gpu_on_lan_remote is not None
     except Exception:
       big_on_lan = False
       if gpu_on_lan is not None:
-        # Local fallback remains active for the rest of this modeld lifecycle.
+        # like a chestnut failure: the on-device model drives for the rest of the drive (Big Model Failed)
         cloudlog.exception("gpu on lan failed, fall back to small")
         params.put_bool("GpuOnLanActive", False)
-        gpu_on_lan.close()
         gpu_on_lan = None
-        lan_model = None
-        reset_local_model(model)
-        publish_state = PublishState()
-        run_count = 0
         model_output = None
       else:
-        if not params.get_bool("ChestnutActive"):
+        if not model.chestnut:
           raise
-        cloudlog.exception("chestnut failed, falling back to small")
+        cloudlog.exception("big model failed, fall back to small")
         params.put_bool("ChestnutActive", False)
         assert small_model is not None
         model = small_model
@@ -514,17 +525,13 @@ def main(demo=False):
       posenet_send = messaging.new_message('cameraOdometry')
       mdv2sp_send = messaging.new_message('modelDataV2SP')
 
-      action_fn = native_action if big_on_lan else model.get_action_from_model
-      action = action_fn(model_output, prev_action, lat_action_t, long_action_t, v_ego)
+      if not sm['carControl'].latActive:
+        prev_action.desiredCurvature = sm['controlsState'].curvature
+      action = model.get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego)
       prev_action = action
-      if big_on_lan:
-        native_fill_model_msg(modelv2_send, model_output, action,
-                              lan_publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
-                              frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen)
-      else:
-        fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
-                       publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
-                       frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen, meta_constants)
+      fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
+                     publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
+                     frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen, meta_constants)
       modelv2_send.modelV2.big = model.chestnut or big_on_lan
 
       desire_state = modelv2_send.modelV2.meta.desireState
@@ -540,10 +547,7 @@ def main(demo=False):
       drivingdata_send.drivingModelData.meta.laneChangeState = DH.lane_change_state
       drivingdata_send.drivingModelData.meta.laneChangeDirection = DH.lane_change_direction
 
-      if big_on_lan:
-        native_fill_driving_data(drivingdata_send, modelv2_send)
-      pose_fn = native_fill_pose_msg if big_on_lan else fill_pose_msg
-      pose_fn(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, live_calib_seen)
+      fill_pose_msg(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, live_calib_seen)
       pm.send('modelV2', modelv2_send)
       pm.send('drivingModelData', drivingdata_send)
       pm.send('cameraOdometry', posenet_send)

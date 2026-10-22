@@ -20,7 +20,6 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import config_realtime_process
 from openpilot.common.transformations.orientation import rot_from_euler, euler_from_rot
 from openpilot.common.swaglog import cloudlog
-from openpilot.common.lan_gpu import is_lan_pose_drop
 
 MIN_SPEED_FILTER = 15 * CV.MPH_TO_MS
 MAX_VEL_ANGLE_STD = np.radians(0.25)
@@ -271,14 +270,17 @@ def main() -> NoReturn:
 
   calibrator = Calibrator(param_put=True)
   calibrator.not_car = CP.notCar
-  pose_dropped = False
 
+  lan_gpu = False
   while 1:
     timeout = 0 if sm.frame == -1 else 100
     sm.update(timeout)
 
     if sm.updated['cameraOdometry']:
-      pose_dropped = is_lan_pose_drop(sm['cameraOdometry'], sm.valid['cameraOdometry'], params_reader.get_bool("GpuOnLanActive"))
+      lan_gpu = params_reader.get_bool("GpuOnLanActive")
+    # lan gpu: a camera frame modeld dropped leaves the next pose invalid; skip it, like locationd does
+    # (selfdrived bounds how often: Driving Model Lagging over 10%)
+    pose_dropped = lan_gpu and not sm.valid['cameraOdometry']
 
     if sm.updated['cameraOdometry'] and not pose_dropped:
       calibrator.handle_v_ego(sm['carState'].vEgo)
@@ -295,7 +297,7 @@ def main() -> NoReturn:
     # 4Hz driven by cameraOdometry
     if sm.frame % 5 == 0:
       calibrator.send_data(pm, sm.all_alive() and sm.all_freq_ok() and
-                           sm.all_valid([s for s in sm.services if not (pose_dropped and s == 'cameraOdometry')]))
+                           sm.all_valid([s for s in sm.services if not (lan_gpu and s == 'cameraOdometry')]))
 
 
 if __name__ == "__main__":

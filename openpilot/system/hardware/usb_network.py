@@ -25,18 +25,27 @@ import shlex
 import subprocess
 import sys
 import uuid
-import threading
+from pathlib import Path
 
+from openpilot.common.hardware.usb import PRIMARY_USB_CONTROLLER, controller
+from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
-from openpilot.common.hardware import COMMA_HARDWARE
 
 CONNECTION_ID = "USB network"
 DEFAULT_ADDRESS = "10.47.0.1/24"
 DNSMASQ_PID = "/run/usb-network-dnsmasq.pid"
 DNSMASQ_LEASES = "/run/usb-network-dnsmasq.leases"
 RULE_TAG = "usb-network"  # iptables comment on every rule we add, so teardown removes exactly ours
-_network_lock = threading.Lock()
-PRIVATE_NETWORKS = tuple(ipaddress.IPv4Network(n) for n in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'))
+NET_PATH = Path("/sys/class/net")
+
+
+def adapter_present() -> bool:
+  """A USB Ethernet adapter on the USB-C port. The port is the chestnut's, so its cable isn't one then."""
+  try:
+    return any((ctrl := controller(net / "device")) is not None and ctrl.name == PRIMARY_USB_CONTROLLER
+               for net in NET_PATH.iterdir() if (net / "device").exists())
+  except OSError:
+    return False
 
 
 def parse_address(text: str) -> ipaddress.IPv4Interface | None:
@@ -45,7 +54,7 @@ def parse_address(text: str) -> ipaddress.IPv4Interface | None:
     iface = ipaddress.IPv4Interface(text.strip())
   except ValueError:
     return None
-  if not 8 <= iface.network.prefixlen <= 30 or not any(iface.network.subnet_of(n) for n in PRIVATE_NETWORKS):
+  if not iface.ip.is_private or not 8 <= iface.network.prefixlen <= 30:
     return None
   if iface.ip in (iface.network.network_address, iface.network.broadcast_address):
     return None
@@ -53,7 +62,6 @@ def parse_address(text: str) -> ipaddress.IPv4Interface | None:
 
 
 def configured_address() -> ipaddress.IPv4Interface:
-  from openpilot.common.params import Params
   return parse_address(Params().get("UsbNetworkAddress") or "") or ipaddress.IPv4Interface(DEFAULT_ADDRESS)
 
 
@@ -111,11 +119,6 @@ def _stop_dnsmasq() -> None:
 
 # NetworkManager over D-Bus (polkit-authorized, like the hotspot)
 
-def _nm_call(conn, message):
-  from jeepney.wrappers import unwrap_msg
-  return unwrap_msg(conn.send_and_get_reply(message))
-
-
 def _nm_connection(conn, address: ipaddress.IPv4Interface | None) -> str | None:
   """Finds our connection; with an address, (re)creates it so it matches."""
   from jeepney import DBusAddress, new_method_call
@@ -123,9 +126,9 @@ def _nm_connection(conn, address: ipaddress.IPv4Interface | None) -> str | None:
 
   settings = DBusAddress(NM_SETTINGS_PATH, bus_name=NM, interface=NM_SETTINGS_IFACE)
   method = 'manual'  # DHCP and NAT are ours (dnsmasq_args, nat_rules), not NetworkManager's shared mode
-  for path in _nm_call(conn, new_method_call(settings, 'ListConnections'))[0]:
+  for path in conn.send_and_get_reply(new_method_call(settings, 'ListConnections')).body[0]:
     addr = DBusAddress(path, bus_name=NM, interface=NM_CONNECTION_IFACE)
-    current = _nm_call(conn, new_method_call(addr, 'GetSettings'))[0]
+    current = conn.send_and_get_reply(new_method_call(addr, 'GetSettings')).body[0]
     if current['connection']['id'][1] != CONNECTION_ID:
       continue
     if address is None:
@@ -133,10 +136,9 @@ def _nm_connection(conn, address: ipaddress.IPv4Interface | None) -> str | None:
     ipv4 = current.get('ipv4', {})
     data = ipv4.get('address-data', ('', []))[1]
     if 'interface-name' not in current['connection'] and data and ipv4.get('method', ('', ''))[1] == method and \
-       data[0]['address'][1] == str(address.ip) and data[0]['prefix'][1] == address.network.prefixlen and \
-       current['connection'].get('autoconnect-priority', ('i', 0))[1] == 999:
+       data[0]['address'][1] == str(address.ip) and data[0]['prefix'][1] == address.network.prefixlen:
       return path
-    _nm_call(conn, new_method_call(addr, 'Delete'))  # subnet changed in settings, or an old shared/gadget one
+    conn.send_and_get_reply(new_method_call(addr, 'Delete'))  # subnet changed in settings, or an old shared/gadget one
   if address is None:
     return None
   connection = {
@@ -145,7 +147,6 @@ def _nm_connection(conn, address: ipaddress.IPv4Interface | None) -> str | None:
       'uuid': ('s', str(uuid.uuid4())),
       'id': ('s', CONNECTION_ID),
       'autoconnect': ('b', True),
-      'autoconnect-priority': ('i', 999),
     },
     'ipv4': {
       'method': ('s', method),
@@ -154,45 +155,19 @@ def _nm_connection(conn, address: ipaddress.IPv4Interface | None) -> str | None:
     },
     'ipv6': {'method': ('s', 'ignore')},
   }
-  return _nm_call(conn, new_method_call(settings, 'AddConnection', 'a{sa{sv}}', (connection,)))[0]
-
-
-def _activate_connection(conn, path: str) -> None:
-  """An existing DHCP profile may already own the adapter; adding a profile is not enough."""
-  from jeepney import DBusAddress, new_method_call
-  from openpilot.system.ui.lib.networkmanager import NM, NM_PATH, NM_IFACE, NM_DEVICE_IFACE, NM_PROPERTIES_IFACE
-
-  manager = DBusAddress(NM_PATH, bus_name=NM, interface=NM_IFACE)
-  for device in _nm_call(conn, new_method_call(manager, 'GetDevices'))[0]:
-    props = DBusAddress(device, bus_name=NM, interface=NM_PROPERTIES_IFACE)
-    state = _nm_call(conn, new_method_call(props, 'GetAll', 's', (NM_DEVICE_IFACE,)))[0]
-    if state.get('DeviceType', ('u', 0))[1] != 1 or not state.get('Interface', ('s', ''))[1].startswith(('eth', 'enx')):
-      continue
-    if not state.get('Managed', ('b', False))[1] or state.get('State', ('u', 0))[1] < 30:
-      continue
-    _nm_call(conn, new_method_call(manager, 'ActivateConnection', 'ooo', (path, device, '/')))
+  return conn.send_and_get_reply(new_method_call(settings, 'AddConnection', 'a{sa{sv}}', (connection,))).body[0]
 
 
 def up() -> bool:
   """Idempotent. NetworkManager brings the link up whenever an adapter is plugged in."""
-  if not COMMA_HARDWARE:
-    return False
-  with _network_lock:
-    return _up()
-
-
-def _up() -> bool:
   from jeepney.io.blocking import open_dbus_connection
-  from openpilot.common.params import Params
   address, gateway = configured_address(), Params().get_bool("UsbNetworkGateway")
   try:
     _stop_dnsmasq()
     _remove_nat()
     with open_dbus_connection(bus="SYSTEM") as conn:
-      path = _nm_connection(conn, address)
-      if path is None:
+      if _nm_connection(conn, address) is None:
         return False
-      _activate_connection(conn, path)
     subprocess.run(["sudo", *dnsmasq_args(address, gateway)], check=True, capture_output=True)  # forks into the background
     if gateway:
       _add_nat(address)
@@ -203,13 +178,6 @@ def _up() -> bool:
 
 
 def down() -> None:
-  if not COMMA_HARDWARE:
-    return
-  with _network_lock:
-    _down()
-
-
-def _down() -> None:
   from jeepney import DBusAddress, new_method_call
   from jeepney.io.blocking import open_dbus_connection
   from openpilot.system.ui.lib.networkmanager import NM, NM_CONNECTION_IFACE
@@ -218,7 +186,7 @@ def _down() -> None:
     _remove_nat()
     with open_dbus_connection(bus="SYSTEM") as conn:
       if (path := _nm_connection(conn, None)) is not None:
-        _nm_call(conn, new_method_call(DBusAddress(path, bus_name=NM, interface=NM_CONNECTION_IFACE), 'Delete'))
+        conn.send_and_get_reply(new_method_call(DBusAddress(path, bus_name=NM, interface=NM_CONNECTION_IFACE), 'Delete'))
   except Exception:
     cloudlog.exception("usb network: teardown failed")
 
@@ -237,16 +205,13 @@ def peer_address() -> str | None:
   for leases in [DNSMASQ_LEASES] + glob.glob("/var/lib/NetworkManager/dnsmasq-*.leases") + ["/var/lib/misc/dnsmasq.leases"]:
     try:
       with open(leases) as f:
-        rows += [r for r in (line.split() for line in f) if len(r) >= 3 and r[0].isdigit() and on_link(r[2])]  # expiry mac ip ...
+        rows += [r for r in (line.split() for line in f) if len(r) >= 3 and on_link(r[2])]  # expiry mac ip ...
     except OSError:
       pass
   if rows:
     return max(rows, key=lambda r: int(r[0]))[2]
 
-  try:
-    neigh = subprocess.run(["ip", "-4", "neigh", "show"], capture_output=True, text=True, timeout=1).stdout
-  except (OSError, subprocess.TimeoutExpired):
-    return None
+  neigh = subprocess.run(["ip", "-4", "neigh", "show"], capture_output=True, text=True).stdout
   for parts in (line.split() for line in neigh.splitlines()):
     if parts and parts[-1] in ("REACHABLE", "STALE", "DELAY", "PROBE") and on_link(parts[0]):
       return parts[0]

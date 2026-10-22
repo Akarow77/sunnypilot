@@ -27,8 +27,8 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.system.statsd import statlog
 from openpilot.system.hardware.power_monitoring import PowerMonitoring
 from openpilot.system.hardware.fan_controller import FanController
-from openpilot.system.hardware import usb_network
 from openpilot.system.hardware.chestnut.monitoring import chestnut_state_thread
+from openpilot.system.hardware import usb_network
 from openpilot.system.hardware.chestnut.status import ChestnutStatus
 from openpilot.common.version import terms_version, training_version, get_build_metadata, terms_version_sp
 
@@ -42,9 +42,10 @@ PANDA_STATES_TIMEOUT = round(1000 / SERVICE_LIST['pandaStates'].frequency * 1.5)
 ONROAD_CYCLE_TIME = 1  # seconds to wait offroad after requesting an onroad cycle
 
 class Chestnut:
-  # flash offroad, modeld ignores chestnut until the product string matches
+  # flash before going onroad, modeld ignores chestnut until the product string matches
   MAX_ATTEMPTS = 3
   RETRY_INTERVAL = 20.
+  STARTUP_TIMEOUT = 30.
 
   def __init__(self):
     self.thread: threading.Thread | None = None
@@ -52,6 +53,10 @@ class Chestnut:
     self.last_attempt = 0.
     self.flashed = False
     self.mismatch = False
+
+  @property
+  def flashing(self) -> bool:
+    return self.thread is not None and self.thread.is_alive() and time.monotonic() - self.last_attempt < self.STARTUP_TIMEOUT
 
   @property
   def failed(self) -> bool:
@@ -74,7 +79,7 @@ class Chestnut:
       return
     if self.thread is not None and self.thread.is_alive():
       return
-    if time.monotonic() - self.last_attempt < self.RETRY_INTERVAL:
+    if self.attempts > 0 and time.monotonic() - self.last_attempt < self.RETRY_INTERVAL:
       return
 
     self.attempts += 1
@@ -223,7 +228,7 @@ def hardware_thread(end_event, hw_queue) -> None:
     network_strength=NetworkStrength.unknown,
     network_stats={'wwanTx': -1, 'wwanRx': -1},
     modem_temps=[],
-    usb_state=[],
+    usb_state=get_usb_state(),
   )
 
   all_temp_filter = FirstOrderFilter(0., TEMP_TAU, DT_HW, initialized=False)
@@ -314,7 +319,7 @@ def hardware_thread(end_event, hw_queue) -> None:
     chestnut.update(started_ts is None, last_hw_state.usb_state)
     chestnut_state = sm["chestnutState"]
     chestnut_valid = sm.alive["chestnutState"] and sm.valid["chestnutState"]
-    chestnut_status.update(started_ts is None, branch, last_hw_state.usb_state, chestnut.failed,
+    chestnut_status.update(started_ts is None or not onroad_conditions["ignition"], branch, last_hw_state.usb_state, chestnut.failed,
                            params.get_bool("ChestnutLoading"), params.get("ChestnutActive"),
                            chestnut_state if chestnut_valid else None, set_offroad_alert_if_changed)
     # this subset is only used for offroad
@@ -360,6 +365,8 @@ def hardware_thread(end_event, hw_queue) -> None:
 
     # must be at an engageable thermal band to go onroad
     startup_conditions["device_temp_engageable"] = thermal_status < ThermalStatus.overheated
+
+    startup_conditions["not_flashing_chestnut"] = not chestnut.flashing
 
     # ensure device is fully booted
     startup_conditions["device_booted"] = startup_conditions.get("device_booted", False) or HARDWARE.booted()
@@ -532,10 +539,10 @@ def main():
 
   if COMMA_HARDWARE:
     threads.append(threading.Thread(target=touch_thread, args=(end_event,)))
-    if Params().get_bool("UsbNetworkEnabled"):
-      # Restore the optional wired link and DHCP service after a device reboot.
-      threading.Thread(target=usb_network.up, daemon=True).start()
     threads.append(threading.Thread(target=chestnut_state_thread, args=(end_event,)))
+    if Params().get_bool("UsbNetworkEnabled"):
+      # our DHCP server on the USB network doesn't outlive a reboot (one-shot)
+      threading.Thread(target=usb_network.up, daemon=True).start()
 
   for t in threads:
     t.start()

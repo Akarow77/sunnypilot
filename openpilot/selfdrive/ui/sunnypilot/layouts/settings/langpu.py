@@ -33,9 +33,7 @@ class LanGpuLayout(Widget):
       description=lambda: tr("Run the big driving model on a computer on the network, e.g. a Mac running Bamyanggang. " +
                              "Works like a chestnut: if the server fails, the on-device model drives until the next drive. " +
                              "Takes effect on the next drive."),
-      initial_state=ui_state.params.get_bool("GpuOnLanEnabled"),
-      enabled=lambda: ui_state.is_offroad(),
-      callback=lambda on: self._set_toggle("GpuOnLanEnabled", on),
+      param="GpuOnLanEnabled",
     )
 
     self._server = button_item_sp(
@@ -44,7 +42,6 @@ class LanGpuLayout(Widget):
       description=lambda: tr("IP address or hostname of the server, optionally with :port (default 8000). " +
                              "Leave empty to use the computer on the USB network."),
       callback=self._edit_server,
-      enabled=lambda: ui_state.is_offroad(),
     )
     self._server.action_item.set_value(self._server_label)
 
@@ -52,9 +49,8 @@ class LanGpuLayout(Widget):
       title=lambda: tr("USB Network"),
       description=lambda: tr("Plug a USB Ethernet adapter into the device and connect it to the computer with an Ethernet cable " +
                              "to get a wired network between them."),
-      initial_state=ui_state.params.get_bool("UsbNetworkEnabled"),
-      enabled=lambda: ui_state.is_offroad(),
-      callback=lambda on: self._set_toggle("UsbNetworkEnabled", on, usb_network.up if on else usb_network.down),
+      param="UsbNetworkEnabled",
+      callback=lambda on: threading.Thread(target=usb_network.up if on else usb_network.down, daemon=True).start(),
     )
 
     self._usb_address = button_item_sp(
@@ -63,7 +59,6 @@ class LanGpuLayout(Widget):
       description=lambda: tr("This device's address on the USB network, with the subnet size (CIDR). " +
                              "The computer gets an address from the same subnet."),
       callback=self._edit_usb_address,
-      enabled=lambda: ui_state.is_offroad() and ui_state.params.get_bool("UsbNetworkEnabled"),
     )
     self._usb_address.action_item.set_value(lambda: str(usb_network.configured_address()))
 
@@ -72,22 +67,11 @@ class LanGpuLayout(Widget):
       description=lambda: tr("Share this device's internet (Wi-Fi or LTE) with the computer on the USB network: " +
                              "it becomes the computer's router and DNS, with NAT. Uses LTE data when on LTE. " +
                              "Off: the computer keeps using its own internet connection."),
-      initial_state=ui_state.params.get_bool("UsbNetworkGateway"),
-      enabled=lambda: ui_state.is_offroad() and ui_state.params.get_bool("UsbNetworkEnabled"),
-      callback=lambda on: self._set_toggle("UsbNetworkGateway", on,
-                                          usb_network.up if ui_state.params.get_bool("UsbNetworkEnabled") else None),
+      param="UsbNetworkGateway",
+      callback=lambda _: ui_state.params.get_bool("UsbNetworkEnabled") and threading.Thread(target=usb_network.up, daemon=True).start(),
     )
 
     return [self._enabled, self._server, self._usb_network, self._usb_address, self._usb_gateway]
-
-  @staticmethod
-  def _set_toggle(param, checked, network_action=None):
-    # Do not let a stale UI event alter the link used by an active model.
-    if not ui_state.is_offroad():
-      return
-    ui_state.params.put_bool(param, checked, block=True)
-    if network_action is not None:
-      threading.Thread(target=network_action, daemon=True).start()
 
   def _server_label(self) -> str:
     if host := ui_state.params.get("GpuOnLanHost"):
@@ -100,31 +84,23 @@ class LanGpuLayout(Widget):
     if now - self._usb_peer_checked > 2.:
       self._usb_peer_checked = now
       self._usb_peer = (usb_network.peer_address() or "") if ui_state.params.get_bool("UsbNetworkEnabled") else ""
-    for item, param in ((self._enabled, "GpuOnLanEnabled"), (self._usb_network, "UsbNetworkEnabled"),
-                        (self._usb_gateway, "UsbNetworkGateway")):
-      item.action_item.set_state(ui_state.params.get_bool(param))
+    self._usb_address.action_item.set_enabled(ui_state.params.get_bool("UsbNetworkEnabled"))
+    self._usb_gateway.action_item.set_enabled(ui_state.params.get_bool("UsbNetworkEnabled"))
 
   @staticmethod
   def _edit_server():
-    if not ui_state.is_offroad():
-      return
-    def on_result(result: DialogResult, text: str):
-      if result == DialogResult.CONFIRM and ui_state.is_offroad():
-        ui_state.params.put("GpuOnLanHost", text.strip())
     InputDialogSP(tr("Server"), tr("e.g. 192.168.43.100:8000, or empty for the USB network"),
-                  current_text=ui_state.params.get("GpuOnLanHost") or "", callback=on_result).show()
+                  current_text=ui_state.params.get("GpuOnLanHost") or "", param="GpuOnLanHost").show()
 
   @staticmethod
   def _edit_usb_address():
-    if not ui_state.is_offroad():
-      return
     def on_result(result: DialogResult, text: str):
-      if result != DialogResult.CONFIRM or not ui_state.is_offroad():
+      if result != DialogResult.CONFIRM:
         return
       if (address := usb_network.parse_address(text)) is None:
         gui_app.push_widget(alert_dialog(tr("Enter a private IPv4 address with a /8 to /30 subnet, e.g. 10.47.0.1/24")))
         return
-      ui_state.params.put("UsbNetworkAddress", str(address), block=True)
+      ui_state.params.put("UsbNetworkAddress", str(address))
       if ui_state.params.get_bool("UsbNetworkEnabled"):
         threading.Thread(target=usb_network.up, daemon=True).start()  # re-apply on the new subnet
 
