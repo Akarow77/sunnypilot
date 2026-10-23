@@ -7,14 +7,12 @@ import numpy as np
 import pyray as rl
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.selfdrive.ui.mici.onroad import blend_colors
+from openpilot.selfdrive.ui.mici.onroad.torque_bar_geometry import torque_angle_span
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.lib.shader_polygon import draw_polygon, Gradient
 from openpilot.system.ui.widgets import Widget
 from openpilot.common.filter_simple import FirstOrderFilter
-
-# TODO: arc_bar_pts doesn't consider rounded end caps part of the angle span
-TORQUE_ANGLE_SPAN = 12.7  # degrees on the default 476 px camera view; narrower views beside the navigation panel scale down
 
 DEBUG = False
 
@@ -208,7 +206,7 @@ class TorqueBar(Widget):
     # draw curved line polygon torque bar
     torque_line_radius = 1200 * self._scale
     top_angle = -90
-    torque_bg_angle_span = self._torque_line_alpha_filter.x * TORQUE_ANGLE_SPAN * rect.width / 476
+    torque_bg_angle_span = self._torque_line_alpha_filter.x * torque_angle_span(rect.width, self._scale)
     torque_start_angle = top_angle - torque_bg_angle_span / 2
     torque_end_angle = top_angle + torque_bg_angle_span / 2
     # centerline radius & center (you already have these values)
