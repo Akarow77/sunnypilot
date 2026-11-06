@@ -120,6 +120,7 @@ class MainLayout(Widget):
 
   def _on_onroad_clicked(self):
     self._sidebar.set_visible(not self._sidebar.is_visible)
+    self._update_layout_rects()
 
   def _on_body_changed(self):
     self._layouts[MainState.HOME] = self._home_body_layout if ui_state.is_body else self._home_layout
