@@ -76,6 +76,12 @@ class DriverStateRendererSP(Widget):
       return
 
     renderer = self._driver_state_renderer
+    # Stock 3X hides DM for every alert size, including lane-change notices.
+    # DM is drawn after alerts here, so suppress the fade immediately as well.
+    if ui_state.sm["selfdriveState"].alertSize != AlertSize.none:
+      renderer._fade_filter.x = 0.0
+      return
+
     right_inset = CONFIDENCE_PANEL_WIDTH if ui_state.model_confidence else 0
     width = max(0.0, rect.width - right_inset)
     height = max(0.0, rect.height - get_bottom_dev_ui_offset())
@@ -91,7 +97,4 @@ class DriverStateRendererSP(Widget):
     if resized:
       renderer.load_icons()
 
-    # This HUD renders DM after alerts. Never paint a fading icon over an alert.
-    if ui_state.sm["selfdriveState"].alertSize != AlertSize.none:
-      renderer._fade_filter.x = 0.0
     renderer._render(renderer.rect)

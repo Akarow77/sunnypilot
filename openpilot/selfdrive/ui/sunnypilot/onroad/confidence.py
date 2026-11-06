@@ -4,7 +4,6 @@ import time
 
 import pyray as rl
 
-from openpilot.cereal import log
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.system.ui.lib.application import gui_app
@@ -12,12 +11,27 @@ from openpilot.system.ui.widgets import Widget
 
 CONFIDENCE_PANEL_WIDTH = 120
 MODEL_MAX_AGE = 0.5
+_CIRCLE_POINTS = tuple((math.cos(i * math.tau / 48), math.sin(i * math.tau / 48)) for i in range(49))
+
+
+def draw_circle_gradient(center_x: float, center_y: float, radius: int, top: rl.Color, bottom: rl.Color) -> None:
+  """Draw only the circle, preserving the translucent background around it."""
+  rl.rl_check_render_batch_limit(48 * 3)
+  rl.rl_set_texture(rl.rl_get_texture_id_default())
+  rl.rl_begin(rl.RL_TRIANGLES)
+  rl.rl_tex_coord2f(0.0, 0.0)
+  for current, following in zip(_CIRCLE_POINTS, _CIRCLE_POINTS[1:]):
+    for dx, dy in ((0.0, 0.0), following, current):
+      mix = (dy + 1.0) / 2.0
+      rl.rl_color4ub(*(round(a + (b - a) * mix) for a, b in
+                       ((top.r, bottom.r), (top.g, bottom.g), (top.b, bottom.b), (top.a, bottom.a))))
+      rl.rl_vertex2f(center_x + dx * radius, center_y + dy * radius)
+  rl.rl_end()
+  rl.rl_set_texture(0)
 
 
 def model_confidence(status: UIStatus, brake_probs, steer_probs) -> float | None:
   """Use the active axes' intervention predictions, not a probability of safe driving."""
-  if status == UIStatus.DISENGAGED:
-    return None
   arrays = (steer_probs,) if status == UIStatus.LAT_ONLY else (brake_probs,) if status == UIStatus.LONG_ONLY else (brake_probs, steer_probs)
   confidence = 1.0
   for probs in arrays:
@@ -27,7 +41,9 @@ def model_confidence(status: UIStatus, brake_probs, steer_probs) -> float | None
   return confidence
 
 
-def confidence_colors(value: float, override: bool = False) -> tuple[rl.Color, rl.Color]:
+def confidence_colors(value: float, override: bool = False, inactive: bool = False) -> tuple[rl.Color, rl.Color]:
+  if inactive:
+    return rl.Color(50, 50, 50, 255), rl.Color(13, 13, 13, 255)
   if override:
     return rl.Color(255, 255, 255, 255), rl.Color(82, 82, 82, 255)
   if value > 0.5:
@@ -74,10 +90,6 @@ class ModelConfidenceRenderer(Widget):
           not 0 <= now - sm.recv_time['selfdriveStateSP'] <= MODEL_MAX_AGE):
         self._reset()
         return
-    if sm['selfdriveState'].alertSize != log.SelfdriveState.AlertSize.none:
-      self._reset()
-      return
-
     predictions = sm['modelV2'].meta.disengagePredictions
     value = model_confidence(ui_state.status, predictions.brakeDisengageProbs, predictions.steerOverrideProbs)
     if value is None:
@@ -90,18 +102,16 @@ class ModelConfidenceRenderer(Widget):
     if not ui_state.model_confidence or not ui_state.started or rect.width <= 0 or rect.height <= 0:
       return
 
-    # A dedicated black panel keeps the original circle's mask off the camera image.
-    rl.draw_rectangle_rec(rect, rl.BLACK)
-    if not self._has_value:
-      return
+    # Match the existing bottom developer bar's translucent black tint.
+    rl.draw_rectangle_rec(rect, rl.Color(0, 0, 0, 100))
     radius = min(40, math.floor(min(rect.width, rect.height) / (2 * math.sqrt(2))) - 1)
     if radius < 1:
       return
-    value = min(1.0, max(0.0, self._confidence_filter.x))
-    outer_radius = math.ceil(radius * math.sqrt(2)) + 1
+    # Missing data uses a neutral marker at the bottom, never an old high value.
+    value = min(1.0, max(0.0, self._confidence_filter.x)) if self._has_value else 0.0
+    padding = math.ceil(radius * math.sqrt(2)) + 1
     x = int(rect.x + rect.width / 2)
-    y = int(rect.y + outer_radius + (1 - value) * (rect.height - 2 * outer_radius))
-    top, bottom = confidence_colors(value, ui_state.status == UIStatus.OVERRIDE)
-    # Match the original two-color circle without importing the mici/SP UI cycle.
-    rl.draw_rectangle_gradient_v(x - radius, y - radius, 2 * radius, 2 * radius, top, bottom)
-    rl.draw_ring(rl.Vector2(x, y), radius, outer_radius, 0, 360, 40, rl.BLACK)
+    y = int(rect.y + padding + (1 - value) * (rect.height - 2 * padding))
+    top, bottom = confidence_colors(value, ui_state.status == UIStatus.OVERRIDE,
+                                    ui_state.status == UIStatus.DISENGAGED or not self._has_value)
+    draw_circle_gradient(x, y, radius, top, bottom)
