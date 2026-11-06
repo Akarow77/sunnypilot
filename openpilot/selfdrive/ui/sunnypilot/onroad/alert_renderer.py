@@ -8,6 +8,7 @@ import pyray as rl
 from openpilot.selfdrive.ui.onroad.alert_renderer import AlertRenderer, AlertSize, ALERT_FONT_MEDIUM, ALERT_FONT_BIG, \
   ALERT_FONT_SMALL, ALERT_MARGIN, ALERT_HEIGHTS, ALERT_PADDING, Alert
 from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.selfdrive.ui.sunnypilot.onroad.confidence import CONFIDENCE_PANEL_WIDTH
 from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.lib.wrap_text import wrap_text
 
@@ -64,12 +65,17 @@ class AlertRendererSP(AlertRenderer):
     rl.draw_text_ex(font, text, rl.Vector2(x, y), font_size, 0, color)
 
   def _get_alert_rect(self, rect: rl.Rectangle, size: int) -> rl.Rectangle:
+    if ui_state.model_confidence:
+      # Keep alerts inside the road area, separate from the confidence panel.
+      rect = rl.Rectangle(rect.x, rect.y, max(0.0, rect.width - CONFIDENCE_PANEL_WIDTH), rect.height)
     if size == AlertSize.full:
       return rect
 
     dev_ui_info = ui_state.developer_ui
     v_adjustment = 40 if dev_ui_info in {2, 3} and size != AlertSize.full else 0
-    h_adjustment = 230 if dev_ui_info in {1, 3} and size != AlertSize.full else 0
+    # The panel already reserves space on the right. Do not subtract the old
+    # developer column allowance again and leave a second empty strip.
+    h_adjustment = 230 if dev_ui_info in {1, 3} and not ui_state.model_confidence else 0
 
     w = int(rect.width - ALERT_MARGIN * 2 - h_adjustment)
     h = self._calculate_dynamic_height(size, w)

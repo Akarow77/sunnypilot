@@ -7,6 +7,7 @@ import pyray as rl
 
 from openpilot.cereal import log
 from openpilot.selfdrive.ui.mici.onroad import driver_state as four_dm
+from openpilot.selfdrive.ui.onroad import driver_state as stock_three_dm
 from openpilot.selfdrive.ui.sunnypilot.onroad import driver_state as three_dm
 from openpilot.selfdrive.ui.ui_state import UIStatus
 
@@ -34,7 +35,7 @@ class TestCommaFourDMOnThreeX(unittest.TestCase):
     self.sm = FakeSubMaster()
     self.ui = SimpleNamespace(sm=self.sm, started=True, started_frame=100,
                               status=UIStatus.LAT_ONLY, always_on_dm=False, model_confidence=False, rocket_fuel=False)
-    for module in (four_dm, three_dm):
+    for module in (four_dm, three_dm, stock_three_dm):
       patcher = patch.object(module, "ui_state", self.ui)
       patcher.start()
       self.addCleanup(patcher.stop)
@@ -146,15 +147,29 @@ class TestCommaFourDMOnThreeX(unittest.TestCase):
     self.frame()
     self.assertGreater(self.renderer._driver_state_renderer._fade_filter.x, 0.0)
 
-  def test_alert_never_has_visible_dm_overlay(self):
-    for _ in range(20):
-      self.frame()
-    self.sm["selfdriveState"].alertSize = four_dm.AlertSize.full
-    self.draw_plain.reset_mock()
-    self.draw_rotated.reset_mock()
-    self.frame()
-    for call in self.draw_plain.call_args_list + self.draw_rotated.call_args_list:
-      self.assertEqual(call.args[-1].a, 0)
+  def test_alert_visibility_matches_stock_three_x_and_recovers(self):
+    stock = stock_three_dm.DriverStateRenderer()
+    for size in (four_dm.AlertSize.small, four_dm.AlertSize.mid, four_dm.AlertSize.full):
+      with self.subTest(alert_size=size):
+        self.sm["selfdriveState"].alertSize = four_dm.AlertSize.none
+        for _ in range(20):
+          self.frame()
+        self.assertTrue(stock.is_visible)
+        self.assertGreater(self.renderer._driver_state_renderer._fade_filter.x, 0.0)
+
+        self.sm["selfdriveState"].alertSize = size
+        self.draw_plain.reset_mock()
+        self.draw_rotated.reset_mock()
+        self.frame()
+        self.assertFalse(stock.is_visible)
+        self.assertEqual(self.renderer._driver_state_renderer._fade_filter.x, 0.0)
+        self.draw_plain.assert_not_called()
+        self.draw_rotated.assert_not_called()
+
+        self.sm["selfdriveState"].alertSize = four_dm.AlertSize.none
+        self.frame()
+        self.assertTrue(stock.is_visible)
+        self.assertGreater(self.draw_plain.call_args.args[-1].a, 0)
 
   def test_rhd_and_developer_ui_avoid_confidence_panel(self):
     self.frame()

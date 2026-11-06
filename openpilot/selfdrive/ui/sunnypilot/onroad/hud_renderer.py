@@ -128,11 +128,12 @@ class HudRendererSP(HudRenderer):
     )
 
   def _draw_current_speed(self, rect: rl.Rectangle) -> None:
-    self.speed_renderer.render(rect)
+    # Keep speed centered in the original viewport, including the side panel.
+    self.speed_renderer.render(self.rect)
 
   def _render(self, rect: rl.Rectangle) -> None:
     confidence_rect = rl.Rectangle(rect.x + rect.width - CONFIDENCE_PANEL_WIDTH, rect.y,
-                                   CONFIDENCE_PANEL_WIDTH, rect.height - get_bottom_dev_ui_offset())
+                                   CONFIDENCE_PANEL_WIDTH, rect.height)
     if ui_state.model_confidence:
       rect = rl.Rectangle(rect.x, rect.y, rect.width - CONFIDENCE_PANEL_WIDTH, rect.height)
     super()._render(rect)
