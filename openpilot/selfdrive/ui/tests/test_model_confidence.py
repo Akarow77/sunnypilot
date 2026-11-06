@@ -7,6 +7,7 @@ import pyray as rl
 
 from openpilot.cereal import messaging, log
 from openpilot.selfdrive.ui.ui_state import UIStatus
+from openpilot.selfdrive.ui.sunnypilot.ui_state import UIStateSP, MADSState, OpenpilotState
 from openpilot.selfdrive.ui.sunnypilot.onroad import confidence
 
 
@@ -64,6 +65,18 @@ class TestConfidenceWidget(unittest.TestCase):
     patch.object(confidence.time, 'monotonic', return_value=10.0).start()
     self.widget = confidence.ModelConfidenceRenderer()
     self.settle_frames = math.ceil(4.0 / self.widget._confidence_filter.dt)
+
+  def set_mads_status(self, expected):
+    """Use the production status mapping, including paused MADS -> override."""
+    ss, ss_sp = self.sm['selfdriveState'], self.sm['selfdriveStateSP']
+    ss.enabled = expected in (UIStatus.ENGAGED, UIStatus.OVERRIDE, UIStatus.LONG_ONLY)
+    ss.state = OpenpilotState.enabled if ss.enabled else OpenpilotState.disabled
+    ss_sp.mads.available = True
+    ss_sp.mads.enabled = expected in (UIStatus.ENGAGED, UIStatus.OVERRIDE, UIStatus.LAT_ONLY)
+    ss_sp.mads.state = MADSState.paused if expected == UIStatus.OVERRIDE else (
+      MADSState.enabled if ss_sp.mads.enabled else MADSState.disabled)
+    self.state.status = UIStatus(UIStateSP.update_status(ss, ss_sp, []))
+    self.assertEqual(self.state.status, expected)
 
   def test_lateral_only_color_changes_with_value(self):
     for prediction, expected in ((0.1, (0, 255, 204)), (0.7, (255, 200, 0)), (0.9, (255, 0, 21))):
@@ -231,7 +244,7 @@ class TestConfidenceWidget(unittest.TestCase):
     self.assertEqual(self.widget._confidence_filter.x, -0.5)
 
   def test_valid_override_retains_both_axis_formula_and_white_grey_palette(self):
-    self.state.status = UIStatus.OVERRIDE
+    self.set_mads_status(UIStatus.OVERRIDE)
     self.sm['modelV2'].meta.disengagePredictions.brakeDisengageProbs = [0.2]
     self.sm['modelV2'].meta.disengagePredictions.steerOverrideProbs = [0.3]
     self.widget._update_state()
@@ -241,6 +254,113 @@ class TestConfidenceWidget(unittest.TestCase):
       self.widget._render(rl.Rectangle(1840, 30, 120, 960))
       self.assertEqual([(c.r, c.g, c.b, c.a) for c in dot.call_args.args[-2:]],
                        [(255, 255, 255, 255), (82, 82, 82, 255)])
+
+  def test_engaged_override_transition_preserves_original_filter_at_20_and_60_fps(self):
+    for fps in (20, 60):
+      with self.subTest(fps=fps), patch.object(confidence.gui_app, '_target_fps', fps):
+        self.widget = confidence.ModelConfidenceRenderer()
+        self.assertAlmostEqual(self.widget._confidence_filter.dt, 1 / fps)
+        self.set_mads_status(UIStatus.ENGAGED)
+        predictions = self.sm['modelV2'].meta.disengagePredictions
+        predictions.brakeDisengageProbs = [0.0]
+        predictions.steerOverrideProbs = [0.0]
+        self.widget._update_state()
+        self.assertEqual(self.widget._confidence_filter.x, 1.0)
+        alpha = (1 / fps) / (0.5 + 1 / fps)
+
+        for status, brake, steer, palette in (
+          (UIStatus.OVERRIDE, 0.2, 0.4, [(255, 255, 255), (82, 82, 82)]),
+          (UIStatus.ENGAGED, 0.05, 0.1, [(0, 255, 204), (0, 255, 38)]),
+        ):
+          self.set_mads_status(status)
+          predictions.brakeDisengageProbs = [brake]
+          predictions.steerOverrideProbs = [steer]
+          start = self.widget._confidence_filter.x
+          target = (1 - predictions.brakeDisengageProbs[0]) * (1 - predictions.steerOverrideProbs[0])
+          with patch.object(rl, 'draw_rectangle_rec'), patch.object(confidence, 'draw_circle_gradient') as dot:
+            for frame in range(1, fps + 1):
+              self.widget._update_state()
+              expected = target + (start - target) * (1 - alpha) ** frame
+              self.assertAlmostEqual(self.widget._confidence_filter.x, expected, places=6)
+              self.widget._render(rl.Rectangle(1840, 30, 120, 960))
+              self.assertEqual([(c.r, c.g, c.b) for c in dot.call_args.args[-2:]], palette)
+          self.assertNotAlmostEqual(self.widget._confidence_filter.x, target, places=3)
+
+  def test_every_mads_status_requires_fresh_sp_message_and_recovers_from_current_data(self):
+    for status in UIStatus:
+      for attr, invalid in (('valid', False), ('alive', False), ('recv_frame', 10),
+                            ('recv_time', 9.49), ('recv_time', 11.0)):
+        with self.subTest(status=status, attr=attr):
+          self.widget = confidence.ModelConfidenceRenderer()
+          self.set_mads_status(status)
+          predictions = self.sm['modelV2'].meta.disengagePredictions
+          predictions.brakeDisengageProbs = [0.0]
+          predictions.steerOverrideProbs = [0.0]
+          self.widget._update_state()
+          self.assertTrue(self.widget._has_value)
+          self.assertEqual(self.widget._confidence_filter.x, -0.5 if status == UIStatus.DISENGAGED else 1.0)
+
+          field = getattr(self.sm, attr)
+          previous = field['selfdriveStateSP']
+          field['selfdriveStateSP'] = invalid
+          self.widget._update_state()
+          self.assertFalse(self.widget._has_value)
+          self.assertFalse(self.widget._confidence_filter.initialized)
+          self.assertEqual(self.widget._confidence_filter.x, 0.0)
+          rect = rl.Rectangle(1840, 30, 120, 960)
+          with patch.object(rl, 'draw_rectangle_rec'), patch.object(confidence, 'draw_circle_gradient') as dot:
+            self.widget._render(rect)
+            _, center_y, radius = dot.call_args.args[:3]
+            self.assertEqual(center_y + math.ceil(radius * math.sqrt(2)) + 1, rect.y + rect.height)
+            self.assertEqual([(c.r, c.g, c.b) for c in dot.call_args.args[-2:]], [(50, 50, 50), (13, 13, 13)])
+
+          field['selfdriveStateSP'] = previous
+          predictions.brakeDisengageProbs = [0.8]
+          predictions.steerOverrideProbs = [0.8]
+          self.set_mads_status(status)
+          self.widget._update_state()
+          self.assertTrue(self.widget._has_value)
+          expected = -0.5 if status == UIStatus.DISENGAGED else (
+            0.2 if status in (UIStatus.LAT_ONLY, UIStatus.LONG_ONLY) else 0.04)
+          self.assertAlmostEqual(self.widget._confidence_filter.x, expected, places=6)
+
+  def test_changes_between_active_axis_domains_reset_the_value(self):
+    domains = {UIStatus.ENGAGED: 'both', UIStatus.OVERRIDE: 'both',
+               UIStatus.LAT_ONLY: 'lateral', UIStatus.LONG_ONLY: 'longitudinal'}
+    predictions = self.sm['modelV2'].meta.disengagePredictions
+    for before, before_domain in domains.items():
+      for after, after_domain in domains.items():
+        if before_domain == after_domain:
+          continue
+        with self.subTest(before=before, after=after):
+          self.widget = confidence.ModelConfidenceRenderer()
+          predictions.brakeDisengageProbs = [0.1]
+          predictions.steerOverrideProbs = [0.2]
+          self.set_mads_status(before)
+          self.widget._update_state()
+          predictions.brakeDisengageProbs = [0.6]
+          predictions.steerOverrideProbs = [0.4]
+          self.set_mads_status(after)
+          self.widget._update_state()
+          expected = {'both': 0.24, 'lateral': 0.6, 'longitudinal': 0.4}[after_domain]
+          self.assertAlmostEqual(self.widget._confidence_filter.x, expected, places=6)
+
+  def test_disengaged_entrance_and_exit_remain_continuous_between_axis_domains(self):
+    predictions = self.sm['modelV2'].meta.disengagePredictions
+    predictions.brakeDisengageProbs = [0.6]
+    predictions.steerOverrideProbs = [0.2]
+    self.set_mads_status(UIStatus.LAT_ONLY)
+    self.widget._update_state()
+    start = self.widget._confidence_filter.x
+    alpha = self.widget._confidence_filter.alpha
+    self.set_mads_status(UIStatus.DISENGAGED)
+    self.widget._update_state()
+    descending = (1 - alpha) * start + alpha * -0.5
+    self.assertAlmostEqual(self.widget._confidence_filter.x, descending, places=6)
+    self.set_mads_status(UIStatus.LONG_ONLY)
+    self.widget._update_state()
+    self.assertAlmostEqual(self.widget._confidence_filter.x, (1 - alpha) * descending + alpha * 0.4, places=6)
+    self.assertNotAlmostEqual(self.widget._confidence_filter.x, 0.4, places=3)
 
   def test_alerts_do_not_hide_or_reset_confidence(self):
     self.widget._update_state()

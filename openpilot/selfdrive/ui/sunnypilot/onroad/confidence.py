@@ -70,10 +70,14 @@ class ModelConfidenceRenderer(Widget):
   def _update_state(self):
     sm = ui_state.sm
     status_changed = self._last_status != ui_state.status
-    # Keep the position across disengage/re-engage so the original four's
-    # descent and return animation are not replaced by an immediate jump.
+    # Four keeps one continuous filter for engagement and override (same axes).
+    # Also retain the descent/return animation across disengagement. Sunnypilot
+    # changes between lateral-only, longitudinal-only and both axes reset the
+    # value so a prediction for the previous active axes is not reused.
     disengage_transition = UIStatus.DISENGAGED in (self._last_status, ui_state.status)
-    if self._started_frame != ui_state.started_frame or (status_changed and not disengage_transition):
+    both_axes = (UIStatus.ENGAGED, UIStatus.OVERRIDE)
+    same_axes_transition = self._last_status in both_axes and ui_state.status in both_axes
+    if self._started_frame != ui_state.started_frame or (status_changed and not (disengage_transition or same_axes_transition)):
       self._reset()
     self._started_frame = ui_state.started_frame
     self._last_status = ui_state.status
@@ -83,11 +87,13 @@ class ModelConfidenceRenderer(Widget):
       self._reset()
       return
     now = time.monotonic()
-    service = 'selfdriveState'
-    if (not sm.valid[service] or not sm.alive[service] or sm.recv_frame[service] <= ui_state.started_frame or
-        not 0 <= now - sm.recv_time[service] <= MODEL_MAX_AGE):
-      self._reset()
-      return
+    # UIStateSP.update_status uses MADS even for ENGAGED, OVERRIDE and DISENGAGED.
+    # Neither state source may be stale when selecting a color or animation.
+    for service in ('selfdriveState', 'selfdriveStateSP'):
+      if (not sm.valid[service] or not sm.alive[service] or sm.recv_frame[service] <= ui_state.started_frame or
+          not 0 <= now - sm.recv_time[service] <= MODEL_MAX_AGE):
+        self._reset()
+        return
     if ui_state.status == UIStatus.DISENGAGED:
       # The four animates out with this target, independent of model confidence.
       # Rendering clamps at the bottom to keep the user's always-visible marker.
@@ -99,12 +105,6 @@ class ModelConfidenceRenderer(Widget):
         not 0 <= now - sm.recv_time[service] <= MODEL_MAX_AGE):
       self._reset()
       return
-    if ui_state.status in (UIStatus.LAT_ONLY, UIStatus.LONG_ONLY):
-      if (not sm.valid['selfdriveStateSP'] or not sm.alive['selfdriveStateSP'] or
-          sm.recv_frame['selfdriveStateSP'] <= ui_state.started_frame or
-          not 0 <= now - sm.recv_time['selfdriveStateSP'] <= MODEL_MAX_AGE):
-        self._reset()
-        return
     predictions = sm['modelV2'].meta.disengagePredictions
     value = model_confidence(ui_state.status, predictions.brakeDisengageProbs, predictions.steerOverrideProbs)
     if value is None:
