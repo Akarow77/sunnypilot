@@ -51,7 +51,9 @@ class TestConfidenceRoadLayout(unittest.TestCase):
     patch.object(road.gui_app, 'font', return_value=rl.Font()).start()
     # Keep the real wrap algorithm and height calculation, replacing only font metrics.
     def measure(font, text, size, spacing=0):
-      return rl.Vector2(len(text) * size * 0.45, size)
+      lines = text.split('\n')
+      return rl.Vector2(max(map(len, lines), default=0) * size * 0.45, len(lines) * size)
+    self.measure = measure
     patch.object(alerts, 'measure_text_cached', side_effect=measure).start()
     patch.object(wrap_module, 'measure_text_cached', side_effect=measure).start()
     patch.object(wrap_module, 'font_fallback', side_effect=lambda font: font).start()
@@ -171,10 +173,28 @@ class TestConfidenceRoadLayout(unittest.TestCase):
           self.frame(size, detail='Monitor surrounding traffic')
           alert_rect = self.alert._draw_background.call_args.args[0]
           margin = 0 if size == AlertSize.full else stock_alert.ALERT_MARGIN
-          debug_margin = 230 if size != AlertSize.full and mode in (DeveloperUiState.BOTTOM, DeveloperUiState.BOTH) else 0
+          debug_margin = 230 if size != AlertSize.full and mode in (DeveloperUiState.RIGHT, DeveloperUiState.BOTH) else 0
           self.assertEqual(alert_rect.x + alert_rect.width, panel.x - margin - debug_margin)
           self.assertEqual(self.draw_circle.call_args.args[:3], reference_dot)
           self.assertEqual(self.events, ['confidence', 'alert', 'dm'])
+
+  def test_alert_bottom_clearance_tracks_bottom_debug_row(self):
+    for enabled in (False, True):
+      self.state.model_confidence = enabled
+      for mode in DeveloperUiState:
+        self.state.developer_ui = mode
+        for size in (AlertSize.small, AlertSize.mid, AlertSize.full):
+          with self.subTest(confidence=enabled, mode=mode, size=size):
+            self.frame(size, 'Pay Attention', 'Driver Distracted')
+            alert_rect = self.alert._draw_background.call_args.args[0]
+            content = self.view._content_rect
+            if size == AlertSize.full:
+              expected_gap = 0
+            else:
+              expected_gap = stock_alert.ALERT_MARGIN
+              if mode in (DeveloperUiState.BOTTOM, DeveloperUiState.BOTH):
+                expected_gap += 40
+            self.assertEqual(content.y + content.height - alert_rect.y - alert_rect.height, expected_gap)
 
   def test_wrapped_message_uses_real_dynamic_height_without_panel_intrusion(self):
     for size in (AlertSize.small, AlertSize.mid):
@@ -199,6 +219,44 @@ class TestConfidenceRoadLayout(unittest.TestCase):
     self.assertEqual(panel.height, self.view._content_rect.height)
     self.draw_circle.assert_called_once()
 
+  def test_mid_explicit_newlines_keep_line_spacing_and_symmetric_padding(self):
+    # Execute the real text renderer down to draw_text_ex. Whole-string metrics
+    # deliberately grow with newlines, as native font measurement does, so they
+    # cannot accidentally be used as the height of each individual output line.
+    self.alert._draw_text = alerts.AlertRendererSP._draw_text.__get__(self.alert)
+    cases = (
+      ('Bookmark Saved', 'Device is not paired\nPair your device'),
+      ('Model Selection Failed\nSelected model is unavailable',
+       'Choose a model\nConnect to the internet\nTry again'),
+    )
+    with patch.object(rl, 'draw_text_ex') as draw:
+      for title, detail in cases:
+        for enabled in (False, True):
+          self.state.model_confidence = enabled
+          for mode in DeveloperUiState:
+            self.state.developer_ui = mode
+            with self.subTest(title=title, confidence=enabled, mode=mode):
+              draw.reset_mock()
+              self.frame(AlertSize.mid, title, detail)
+              alert_rect = self.alert._draw_background.call_args.args[0]
+              title_lines, detail_lines = title.split('\n'), detail.split('\n')
+              lines = title_lines + detail_lines
+              sizes = [stock_alert.ALERT_FONT_BIG] * len(title_lines) + [stock_alert.ALERT_FONT_SMALL] * len(detail_lines)
+              self.assertEqual([call.args[1] for call in draw.call_args_list], lines)
+              text_height = sum(sizes) + alerts.ALERT_LINE_SPACING
+              padding = stock_alert.ALERT_PADDING - stock_alert.ALERT_MARGIN
+              self.assertEqual(alert_rect.height, text_height + 2 * padding)
+              y = alert_rect.y + padding
+              for index, (call, line, size) in enumerate(zip(draw.call_args_list, lines, sizes, strict=True)):
+                self.assertEqual(call.args[3], size)
+                self.assertEqual(call.args[2].y, y)
+                text_width = self.measure(call.args[0], line, size).x
+                self.assertAlmostEqual(call.args[2].x + text_width / 2, alert_rect.x + alert_rect.width / 2, delta=0.001)
+                y += size
+                if index + 1 == len(title_lines):
+                  y += alerts.ALERT_LINE_SPACING
+              self.assertEqual(alert_rect.y + alert_rect.height - y, padding)
+
   def test_full_alert_keeps_entire_camera_area_and_confidence_panel_separate(self):
     panel = self.frame(AlertSize.full, 'TAKE CONTROL IMMEDIATELY', 'System Unresponsive')
     alert_rect = self.alert._draw_background.call_args.args[0]
@@ -207,7 +265,7 @@ class TestConfidenceRoadLayout(unittest.TestCase):
     self.assertEqual(self.events, ['confidence', 'alert', 'dm'])
     self.draw_circle.assert_called_once()
 
-  def test_setting_off_preserves_stock_alert_and_hud_width(self):
+  def test_setting_off_reserves_only_the_active_debug_column(self):
     self.state.model_confidence = False
     for mode in DeveloperUiState:
       self.state.developer_ui = mode
@@ -216,8 +274,8 @@ class TestConfidenceRoadLayout(unittest.TestCase):
       content = self.view._content_rect
       self.assertEqual(bounds(self.hud.developer_ui.render.call_args.args[0]), bounds(content))
       alert_rect = self.alert._draw_background.call_args.args[0]
-      old_adjustment = 230 if mode in (DeveloperUiState.BOTTOM, DeveloperUiState.BOTH) else 0
-      self.assertEqual(alert_rect.width, content.width - 2 * stock_alert.ALERT_MARGIN - old_adjustment)
+      column_width = 230 if mode in (DeveloperUiState.RIGHT, DeveloperUiState.BOTH) else 0
+      self.assertEqual(alert_rect.width, content.width - 2 * stock_alert.ALERT_MARGIN - column_width)
     self.frame(AlertSize.full)
     self.assertEqual(bounds(self.alert._draw_background.call_args.args[0]), bounds(self.view._content_rect))
 
