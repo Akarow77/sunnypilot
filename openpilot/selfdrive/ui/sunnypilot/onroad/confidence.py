@@ -69,7 +69,11 @@ class ModelConfidenceRenderer(Widget):
 
   def _update_state(self):
     sm = ui_state.sm
-    if self._started_frame != ui_state.started_frame or self._last_status != ui_state.status:
+    status_changed = self._last_status != ui_state.status
+    # Keep the position across disengage/re-engage so the original four's
+    # descent and return animation are not replaced by an immediate jump.
+    disengage_transition = UIStatus.DISENGAGED in (self._last_status, ui_state.status)
+    if self._started_frame != ui_state.started_frame or (status_changed and not disengage_transition):
       self._reset()
     self._started_frame = ui_state.started_frame
     self._last_status = ui_state.status
@@ -79,11 +83,22 @@ class ModelConfidenceRenderer(Widget):
       self._reset()
       return
     now = time.monotonic()
-    for service in ('modelV2', 'selfdriveState'):
-      if (not sm.valid[service] or not sm.alive[service] or sm.recv_frame[service] <= ui_state.started_frame or
-          not 0 <= now - sm.recv_time[service] <= MODEL_MAX_AGE):
-        self._reset()
-        return
+    service = 'selfdriveState'
+    if (not sm.valid[service] or not sm.alive[service] or sm.recv_frame[service] <= ui_state.started_frame or
+        not 0 <= now - sm.recv_time[service] <= MODEL_MAX_AGE):
+      self._reset()
+      return
+    if ui_state.status == UIStatus.DISENGAGED:
+      # The four animates out with this target, independent of model confidence.
+      # Rendering clamps at the bottom to keep the user's always-visible marker.
+      self._confidence_filter.update(-0.5)
+      self._has_value = True
+      return
+    service = 'modelV2'
+    if (not sm.valid[service] or not sm.alive[service] or sm.recv_frame[service] <= ui_state.started_frame or
+        not 0 <= now - sm.recv_time[service] <= MODEL_MAX_AGE):
+      self._reset()
+      return
     if ui_state.status in (UIStatus.LAT_ONLY, UIStatus.LONG_ONLY):
       if (not sm.valid['selfdriveStateSP'] or not sm.alive['selfdriveStateSP'] or
           sm.recv_frame['selfdriveStateSP'] <= ui_state.started_frame or
