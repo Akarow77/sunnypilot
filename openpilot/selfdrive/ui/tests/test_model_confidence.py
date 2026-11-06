@@ -15,7 +15,7 @@ class TestConfidenceValue(unittest.TestCase):
     self.assertAlmostEqual(confidence.model_confidence(UIStatus.ENGAGED, [0.2, 0.1], [0.3, 0.1]), 0.56)
     self.assertAlmostEqual(confidence.model_confidence(UIStatus.LAT_ONLY, [], [0.3]), 0.7)
     self.assertAlmostEqual(confidence.model_confidence(UIStatus.LONG_ONLY, [0.2], []), 0.8)
-    self.assertAlmostEqual(confidence.model_confidence(UIStatus.DISENGAGED, [0.2], [0.3]), 0.56)
+    self.assertAlmostEqual(confidence.model_confidence(UIStatus.OVERRIDE, [0.2], [0.3]), 0.56)
 
   def test_missing_and_invalid_predictions(self):
     for bad in ([], [math.nan], [math.inf], [-0.01], [1.01], [0.1, math.nan]):
@@ -63,6 +63,7 @@ class TestConfidenceWidget(unittest.TestCase):
     patch.object(confidence, 'ui_state', self.state).start()
     patch.object(confidence.time, 'monotonic', return_value=10.0).start()
     self.widget = confidence.ModelConfidenceRenderer()
+    self.settle_frames = math.ceil(4.0 / self.widget._confidence_filter.dt)
 
   def test_lateral_only_color_changes_with_value(self):
     for prediction, expected in ((0.1, (0, 255, 204)), (0.7, (255, 200, 0)), (0.9, (255, 0, 21))):
@@ -109,16 +110,137 @@ class TestConfidenceWidget(unittest.TestCase):
           dot.assert_not_called()
         setattr(self.state, attr, previous)
 
-  def test_disengaged_keeps_live_grey_indicator(self):
+  def test_disengaging_descends_to_visible_grey_bottom_despite_high_model_value(self):
+    self.state.status = UIStatus.ENGAGED
+    self.sm['modelV2'].meta.disengagePredictions.brakeDisengageProbs = [0.0]
+    self.sm['modelV2'].meta.disengagePredictions.steerOverrideProbs = [0.0]
+    self.widget._update_state()
+    self.assertEqual(self.widget._confidence_filter.x, 1.0)
+    rect = rl.Rectangle(1840, 30, 120, 960)
+    values, centers = [], []
+    self.state.status = UIStatus.DISENGAGED
+    with patch.object(rl, 'draw_rectangle_rec'), patch.object(confidence, 'draw_circle_gradient') as dot:
+      for _ in range(self.settle_frames):
+        self.widget._update_state()
+        self.widget._render(rect)
+        self.assertTrue(self.widget._has_value)
+        values.append(self.widget._confidence_filter.x)
+        centers.append(dot.call_args.args[1])
+        self.assertEqual([(c.r, c.g, c.b) for c in dot.call_args.args[-2:]], [(50, 50, 50), (13, 13, 13)])
+      radius = dot.call_args.args[2]
+      expected_bottom = rect.y + rect.height - math.ceil(radius * math.sqrt(2)) - 1
+      self.assertEqual(centers[-1], expected_bottom)
+      self.assertEqual(centers[-10:], [expected_bottom] * 10)
+    self.assertGreater(values[0], 0.0)  # It moves down from the previous value, without jumping.
+    self.assertLess(values[0], 1.0)
+    self.assertTrue(all(a > b for a, b in zip(values, values[1:])))
+    self.assertTrue(all(a <= b for a, b in zip(centers, centers[1:])))
+    self.assertLess(values[-1], 0.0)
+    # Match comma four's -0.5 target and 0.5-second time constant.
+    dt = self.widget._confidence_filter.dt
+    alpha = dt / (0.5 + dt)
+    self.assertAlmostEqual(values[0], (1 - alpha) * 1.0 + alpha * -0.5)
+
+  def test_reengagement_rises_gradually_from_disengaged_bottom(self):
+    self.state.status = UIStatus.ENGAGED
+    self.sm['modelV2'].meta.disengagePredictions.brakeDisengageProbs = [0.0]
+    self.sm['modelV2'].meta.disengagePredictions.steerOverrideProbs = [0.0]
+    self.widget._update_state()
+    self.state.status = UIStatus.DISENGAGED
+    for _ in range(self.settle_frames):
+      self.widget._update_state()
+    before = self.widget._confidence_filter.x
+    self.assertLess(before, 0)
+    self.state.status = UIStatus.ENGAGED
+    values, centers = [], []
+    with patch.object(rl, 'draw_rectangle_rec'), patch.object(confidence, 'draw_circle_gradient') as dot:
+      for _ in range(self.settle_frames):
+        self.widget._update_state()
+        self.widget._render(rl.Rectangle(1840, 30, 120, 960))
+        values.append(self.widget._confidence_filter.x)
+        centers.append(dot.call_args.args[1])
+    self.assertGreater(values[0], before)
+    self.assertLess(values[0], 0)  # Preserve the original entrance animation, not a jump to 1.
+    self.assertTrue(all(a < b for a, b in zip(values, values[1:])))
+    self.assertTrue(all(a >= b for a, b in zip(centers, centers[1:])))
+    self.assertGreater(values[-1], 0.9)
+
+  def test_disengaged_descent_does_not_require_a_model_prediction(self):
+    self.widget._update_state()
+    before = self.widget._confidence_filter.x
+    self.state.status = UIStatus.DISENGAGED
+    self.sm.valid['modelV2'] = False
+    self.sm.alive['modelV2'] = False
+    self.sm.recv_time['modelV2'] = 0.0
+    self.sm['modelV2'].meta.disengagePredictions.brakeDisengageProbs = []
+    self.sm['modelV2'].meta.disengagePredictions.steerOverrideProbs = [math.nan]
+    self.widget._update_state()
+    self.assertTrue(self.widget._has_value)
+    self.assertGreater(self.widget._confidence_filter.x, 0.0)
+    self.assertLess(self.widget._confidence_filter.x, before)
+    for _ in range(self.settle_frames):
+      self.widget._update_state()
+    self.assertLess(self.widget._confidence_filter.x, 0.0)
+    self.state.status = UIStatus.ENGAGED
+    self.widget._update_state()
+    self.assertFalse(self.widget._has_value)  # Active display must still reject the missing model.
+
+  def test_invalid_selfdrive_status_resets_disengaged_animation(self):
+    for attr, invalid in (('valid', False), ('alive', False), ('recv_frame', 10),
+                          ('recv_time', 9.49), ('recv_time', 11.0)):
+      with self.subTest(attr=attr):
+        self.state.status = UIStatus.LAT_ONLY
+        self.widget._update_state()
+        self.state.status = UIStatus.DISENGAGED
+        self.widget._update_state()
+        self.assertTrue(self.widget._has_value)
+        field = getattr(self.sm, attr)
+        previous = field['selfdriveState']
+        field['selfdriveState'] = invalid
+        self.widget._update_state()
+        self.assertFalse(self.widget._has_value)
+        self.assertFalse(self.widget._confidence_filter.initialized)
+        self.assertEqual(self.widget._confidence_filter.x, 0.0)
+        field['selfdriveState'] = previous
+        self.widget._update_state()
+        self.assertTrue(self.widget._has_value)
+        self.assertEqual(self.widget._confidence_filter.x, -0.5)
+
+  def test_offroad_and_new_drive_do_not_reuse_the_previous_animation(self):
+    self.widget._update_state()
+    self.assertGreater(self.widget._confidence_filter.x, 0.8)
+    self.state.status = UIStatus.DISENGAGED
+    self.widget._update_state()
+    self.state.started = False
+    self.widget._update_state()
+    self.assertFalse(self.widget._has_value)
+    self.assertFalse(self.widget._confidence_filter.initialized)
+    self.state.started = True
+    self.widget._update_state()
+    self.assertEqual(self.widget._confidence_filter.x, -0.5)
+
+    self.state.status = UIStatus.ENGAGED
+    for _ in range(self.settle_frames):
+      self.widget._update_state()
+    self.assertGreater(self.widget._confidence_filter.x, 0.8)
+    self.state.started_frame = 100
+    self.sm.recv_frame = dict.fromkeys(self.sm, 101)
     self.state.status = UIStatus.DISENGAGED
     self.widget._update_state()
     self.assertTrue(self.widget._has_value)
-    self.assertAlmostEqual(self.widget._confidence_filter.x, 0.81, places=6)
+    self.assertEqual(self.widget._confidence_filter.x, -0.5)
+
+  def test_valid_override_retains_both_axis_formula_and_white_grey_palette(self):
+    self.state.status = UIStatus.OVERRIDE
+    self.sm['modelV2'].meta.disengagePredictions.brakeDisengageProbs = [0.2]
+    self.sm['modelV2'].meta.disengagePredictions.steerOverrideProbs = [0.3]
+    self.widget._update_state()
+    self.assertTrue(self.widget._has_value)
+    self.assertAlmostEqual(self.widget._confidence_filter.x, 0.56, places=6)
     with patch.object(rl, 'draw_rectangle_rec'), patch.object(confidence, 'draw_circle_gradient') as dot:
       self.widget._render(rl.Rectangle(1840, 30, 120, 960))
-      dot.assert_called_once()
-      for color in dot.call_args.args[-2:]:
-        self.assertEqual((color.r, color.g, color.b), (color.r,) * 3)
+      self.assertEqual([(c.r, c.g, c.b, c.a) for c in dot.call_args.args[-2:]],
+                       [(255, 255, 255, 255), (82, 82, 82, 255)])
 
   def test_alerts_do_not_hide_or_reset_confidence(self):
     self.widget._update_state()
