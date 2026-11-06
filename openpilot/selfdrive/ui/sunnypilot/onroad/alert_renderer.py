@@ -73,9 +73,9 @@ class AlertRendererSP(AlertRenderer):
 
     dev_ui_info = ui_state.developer_ui
     v_adjustment = 40 if dev_ui_info in {2, 3} and size != AlertSize.full else 0
-    # The panel already reserves space on the right. Do not subtract the old
-    # developer column allowance again and leave a second empty strip.
-    h_adjustment = 230 if dev_ui_info in {1, 3} and not ui_state.model_confidence else 0
+    # Preserve the stock developer-column allowance inside the road area.
+    # The confidence panel is separate; its width does not replace this space.
+    h_adjustment = 230 if dev_ui_info in {1, 3} else 0
 
     w = int(rect.width - ALERT_MARGIN * 2 - h_adjustment)
     h = self._calculate_dynamic_height(size, w)

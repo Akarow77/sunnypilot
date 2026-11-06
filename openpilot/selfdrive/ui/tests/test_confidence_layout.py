@@ -74,7 +74,7 @@ class TestConfidenceRoadLayout(unittest.TestCase):
     for name in ('developer_ui', 'road_name_renderer', 'speed_limit_renderer', 'smart_cruise_control_renderer',
                  'turn_signal_controller', 'circular_alerts_renderer', 'rocket_fuel'):
       setattr(self.hud, name, SimpleNamespace(render=Mock()))
-    self.hud.render = Mock(side_effect=self.hud._render)
+    self.hud.render = Mock(side_effect=self._render_hud)
 
     self.alert = alerts.AlertRendererSP()
     self.alert._draw_background = Mock(side_effect=lambda rect, alert: self.events.append('alert'))
@@ -94,6 +94,10 @@ class TestConfidenceRoadLayout(unittest.TestCase):
   def _render_confidence(self, rect):
     self.events.append('confidence')
     self.confidence._render(rect)
+
+  def _render_hud(self, rect):
+    self.hud._rect = rect  # The real Widget.render records this before _render.
+    self.hud._render(rect)
 
   def frame(self, size=AlertSize.none, text='Changing lanes', detail=''):
     self.sm['selfdriveState'].alertSize = size
@@ -140,6 +144,23 @@ class TestConfidenceRoadLayout(unittest.TestCase):
           for call in draw.call_args_list:
             self.assertEqual(call.args[2].x + 100, viewport.x + viewport.width / 2)
 
+  def test_steering_arc_retains_stock_viewport_and_bottom_offset(self):
+    self.state.torque_bar = True
+    self.hud._torque_bar = SimpleNamespace(render=Mock())
+    with patch('openpilot.selfdrive.ui.sunnypilot.onroad.developer_ui.ui_state', self.state):
+      for screen in (rl.Rectangle(0, 0, 2160, 1080), rl.Rectangle(300, 0, 1860, 1080)):
+        self.screen = screen
+        for mode in DeveloperUiState:
+          self.state.developer_ui = mode
+          for enabled in (False, True):
+            self.state.model_confidence = enabled
+            self.frame()
+            content = self.view._content_rect
+            arc = self.hud._torque_bar.render.call_args.args[0]
+            bottom = 60 if mode in (DeveloperUiState.BOTTOM, DeveloperUiState.BOTH) else 0
+            self.assertEqual(bounds(arc), (content.x, content.y, content.width, content.height - bottom))
+            self.assertEqual(arc.x + arc.width / 2, screen.x + screen.width / 2)
+
   def test_every_alert_stays_outside_panel_and_does_not_move_dot(self):
     for mode in DeveloperUiState:
       self.state.developer_ui = mode
@@ -150,7 +171,8 @@ class TestConfidenceRoadLayout(unittest.TestCase):
           self.frame(size, detail='Monitor surrounding traffic')
           alert_rect = self.alert._draw_background.call_args.args[0]
           margin = 0 if size == AlertSize.full else stock_alert.ALERT_MARGIN
-          self.assertEqual(alert_rect.x + alert_rect.width, panel.x - margin)
+          debug_margin = 230 if size != AlertSize.full and mode in (DeveloperUiState.BOTTOM, DeveloperUiState.BOTH) else 0
+          self.assertEqual(alert_rect.x + alert_rect.width, panel.x - margin - debug_margin)
           self.assertEqual(self.draw_circle.call_args.args[:3], reference_dot)
           self.assertEqual(self.events, ['confidence', 'alert', 'dm'])
 
@@ -163,7 +185,7 @@ class TestConfidenceRoadLayout(unittest.TestCase):
       long = self.alert._draw_background.call_args.args[0]
       self.assertGreater(long.height, short.height)
       self.assertLess(long.y, short.y)
-      self.assertEqual(long.x + long.width, panel.x - stock_alert.ALERT_MARGIN)
+      self.assertEqual(long.x + long.width, panel.x - stock_alert.ALERT_MARGIN - 230)
       self.assertGreaterEqual(long.y, self.view._content_rect.y)
       self.assertLessEqual(long.y + long.height, self.view._content_rect.y + self.view._content_rect.height)
       current = self.alert.get_alert(self.sm)
