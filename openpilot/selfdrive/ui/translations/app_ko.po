@@ -878,3 +878,11 @@ msgstr "✓ 구독됨"
 msgid "🔥 Firehose Mode 🔥"
 msgstr "🔥 파이어호스 모드 🔥"
 
+#: openpilot/selfdrive/ui/sunnypilot/layouts/settings/visuals.py
+msgid "Model Confidence"
+msgstr "모델 Confidence"
+
+#: openpilot/selfdrive/ui/sunnypilot/layouts/settings/visuals.py
+msgid "Display the comma four style confidence indicator. Its height and color follow model-predicted driver interventions. This is not a probability of safe driving."
+msgstr "콤마4 스타일의 Confidence 표시를 사용합니다. 모델이 예측한 운전자 개입에 따라 높이와 색상이 바뀝니다. 안전하게 주행할 확률을 뜻하지는 않습니다."
+
