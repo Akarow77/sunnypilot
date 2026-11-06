@@ -139,9 +139,9 @@ class HudRendererSP(HudRenderer):
     super()._render(rect)
 
     if ui_state.torque_bar:
-      torque_rect = rect
+      torque_rect = self.rect
       if ui_state.developer_ui in (DeveloperUiState.BOTTOM, DeveloperUiState.BOTH):
-        torque_rect = rl.Rectangle(rect.x, rect.y, rect.width, rect.height - get_bottom_dev_ui_offset())
+        torque_rect = rl.Rectangle(self.rect.x, self.rect.y, self.rect.width, self.rect.height - get_bottom_dev_ui_offset())
       self._torque_bar.render(torque_rect)
 
     self.developer_ui.render(rect)
