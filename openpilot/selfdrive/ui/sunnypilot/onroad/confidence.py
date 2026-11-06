@@ -1,0 +1,107 @@
+"""Comma four style model confidence indicator for the 3X driving screen."""
+import math
+import time
+
+import pyray as rl
+
+from openpilot.cereal import log
+from openpilot.common.filter_simple import FirstOrderFilter
+from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
+from openpilot.system.ui.lib.application import gui_app
+from openpilot.system.ui.widgets import Widget
+
+CONFIDENCE_PANEL_WIDTH = 120
+MODEL_MAX_AGE = 0.5
+
+
+def model_confidence(status: UIStatus, brake_probs, steer_probs) -> float | None:
+  """Use the active axes' intervention predictions, not a probability of safe driving."""
+  if status == UIStatus.DISENGAGED:
+    return None
+  arrays = (steer_probs,) if status == UIStatus.LAT_ONLY else (brake_probs,) if status == UIStatus.LONG_ONLY else (brake_probs, steer_probs)
+  confidence = 1.0
+  for probs in arrays:
+    if not len(probs) or any(not math.isfinite(p) or not 0 <= p <= 1 for p in probs):
+      return None
+    confidence *= 1.0 - max(probs)
+  return confidence
+
+
+def confidence_colors(value: float, override: bool = False) -> tuple[rl.Color, rl.Color]:
+  if override:
+    return rl.Color(255, 255, 255, 255), rl.Color(82, 82, 82, 255)
+  if value > 0.5:
+    return rl.Color(0, 255, 204, 255), rl.Color(0, 255, 38, 255)
+  if value > 0.2:
+    return rl.Color(255, 200, 0, 255), rl.Color(255, 115, 0, 255)
+  return rl.Color(255, 0, 21, 255), rl.Color(255, 0, 89, 255)
+
+
+class ModelConfidenceRenderer(Widget):
+  def __init__(self):
+    super().__init__()
+    self._confidence_filter = FirstOrderFilter(0.0, 0.5, 1 / gui_app.target_fps, initialized=False)
+    self._has_value = False
+    self._last_status = None
+    self._started_frame = None
+    self.set_enabled(False)  # Display only; touches still belong to the road view.
+
+  def _reset(self):
+    self._has_value = False
+    self._confidence_filter.x = 0.0
+    self._confidence_filter.initialized = False
+
+  def _update_state(self):
+    sm = ui_state.sm
+    if self._started_frame != ui_state.started_frame or self._last_status != ui_state.status:
+      self._reset()
+    self._started_frame = ui_state.started_frame
+    self._last_status = ui_state.status
+
+    # A frozen or malformed prediction must never leave a high confidence dot onscreen.
+    if not ui_state.model_confidence or not ui_state.started:
+      self._reset()
+      return
+    now = time.monotonic()
+    for service in ('modelV2', 'selfdriveState'):
+      if (not sm.valid[service] or not sm.alive[service] or sm.recv_frame[service] <= ui_state.started_frame or
+          not 0 <= now - sm.recv_time[service] <= MODEL_MAX_AGE):
+        self._reset()
+        return
+    if ui_state.status in (UIStatus.LAT_ONLY, UIStatus.LONG_ONLY):
+      if (not sm.valid['selfdriveStateSP'] or not sm.alive['selfdriveStateSP'] or
+          sm.recv_frame['selfdriveStateSP'] <= ui_state.started_frame or
+          not 0 <= now - sm.recv_time['selfdriveStateSP'] <= MODEL_MAX_AGE):
+        self._reset()
+        return
+    if sm['selfdriveState'].alertSize != log.SelfdriveState.AlertSize.none:
+      self._reset()
+      return
+
+    predictions = sm['modelV2'].meta.disengagePredictions
+    value = model_confidence(ui_state.status, predictions.brakeDisengageProbs, predictions.steerOverrideProbs)
+    if value is None:
+      self._reset()
+      return
+    self._confidence_filter.update(value)
+    self._has_value = True
+
+  def _render(self, rect: rl.Rectangle):
+    if not ui_state.model_confidence or not ui_state.started or rect.width <= 0 or rect.height <= 0:
+      return
+
+    # A dedicated black panel keeps the original circle's mask off the camera image.
+    rl.draw_rectangle_rec(rect, rl.BLACK)
+    if not self._has_value:
+      return
+    radius = min(40, math.floor(min(rect.width, rect.height) / (2 * math.sqrt(2))) - 1)
+    if radius < 1:
+      return
+    value = min(1.0, max(0.0, self._confidence_filter.x))
+    outer_radius = math.ceil(radius * math.sqrt(2)) + 1
+    x = int(rect.x + rect.width / 2)
+    y = int(rect.y + outer_radius + (1 - value) * (rect.height - 2 * outer_radius))
+    top, bottom = confidence_colors(value, ui_state.status == UIStatus.OVERRIDE)
+    # Match the original two-color circle without importing the mici/SP UI cycle.
+    rl.draw_rectangle_gradient_v(x - radius, y - radius, 2 * radius, 2 * radius, top, bottom)
+    rl.draw_ring(rl.Vector2(x, y), radius, outer_radius, 0, 360, 40, rl.BLACK)

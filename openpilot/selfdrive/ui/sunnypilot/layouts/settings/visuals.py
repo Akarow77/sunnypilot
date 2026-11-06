@@ -39,6 +39,12 @@ class VisualsLayout(Widget):
         tr("Display steering arc on the driving screen when lateral control is enabled."),
         None,
       ),
+      "ModelConfidence": (
+        lambda: tr("Model Confidence"),
+        tr("Display the comma four style confidence indicator. Its height and color follow model-predicted driver interventions. " +
+           "This is not a probability of safe driving."),
+        None,
+      ),
       "RainbowMode": (
         lambda: tr("Enable Tesla Rainbow Mode"),
         tr("A beautiful rainbow effect on the path the model wants to take. " +

@@ -10,6 +10,8 @@ from openpilot.selfdrive.ui.ui_state import ui_state
 
 
 class RocketFuel:
+  BAR_WIDTH = 28
+
   def __init__(self):
     self.vc_accel = 0.0
 
@@ -36,7 +38,7 @@ class RocketFuel:
       hha = 0.0
 
     hha = hha * rect.height
-    wp = 28.0
+    wp = self.BAR_WIDTH
 
     # Draw
     rect_h = rect.height

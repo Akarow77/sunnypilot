@@ -16,6 +16,7 @@ from openpilot.selfdrive.ui.sunnypilot.onroad.smart_cruise_control import SmartC
 from openpilot.selfdrive.ui.sunnypilot.onroad.turn_signal import TurnSignalController
 from openpilot.selfdrive.ui.sunnypilot.onroad.circular_alerts import CircularAlertsRenderer
 from openpilot.selfdrive.ui.sunnypilot.onroad.speed_renderer import SpeedRenderer
+from openpilot.selfdrive.ui.sunnypilot.onroad.confidence import CONFIDENCE_PANEL_WIDTH, ModelConfidenceRenderer
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.selfdrive.ui.onroad.hud_renderer import HudRenderer, UI_CONFIG, FONT_SIZES, COLORS, CRUISE_DISABLED_CHAR
 from openpilot.system.ui.lib.application import gui_app
@@ -37,6 +38,7 @@ class HudRendererSP(HudRenderer):
     self.circular_alerts_renderer = CircularAlertsRenderer()
     self.speed_renderer = SpeedRenderer()
     self._torque_bar = TorqueBar(scale=3.0, always=True)
+    self._model_confidence = ModelConfidenceRenderer()
 
     self.pcm_cruise_speed: bool = True
     self.show_icbm_status: bool = False
@@ -129,6 +131,10 @@ class HudRendererSP(HudRenderer):
     self.speed_renderer.render(rect)
 
   def _render(self, rect: rl.Rectangle) -> None:
+    confidence_rect = rl.Rectangle(rect.x + rect.width - CONFIDENCE_PANEL_WIDTH, rect.y,
+                                   CONFIDENCE_PANEL_WIDTH, rect.height - get_bottom_dev_ui_offset())
+    if ui_state.model_confidence:
+      rect = rl.Rectangle(rect.x, rect.y, rect.width - CONFIDENCE_PANEL_WIDTH, rect.height)
     super()._render(rect)
 
     if ui_state.torque_bar:
@@ -144,3 +150,4 @@ class HudRendererSP(HudRenderer):
     self.turn_signal_controller.render(rect)
     self.circular_alerts_renderer.render(rect)
     self.rocket_fuel.render(rect, ui_state.sm)
+    self._model_confidence.render(confidence_rect)

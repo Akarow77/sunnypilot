@@ -1090,3 +1090,11 @@ msgstr ""
 msgid "camera starting"
 msgstr ""
 
+#: openpilot/selfdrive/ui/sunnypilot/layouts/settings/visuals.py
+msgid "Model Confidence"
+msgstr ""
+
+#: openpilot/selfdrive/ui/sunnypilot/layouts/settings/visuals.py
+msgid "Display the comma four style confidence indicator. Its height and color follow model-predicted driver interventions. This is not a probability of safe driving."
+msgstr ""
+
