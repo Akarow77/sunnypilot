@@ -1,10 +1,12 @@
 """Comma four style model confidence indicator for the 3X driving screen."""
 import math
 import time
+from itertools import pairwise
 
 import pyray as rl
 
 from openpilot.common.filter_simple import FirstOrderFilter
+from openpilot.selfdrive.ui.sunnypilot.onroad.augmented_road_view import BORDER_COLORS_SP
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.widgets import Widget
@@ -20,7 +22,7 @@ def draw_circle_gradient(center_x: float, center_y: float, radius: int, top: rl.
   rl.rl_set_texture(rl.rl_get_texture_id_default())
   rl.rl_begin(rl.RL_TRIANGLES)
   rl.rl_tex_coord2f(0.0, 0.0)
-  for current, following in zip(_CIRCLE_POINTS, _CIRCLE_POINTS[1:]):
+  for current, following in pairwise(_CIRCLE_POINTS):
     for dx, dy in ((0.0, 0.0), following, current):
       mix = (dy + 1.0) / 2.0
       rl.rl_color4ub(*(round(a + (b - a) * mix) for a, b in
@@ -41,10 +43,13 @@ def model_confidence(status: UIStatus, brake_probs, steer_probs) -> float | None
   return confidence
 
 
-def confidence_colors(value: float, override: bool = False, inactive: bool = False) -> tuple[rl.Color, rl.Color]:
-  if inactive:
+def confidence_colors(value: float, status: UIStatus) -> tuple[rl.Color, rl.Color]:
+  if status == UIStatus.DISENGAGED:
     return rl.Color(50, 50, 50, 255), rl.Color(13, 13, 13, 255)
-  if override:
+  if status in (UIStatus.LAT_ONLY, UIStatus.LONG_ONLY):
+    color = BORDER_COLORS_SP[status]
+    return color, color
+  if status == UIStatus.OVERRIDE:
     return rl.Color(255, 255, 255, 255), rl.Color(82, 82, 82, 255)
   if value > 0.5:
     return rl.Color(0, 255, 204, 255), rl.Color(0, 255, 38, 255)
@@ -56,31 +61,20 @@ def confidence_colors(value: float, override: bool = False, inactive: bool = Fal
 class ModelConfidenceRenderer(Widget):
   def __init__(self):
     super().__init__()
-    self._confidence_filter = FirstOrderFilter(0.0, 0.5, 1 / gui_app.target_fps, initialized=False)
+    self._confidence_filter = FirstOrderFilter(-0.5, 0.5, 1 / gui_app.target_fps)
     self._has_value = False
-    self._last_status = None
     self._started_frame = None
     self.set_enabled(False)  # Display only; touches still belong to the road view.
 
   def _reset(self):
     self._has_value = False
-    self._confidence_filter.x = 0.0
-    self._confidence_filter.initialized = False
+    self._confidence_filter.x = -0.5
 
   def _update_state(self):
     sm = ui_state.sm
-    status_changed = self._last_status != ui_state.status
-    # Four keeps one continuous filter for engagement and override (same axes).
-    # Also retain the descent/return animation across disengagement. Sunnypilot
-    # changes between lateral-only, longitudinal-only and both axes reset the
-    # value so a prediction for the previous active axes is not reused.
-    disengage_transition = UIStatus.DISENGAGED in (self._last_status, ui_state.status)
-    both_axes = (UIStatus.ENGAGED, UIStatus.OVERRIDE)
-    same_axes_transition = self._last_status in both_axes and ui_state.status in both_axes
-    if self._started_frame != ui_state.started_frame or (status_changed and not (disengage_transition or same_axes_transition)):
+    if self._started_frame != ui_state.started_frame:
       self._reset()
-    self._started_frame = ui_state.started_frame
-    self._last_status = ui_state.status
+      self._started_frame = ui_state.started_frame
 
     # A frozen or malformed prediction must never leave a high confidence dot onscreen.
     if not ui_state.model_confidence or not ui_state.started:
@@ -127,6 +121,5 @@ class ModelConfidenceRenderer(Widget):
     padding = math.ceil(radius * math.sqrt(2)) + 1
     x = int(rect.x + rect.width / 2)
     y = int(rect.y + padding + (1 - value) * (rect.height - 2 * padding))
-    top, bottom = confidence_colors(value, ui_state.status == UIStatus.OVERRIDE,
-                                    ui_state.status == UIStatus.DISENGAGED or not self._has_value)
+    top, bottom = confidence_colors(value, ui_state.status if self._has_value else UIStatus.DISENGAGED)
     draw_circle_gradient(x, y, radius, top, bottom)
