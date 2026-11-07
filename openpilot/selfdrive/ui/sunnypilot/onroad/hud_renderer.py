@@ -148,7 +148,8 @@ class HudRendererSP(HudRenderer):
     self.road_name_renderer.render(rect)
     self.speed_limit_renderer.render(rect)
     self.smart_cruise_control_renderer.render(rect)
-    self.turn_signal_controller.render(rect)
+    # Keep turn signals and blind-spot warnings aligned with the original viewport center.
+    self.turn_signal_controller.render(self.rect)
     self.circular_alerts_renderer.render(rect)
     self.rocket_fuel.render(rect, ui_state.sm)
     self._model_confidence.render(confidence_rect)
