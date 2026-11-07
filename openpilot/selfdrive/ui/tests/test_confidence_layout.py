@@ -1,4 +1,5 @@
 import importlib
+import itertools
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -13,6 +14,7 @@ from openpilot.selfdrive.ui.onroad import alert_renderer as stock_alert
 from openpilot.selfdrive.ui.sunnypilot.onroad import alert_renderer as alerts
 from openpilot.selfdrive.ui.sunnypilot.onroad import confidence, hud_renderer as hud
 from openpilot.selfdrive.ui.sunnypilot.onroad import speed_renderer as speed
+from openpilot.selfdrive.ui.sunnypilot.onroad import turn_signal
 from openpilot.selfdrive.ui.sunnypilot.onroad.developer_ui import DeveloperUiState
 from openpilot.selfdrive.ui.ui_state import UIStatus
 
@@ -162,6 +164,66 @@ class TestConfidenceRoadLayout(unittest.TestCase):
             bottom = 60 if mode in (DeveloperUiState.BOTTOM, DeveloperUiState.BOTH) else 0
             self.assertEqual(bounds(arc), (content.x, content.y, content.width, content.height - bottom))
             self.assertEqual(arc.x + arc.width / 2, screen.x + screen.width / 2)
+
+  def test_turn_signal_viewport_stays_stock_across_confidence_and_sidebar_toggles(self):
+    # Repeated toggles must not retain the panel's reduced width or a stale sidebar rect.
+    for sidebar in (False, True, False):
+      self.screen = rl.Rectangle(300, 0, 1860, 1080) if sidebar else rl.Rectangle(0, 0, 2160, 1080)
+      for enabled in (False, True, False):
+        with self.subTest(sidebar=sidebar, confidence=enabled):
+          self.state.model_confidence = enabled
+          self.frame()
+          viewport = self.view._content_rect
+          signal_rect = self.hud.turn_signal_controller.render.call_args.args[0]
+          self.assertEqual(bounds(signal_rect), bounds(viewport))
+          self.assertEqual(signal_rect.x + signal_rect.width / 2, self.screen.x + self.screen.width / 2)
+
+  def test_turn_signal_and_blindspot_draws_keep_stock_position_size_and_priority(self):
+    self.sm['carState'] = messaging.new_message('carState').carState
+    cs = self.sm['carState']
+    with patch.object(turn_signal, 'ui_state', self.state), \
+         patch.object(turn_signal.gui_app, 'texture', side_effect=lambda *args, **kwargs: SimpleNamespace(width=120, height=109)), \
+         patch.object(rl, 'draw_texture_ex') as draw:
+      controller = turn_signal.TurnSignalController()
+      self.hud.turn_signal_controller = controller
+      for sidebar, enabled, signals_enabled, blindspot_enabled in itertools.product((False, True), repeat=4):
+        self.screen = rl.Rectangle(300, 0, 1860, 1080) if sidebar else rl.Rectangle(0, 0, 2160, 1080)
+        self.state.model_confidence = enabled
+        self.state.turn_signals = signals_enabled
+        self.state.blindspot = blindspot_enabled
+        for left_blinker, right_blinker, left_blindspot, right_blindspot in itertools.product((False, True), repeat=4):
+          with self.subTest(sidebar=sidebar, confidence=enabled, signals_enabled=signals_enabled, blindspot_enabled=blindspot_enabled,
+                            blinkers=(left_blinker, right_blinker), blindspots=(left_blindspot, right_blindspot)):
+            cs.leftBlinker, cs.rightBlinker = left_blinker, right_blinker
+            cs.leftBlindspot, cs.rightBlindspot = left_blindspot, right_blindspot
+            controller.update()
+            draw.reset_mock()
+            self.frame()
+            viewport = self.view._content_rect
+            center_x = viewport.x + viewport.width / 2
+            expected = []
+            for signal, blinker, blindspot, offset in (
+              (controller._left_signal, left_blinker, left_blindspot, -230),
+              (controller._right_signal, right_blinker, right_blindspot, 80),
+            ):
+              if blindspot_enabled and blindspot:
+                texture = signal._blind_spot_texture
+              elif signals_enabled and blinker:
+                texture = signal._signal_texture
+              else:
+                self.assertFalse(signal._active)
+                continue
+              self.assertEqual(bounds(signal.rect), (center_x + offset, viewport.y + 190, 150, 150))
+              expected.append((texture, center_x + offset + 15, viewport.y + 210.5, signal._type))
+            self.assertEqual(draw.call_count, len(expected))
+            for call, (texture, x, y, kind) in zip(draw.call_args_list, expected, strict=True):
+              self.assertIs(call.args[0], texture)
+              self.assertEqual((call.args[1].x, call.args[1].y), (x, y))
+              self.assertEqual(call.args[2:4], (0.0, 1.0))  # No rotation or texture rescaling.
+              color = call.args[4]
+              self.assertEqual((color.r, color.g, color.b), (255, 255, 255))
+              if kind == 'blind_spot':
+                self.assertEqual(color.a, 255)
 
   def test_every_alert_stays_outside_panel_and_does_not_move_dot(self):
     for mode in DeveloperUiState:
