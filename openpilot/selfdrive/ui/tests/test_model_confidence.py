@@ -1,5 +1,6 @@
 import math
 import unittest
+from itertools import pairwise
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -29,16 +30,16 @@ class TestConfidenceValue(unittest.TestCase):
     for value, expected in ((0.0, (255, 0, 21)), (0.2, (255, 0, 21)), (0.21, (255, 200, 0)),
                             (0.5, (255, 200, 0)), (0.51, (0, 255, 204)), (1.0, (0, 255, 204))):
       with self.subTest(value=value):
-        color = confidence.confidence_colors(value)[0]
+        color = confidence.confidence_colors(value, UIStatus.ENGAGED)[0]
         self.assertEqual((color.r, color.g, color.b), expected)
-    color = confidence.confidence_colors(1, override=True)[0]
+    color = confidence.confidence_colors(1, status=UIStatus.OVERRIDE)[0]
     self.assertEqual((color.r, color.g, color.b), (255, 255, 255))
-    color = confidence.confidence_colors(1, override=True)[1]
+    color = confidence.confidence_colors(1, status=UIStatus.OVERRIDE)[1]
     self.assertEqual((color.r, color.g, color.b, color.a), (82, 82, 82, 255))
     for value in (0.0, 0.3, 1.0):
-      colors = confidence.confidence_colors(value, inactive=True)
+      colors = confidence.confidence_colors(value, status=UIStatus.DISENGAGED)
       self.assertEqual([(c.r, c.g, c.b, c.a) for c in colors], [(50, 50, 50, 255), (13, 13, 13, 255)])
-      for color in confidence.confidence_colors(value, inactive=True):
+      for color in confidence.confidence_colors(value, status=UIStatus.DISENGAGED):
         self.assertEqual(color.r, color.g)
         self.assertEqual(color.g, color.b)
         self.assertGreater(color.a, 0)
@@ -78,17 +79,15 @@ class TestConfidenceWidget(unittest.TestCase):
     self.state.status = UIStatus(UIStateSP.update_status(ss, ss_sp, []))
     self.assertEqual(self.state.status, expected)
 
-  def test_lateral_only_color_changes_with_value(self):
-    for prediction, expected in ((0.1, (0, 255, 204)), (0.7, (255, 200, 0)), (0.9, (255, 0, 21))):
-      self.widget._reset()
-      self.sm['modelV2'].meta.disengagePredictions.steerOverrideProbs = [prediction] * 5
+  def settle(self):
+    for _ in range(self.settle_frames):
       self.widget._update_state()
-      self.assertTrue(self.widget._has_value)
-      color = confidence.confidence_colors(self.widget._confidence_filter.x)[0]
-      self.assertEqual((color.r, color.g, color.b), expected)
+
+  def first_filtered_value(self, target):
+    return -0.5 + self.widget._confidence_filter.alpha * (target + 0.5)
 
   def test_stale_value_cleared_and_not_reused_on_recovery(self):
-    self.widget._update_state()
+    self.settle()
     self.assertGreater(self.widget._confidence_filter.x, 0.8)
     self.sm.recv_time['modelV2'] = 9.49
     self.widget._update_state()
@@ -96,7 +95,7 @@ class TestConfidenceWidget(unittest.TestCase):
     self.sm.recv_time['modelV2'] = 10.0
     self.sm['modelV2'].meta.disengagePredictions.steerOverrideProbs = [0.95]
     self.widget._update_state()
-    self.assertAlmostEqual(self.widget._confidence_filter.x, 0.05, places=6)
+    self.assertAlmostEqual(self.widget._confidence_filter.x, self.first_filtered_value(0.05), places=6)
 
   def test_invalid_dead_old_session_and_future_values_cleared(self):
     for service in self.sm:
@@ -123,12 +122,27 @@ class TestConfidenceWidget(unittest.TestCase):
           dot.assert_not_called()
         setattr(self.state, attr, previous)
 
+  def test_reenable_and_new_active_drive_enter_from_the_bottom(self):
+    self.settle()
+    self.state.model_confidence = False
+    self.widget._update_state()
+    self.state.model_confidence = True
+    self.widget._update_state()
+    self.assertAlmostEqual(self.widget._confidence_filter.x, self.first_filtered_value(0.9))
+
+    self.settle()
+    self.state.started_frame = 30
+    self.sm.recv_frame = dict.fromkeys(self.sm, 31)
+    self.widget._update_state()
+    self.assertAlmostEqual(self.widget._confidence_filter.x, self.first_filtered_value(0.9))
+
   def test_disengaging_descends_to_visible_grey_bottom_despite_high_model_value(self):
     self.state.status = UIStatus.ENGAGED
     self.sm['modelV2'].meta.disengagePredictions.brakeDisengageProbs = [0.0]
     self.sm['modelV2'].meta.disengagePredictions.steerOverrideProbs = [0.0]
-    self.widget._update_state()
-    self.assertEqual(self.widget._confidence_filter.x, 1.0)
+    self.settle()
+    before = self.widget._confidence_filter.x
+    self.assertGreater(before, 0.99)
     rect = rl.Rectangle(1840, 30, 120, 960)
     values, centers = [], []
     self.state.status = UIStatus.DISENGAGED
@@ -146,13 +160,13 @@ class TestConfidenceWidget(unittest.TestCase):
       self.assertEqual(centers[-10:], [expected_bottom] * 10)
     self.assertGreater(values[0], 0.0)  # It moves down from the previous value, without jumping.
     self.assertLess(values[0], 1.0)
-    self.assertTrue(all(a > b for a, b in zip(values, values[1:])))
-    self.assertTrue(all(a <= b for a, b in zip(centers, centers[1:])))
+    self.assertTrue(all(a > b for a, b in pairwise(values)))
+    self.assertTrue(all(a <= b for a, b in pairwise(centers)))
     self.assertLess(values[-1], 0.0)
     # Match comma four's -0.5 target and 0.5-second time constant.
     dt = self.widget._confidence_filter.dt
     alpha = dt / (0.5 + dt)
-    self.assertAlmostEqual(values[0], (1 - alpha) * 1.0 + alpha * -0.5)
+    self.assertAlmostEqual(values[0], (1 - alpha) * before + alpha * -0.5)
 
   def test_reengagement_rises_gradually_from_disengaged_bottom(self):
     self.state.status = UIStatus.ENGAGED
@@ -174,12 +188,12 @@ class TestConfidenceWidget(unittest.TestCase):
         centers.append(dot.call_args.args[1])
     self.assertGreater(values[0], before)
     self.assertLess(values[0], 0)  # Preserve the original entrance animation, not a jump to 1.
-    self.assertTrue(all(a < b for a, b in zip(values, values[1:])))
-    self.assertTrue(all(a >= b for a, b in zip(centers, centers[1:])))
+    self.assertTrue(all(a < b for a, b in pairwise(values)))
+    self.assertTrue(all(a >= b for a, b in pairwise(centers)))
     self.assertGreater(values[-1], 0.9)
 
   def test_disengaged_descent_does_not_require_a_model_prediction(self):
-    self.widget._update_state()
+    self.settle()
     before = self.widget._confidence_filter.x
     self.state.status = UIStatus.DISENGAGED
     self.sm.valid['modelV2'] = False
@@ -212,29 +226,27 @@ class TestConfidenceWidget(unittest.TestCase):
         field['selfdriveState'] = invalid
         self.widget._update_state()
         self.assertFalse(self.widget._has_value)
-        self.assertFalse(self.widget._confidence_filter.initialized)
-        self.assertEqual(self.widget._confidence_filter.x, 0.0)
+        self.assertEqual(self.widget._confidence_filter.x, -0.5)
         field['selfdriveState'] = previous
         self.widget._update_state()
         self.assertTrue(self.widget._has_value)
         self.assertEqual(self.widget._confidence_filter.x, -0.5)
 
   def test_offroad_and_new_drive_do_not_reuse_the_previous_animation(self):
-    self.widget._update_state()
+    self.settle()
     self.assertGreater(self.widget._confidence_filter.x, 0.8)
     self.state.status = UIStatus.DISENGAGED
     self.widget._update_state()
     self.state.started = False
     self.widget._update_state()
     self.assertFalse(self.widget._has_value)
-    self.assertFalse(self.widget._confidence_filter.initialized)
+    self.assertEqual(self.widget._confidence_filter.x, -0.5)
     self.state.started = True
     self.widget._update_state()
     self.assertEqual(self.widget._confidence_filter.x, -0.5)
 
     self.state.status = UIStatus.ENGAGED
-    for _ in range(self.settle_frames):
-      self.widget._update_state()
+    self.settle()
     self.assertGreater(self.widget._confidence_filter.x, 0.8)
     self.state.started_frame = 100
     self.sm.recv_frame = dict.fromkeys(self.sm, 101)
@@ -249,42 +261,50 @@ class TestConfidenceWidget(unittest.TestCase):
     self.sm['modelV2'].meta.disengagePredictions.steerOverrideProbs = [0.3]
     self.widget._update_state()
     self.assertTrue(self.widget._has_value)
-    self.assertAlmostEqual(self.widget._confidence_filter.x, 0.56, places=6)
+    self.assertAlmostEqual(self.widget._confidence_filter.x, self.first_filtered_value(0.56), places=6)
     with patch.object(rl, 'draw_rectangle_rec'), patch.object(confidence, 'draw_circle_gradient') as dot:
       self.widget._render(rl.Rectangle(1840, 30, 120, 960))
       self.assertEqual([(c.r, c.g, c.b, c.a) for c in dot.call_args.args[-2:]],
                        [(255, 255, 255, 255), (82, 82, 82, 255)])
 
-  def test_engaged_override_transition_preserves_original_filter_at_20_and_60_fps(self):
-    for fps in (20, 60):
-      with self.subTest(fps=fps), patch.object(confidence.gui_app, '_target_fps', fps):
-        self.widget = confidence.ModelConfidenceRenderer()
-        self.assertAlmostEqual(self.widget._confidence_filter.dt, 1 / fps)
-        self.set_mads_status(UIStatus.ENGAGED)
-        predictions = self.sm['modelV2'].meta.disengagePredictions
-        predictions.brakeDisengageProbs = [0.0]
-        predictions.steerOverrideProbs = [0.0]
-        self.widget._update_state()
-        self.assertEqual(self.widget._confidence_filter.x, 1.0)
-        alpha = (1 / fps) / (0.5 + 1 / fps)
+  def test_four_filter_and_render_colors_at_20_and_60_fps(self):
+    from openpilot.selfdrive.ui.mici.onroad import confidence_ball as four
+    from openpilot.selfdrive.ui.sunnypilot.mici.onroad import confidence_ball as four_sp
 
-        for status, brake, steer, palette in (
-          (UIStatus.OVERRIDE, 0.2, 0.4, [(255, 255, 255), (82, 82, 82)]),
-          (UIStatus.ENGAGED, 0.05, 0.1, [(0, 255, 204), (0, 255, 38)]),
-        ):
+    rect = rl.Rectangle(1840, 30, 120, 960)
+    transitions = (
+      (UIStatus.ENGAGED, 0.1, 0.52), (UIStatus.LONG_ONLY, 0.0, 0.9),
+      (UIStatus.LONG_ONLY, 0.95, 0.9), (UIStatus.ENGAGED, 0.3, 0.05),
+      (UIStatus.LAT_ONLY, 0.95, 0.02), (UIStatus.LAT_ONLY, 0.0, 0.93),
+      (UIStatus.OVERRIDE, 0.3, 0.5), (UIStatus.DISENGAGED, 0.0, 0.0),
+      (UIStatus.LONG_ONLY, 0.2, 0.3), (UIStatus.LAT_ONLY, 0.25, 0.45),
+    )
+    for fps in (20, 60):
+      with (
+        self.subTest(fps=fps),
+        patch.object(confidence.gui_app, '_target_fps', fps),
+        patch.object(four, 'ui_state', self.state),
+        patch.object(four_sp, 'ui_state', self.state),
+        patch.object(rl, 'draw_rectangle_rec'),
+        patch.object(four, 'draw_circle_gradient') as four_dot,
+        patch.object(confidence, 'draw_circle_gradient') as dot,
+      ):
+        widget, original = confidence.ModelConfidenceRenderer(), four.ConfidenceBall()
+        original.set_rect(rect)
+        self.assertEqual(widget._confidence_filter.x, -0.5)
+        predictions = self.sm['modelV2'].meta.disengagePredictions
+        for status, brake, steer in transitions:
           self.set_mads_status(status)
-          predictions.brakeDisengageProbs = [brake]
-          predictions.steerOverrideProbs = [steer]
-          start = self.widget._confidence_filter.x
-          target = (1 - predictions.brakeDisengageProbs[0]) * (1 - predictions.steerOverrideProbs[0])
-          with patch.object(rl, 'draw_rectangle_rec'), patch.object(confidence, 'draw_circle_gradient') as dot:
-            for frame in range(1, fps + 1):
-              self.widget._update_state()
-              expected = target + (start - target) * (1 - alpha) ** frame
-              self.assertAlmostEqual(self.widget._confidence_filter.x, expected, places=6)
-              self.widget._render(rl.Rectangle(1840, 30, 120, 960))
-              self.assertEqual([(c.r, c.g, c.b) for c in dot.call_args.args[-2:]], palette)
-          self.assertNotAlmostEqual(self.widget._confidence_filter.x, target, places=3)
+          predictions.brakeDisengageProbs = [0.0, brake]
+          predictions.steerOverrideProbs = [steer, 0.0]
+          for _ in range(fps):
+            widget._update_state()
+            original._update_state()
+            self.assertEqual(widget._confidence_filter.x, original._confidence_filter.x)
+            widget._render(rect)
+            original._render(rect)
+            palette = [(c.r, c.g, c.b, c.a) for c in dot.call_args.args[-2:]]
+            self.assertEqual(palette, [(c.r, c.g, c.b, c.a) for c in four_dot.call_args.args[-2:]])
 
   def test_every_mads_status_requires_fresh_sp_message_and_recovers_from_current_data(self):
     for status in UIStatus:
@@ -298,15 +318,14 @@ class TestConfidenceWidget(unittest.TestCase):
           predictions.steerOverrideProbs = [0.0]
           self.widget._update_state()
           self.assertTrue(self.widget._has_value)
-          self.assertEqual(self.widget._confidence_filter.x, -0.5 if status == UIStatus.DISENGAGED else 1.0)
+          self.assertAlmostEqual(self.widget._confidence_filter.x, -0.5 if status == UIStatus.DISENGAGED else self.first_filtered_value(1.0))
 
           field = getattr(self.sm, attr)
           previous = field['selfdriveStateSP']
           field['selfdriveStateSP'] = invalid
           self.widget._update_state()
           self.assertFalse(self.widget._has_value)
-          self.assertFalse(self.widget._confidence_filter.initialized)
-          self.assertEqual(self.widget._confidence_filter.x, 0.0)
+          self.assertEqual(self.widget._confidence_filter.x, -0.5)
           rect = rl.Rectangle(1840, 30, 120, 960)
           with patch.object(rl, 'draw_rectangle_rec'), patch.object(confidence, 'draw_circle_gradient') as dot:
             self.widget._render(rect)
@@ -322,28 +341,7 @@ class TestConfidenceWidget(unittest.TestCase):
           self.assertTrue(self.widget._has_value)
           expected = -0.5 if status == UIStatus.DISENGAGED else (
             0.2 if status in (UIStatus.LAT_ONLY, UIStatus.LONG_ONLY) else 0.04)
-          self.assertAlmostEqual(self.widget._confidence_filter.x, expected, places=6)
-
-  def test_changes_between_active_axis_domains_reset_the_value(self):
-    domains = {UIStatus.ENGAGED: 'both', UIStatus.OVERRIDE: 'both',
-               UIStatus.LAT_ONLY: 'lateral', UIStatus.LONG_ONLY: 'longitudinal'}
-    predictions = self.sm['modelV2'].meta.disengagePredictions
-    for before, before_domain in domains.items():
-      for after, after_domain in domains.items():
-        if before_domain == after_domain:
-          continue
-        with self.subTest(before=before, after=after):
-          self.widget = confidence.ModelConfidenceRenderer()
-          predictions.brakeDisengageProbs = [0.1]
-          predictions.steerOverrideProbs = [0.2]
-          self.set_mads_status(before)
-          self.widget._update_state()
-          predictions.brakeDisengageProbs = [0.6]
-          predictions.steerOverrideProbs = [0.4]
-          self.set_mads_status(after)
-          self.widget._update_state()
-          expected = {'both': 0.24, 'lateral': 0.6, 'longitudinal': 0.4}[after_domain]
-          self.assertAlmostEqual(self.widget._confidence_filter.x, expected, places=6)
+          self.assertAlmostEqual(self.widget._confidence_filter.x, self.first_filtered_value(expected), places=6)
 
   def test_disengaged_entrance_and_exit_remain_continuous_between_axis_domains(self):
     predictions = self.sm['modelV2'].meta.disengagePredictions
@@ -364,12 +362,14 @@ class TestConfidenceWidget(unittest.TestCase):
 
   def test_alerts_do_not_hide_or_reset_confidence(self):
     self.widget._update_state()
-    initial = self.widget._confidence_filter.x
+    alpha = self.widget._confidence_filter.alpha
+    expected = self.widget._confidence_filter.x
     for size in (log.SelfdriveState.AlertSize.small, log.SelfdriveState.AlertSize.mid, log.SelfdriveState.AlertSize.full):
       self.sm['selfdriveState'].alertSize = size
       self.widget._update_state()
       self.assertTrue(self.widget._has_value)
-      self.assertAlmostEqual(self.widget._confidence_filter.x, initial)
+      expected += alpha * (0.9 - expected)
+      self.assertAlmostEqual(self.widget._confidence_filter.x, expected)
       with patch.object(rl, 'draw_rectangle_rec'), patch.object(confidence, 'draw_circle_gradient') as dot:
         self.widget._render(rl.Rectangle(1840, 30, 120, 960))
         dot.assert_called_once()
