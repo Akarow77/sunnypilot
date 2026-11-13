@@ -85,7 +85,9 @@ jobs:
         run: |
           ./tools/op.sh setup
           sudo apt-get install -y --no-install-recommends libgles2 libegl1
-          .venv/bin/scons -j"$(nproc)"
+          source .venv/bin/activate
+          "$HOME/.local/bin/uv" pip install "cython>=3,<4" "pytest>=9,<10"
+          scons -j"$(nproc)"
       - name: Run LAN, USB and 3X UI regression tests
         if: steps.merge.outputs.changed == 'true' || inputs.dry_run
         env:
