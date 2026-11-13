@@ -1,0 +1,126 @@
+name: Sync bamyanggang-lan
+on:
+  schedule:
+    - cron: '0 1 * * 1,4'  # Monday and Thursday, 10:00 Asia/Seoul
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and test even if up to date, without pushing
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+concurrency:
+  group: bamyanggang-upstream-sync
+  cancel-in-progress: false
+
+env:
+  GIT_LFS_SKIP_SMUDGE: '1'
+  GIT_AUTHOR_NAME: github-actions[bot]
+  GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+  GIT_COMMITTER_NAME: github-actions[bot]
+  GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+
+jobs:
+  validate:
+    if: github.repository == 'Akarow77/sunnypilot' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+      base: ${{ steps.merge.outputs.base }}
+      upstream: ${{ steps.merge.outputs.upstream }}
+      tree: ${{ steps.merge.outputs.tree }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bamyanggang-lan
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - name: Check for overlapping custom paths and merge
+        id: merge
+        shell: bash
+        run: |
+          git fetch --no-tags --filter=blob:none https://github.com/sunnypilot/sunnypilot.git refs/heads/master
+          base=$(git rev-parse HEAD)
+          upstream=$(git rev-parse FETCH_HEAD)
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$upstream" HEAD; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo "Already includes upstream $upstream" >> "$GITHUB_STEP_SUMMARY"
+          else
+            common=$(git merge-base HEAD "$upstream")
+            git diff --no-renames --name-only -z "$common" HEAD > "$RUNNER_TEMP/custom"
+            git diff --no-renames --name-only -z "$common" "$upstream" > "$RUNNER_TEMP/incoming"
+            python3 - <<'PY'
+          import os
+          from pathlib import Path
+          def paths(name):
+              return set((Path(os.environ["RUNNER_TEMP"]) / name).read_bytes().split(b"\0")) - {b""}
+          overlap = sorted(paths("custom") & paths("incoming"))
+          if overlap:
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+                  print("Manual review required. Both branches changed these paths:", file=summary)
+                  for path in overlap:
+                      print("    " + os.fsdecode(path), file=summary)
+              raise SystemExit("Custom paths overlap upstream")
+          PY
+            git merge --no-ff --no-edit "$upstream" || {
+              echo 'Merge conflict. Manual review required.' >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            }
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          fi
+          echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
+      - name: Set up candidate and build
+        if: steps.merge.outputs.changed == 'true' || inputs.dry_run
+        env:
+          CI: '1'
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: lfs.fetchexclude
+          GIT_CONFIG_VALUE_0: openpilot/selfdrive/modeld/models/big_driving_tinygrad.pkl
+        run: |
+          ./tools/op.sh setup
+          sudo apt-get install -y --no-install-recommends libgles2 libegl1
+          .venv/bin/scons -j"$(nproc)"
+      - name: Run LAN, USB and 3X UI regression tests
+        if: steps.merge.outputs.changed == 'true' || inputs.dry_run
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          RAYLIB_BACKEND: headless
+          OFFSCREEN: '1'
+        run: |
+          .venv/bin/python -m pytest -q \
+            openpilot/selfdrive/modeld/tests/test_gpu_on_lan.py \
+            openpilot/system/hardware/tests/test_usb_network.py \
+            openpilot/selfdrive/ui/tests/{test_confidence_layout,test_model_confidence,test_mici_dm_3x,test_confidence_interaction}.py
+
+  publish:
+    needs: validate
+    if: needs.validate.outputs.changed == 'true' && !inputs.dry_run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bamyanggang-lan
+          fetch-depth: 0
+          filter: blob:none
+      - name: Publish the validated tree
+        env:
+          BASE: ${{ needs.validate.outputs.base }}
+          UPSTREAM: ${{ needs.validate.outputs.upstream }}
+          TREE: ${{ needs.validate.outputs.tree }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$BASE"
+          git fetch --no-tags --filter=blob:none https://github.com/sunnypilot/sunnypilot.git "$UPSTREAM"
+          git merge --no-ff -m "Merge sunnypilot master ${UPSTREAM:0:9} into bamyanggang-lan" "$UPSTREAM"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$TREE"
+          git push origin HEAD:refs/heads/bamyanggang-lan
+          test "$(git ls-remote origin refs/heads/bamyanggang-lan | cut -f1)" = "$(git rev-parse HEAD)"
+          echo "Published $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
