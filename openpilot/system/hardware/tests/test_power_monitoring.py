@@ -243,6 +243,9 @@ class TestPowerMonitoring(OpenpilotTestCase):
       # Custom voltage < VBATT_PAUSE_CHARGING (disables shutdown due to low voltage)
       (11.7, 11.6, False),
       (11.7, 11.9, False),
+      (float("nan"), 11.7, True),
+      (0.0, 11.7, True),
+      (99.0, 12.0, False),
     ]
   )
   def test_battery_voltage_below_threshold(self, custom_voltage, car_voltage, expected_result):

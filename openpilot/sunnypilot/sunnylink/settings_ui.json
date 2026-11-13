@@ -1726,11 +1726,11 @@
               "key": "CustomShutdownVoltage",
               "widget": "option",
               "title": "Minimum Battery Voltage",
-              "description": "Device will shutdown if the car battery reaches the set voltage. < 11.8V disables the minimum battery voltage check.",
+              "description": "Device will shutdown if the car battery reaches the set voltage. 11.7V disables the minimum battery voltage check.",
               "options": [
                 {
                   "value": 11.7,
-                  "label": "Always On"
+                  "label": "Low voltage check disabled"
                 },
                 {
                   "value": 11.8,

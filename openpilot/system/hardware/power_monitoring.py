@@ -113,17 +113,11 @@ class PowerMonitoring:
 
   def battery_voltage_below_threshold(self, car_voltage):
     param = self.params.get("CustomShutdownVoltage", return_default=True)
-    try:
-      param = float(param) if param is not None else None
-    except (ValueError, TypeError):
-      param = None
-
-    try:
-      low_voltage_custom = param * 1e3 if param is not None and param > VBATT_PAUSE_CHARGING else VBATT_PAUSE_CHARGING * 1e3
-    except Exception:
-      low_voltage_custom = VBATT_PAUSE_CHARGING * 1e3
-
-    return car_voltage <= low_voltage_custom and (param is not None and param >= VBATT_PAUSE_CHARGING)
+    if param == 11.7:  # The explicit Disabled option in Device and sunnylink.
+      return False
+    if param is None or not VBATT_PAUSE_CHARGING <= param <= 12.8:
+      param = VBATT_PAUSE_CHARGING
+    return car_voltage <= param * 1e3
 
   # See if we need to shutdown
   def should_shutdown(self, ignition: bool, in_car: bool, offroad_timestamp: float | None, started_seen: bool):
