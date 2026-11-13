@@ -45,6 +45,8 @@ class OptionControlSP(ItemAction):
           break
     else:
       value = self.params.get(self.param_key, return_default=True)
+      if self.use_float_scaling and not (min_value / 100.0 <= value <= max_value / 100.0):
+        value = self.params.get_default_value(self.param_key)
       self.current_value = int(float(value) * 100.0) if self.use_float_scaling else int(value)
 
     # Initialize font and button styles
