@@ -36,6 +36,8 @@ class TestConfidenceInteraction(unittest.TestCase):
     directory = tempfile.TemporaryDirectory()
     self.addCleanup(directory.cleanup)
     self.params = Params(directory.name)
+    # Destroy the native writer and drain queued writes before removing its directory.
+    self.addCleanup(self.params._finalizer)
     self.addCleanup(patch.stopall)
     self.events = SimpleNamespace(mouse_events=[], show_touches=False)
     patch.object(widgets, 'gui_app', self.events).start()
